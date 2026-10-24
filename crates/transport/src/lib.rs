@@ -1,7 +1,11 @@
 mod identity;
+mod pairing;
 mod peer;
 
 pub use identity::{Fingerprint, Identity, fingerprint};
+pub use pairing::{
+    ApprovedPeer, PairingInvitation, PairingServer, PendingPairing, request_pairing,
+};
 pub use peer::{PeerClient, PeerConnection, PeerServer};
 
 #[derive(Debug, thiserror::Error)]
@@ -22,4 +26,8 @@ pub enum TransportError {
     InvalidIdentity,
     #[error("client verification setup failed: {0}")]
     Verifier(String),
+    #[error("pairing is closed or the invitation is invalid")]
+    PairingClosed,
+    #[error("pairing was denied")]
+    PairingDenied,
 }
