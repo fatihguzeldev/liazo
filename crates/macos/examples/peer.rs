@@ -71,13 +71,14 @@ mod native_peer {
                         generation,
                     };
                     let mut stream = liazo_macos::AudioStream::start(&audio_key.id).await?;
+                    let stream_id = uuid::Uuid::new_v4();
                     tokio::time::timeout(Duration::from_secs(3), async {
                         for _ in 0..AUDIO_CHUNKS {
                             stream
                                 .next()
                                 .await
                                 .ok_or("audio ended")??
-                                .into_audio_frame(audio_key.clone())?
+                                .into_audio_frame(audio_key.clone(), stream_id)?
                                 .write_to(&mut audio_lane)
                                 .await?;
                         }

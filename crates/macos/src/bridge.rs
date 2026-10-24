@@ -301,6 +301,10 @@ impl Drop for AudioStream {
 pub fn run_main_loop() {
     unsafe { ffi::liazo_native_runloop() };
 }
+
+pub fn clock_ns() -> u64 {
+    unsafe { ffi::liazo_native_clock_ns() }
+}
 pub fn stop_main_loop() {
     unsafe { ffi::liazo_native_stoploop() };
 }

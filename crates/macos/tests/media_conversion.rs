@@ -51,7 +51,7 @@ fn native_audio_uses_actual_sample_format_and_source_clock() {
         metadata,
         payload: Bytes::from(vec![0; 16]),
     }
-    .into_audio_frame(key())
+    .into_audio_frame(key(), uuid::Uuid::from_u128(2))
     .unwrap();
     let Header::Audio(audio) = frame.header else {
         panic!("wrong frame kind")

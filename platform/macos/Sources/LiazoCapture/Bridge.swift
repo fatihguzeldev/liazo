@@ -3,6 +3,9 @@ import AVFoundation
 import CLiazoCapture
 import Foundation
 
+@_cdecl("liazo_native_clock_ns")
+public func nativeClockNS() -> UInt64 { DispatchTime.now().uptimeNanoseconds }
+
 private final class Reply: @unchecked Sendable {
     let id: UInt64
     let callback: LiazoCallback

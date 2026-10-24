@@ -71,7 +71,11 @@ impl NativePacket {
         Frame::new(header, self.payload).map_err(|e| NativeError::Failure(e.to_string()))
     }
 
-    pub fn into_audio_frame(self, source: SourceKey) -> Result<Frame, NativeError> {
+    pub fn into_audio_frame(
+        self,
+        source: SourceKey,
+        stream_id: uuid::Uuid,
+    ) -> Result<Frame, NativeError> {
         let rate = self
             .metadata
             .get("sample_rate")
@@ -82,6 +86,7 @@ impl NativePacket {
         }
         let audio = AudioMeta {
             source,
+            stream_id,
             sequence: number(&self.metadata, "sequence")?,
             captured_ns: number(&self.metadata, "host_time_ns")?,
             sample_position: number(&self.metadata, "sample_position")?,

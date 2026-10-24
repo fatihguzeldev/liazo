@@ -1,6 +1,7 @@
 #ifndef LIAZO_CAPTURE_H
 #define LIAZO_CAPTURE_H
 #include <stdint.h>
+uint64_t liazo_native_clock_ns(void);
 #include <stddef.h>
 
 typedef struct {

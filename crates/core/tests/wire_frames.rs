@@ -17,6 +17,7 @@ fn key() -> SourceKey {
 async fn binary_audio_roundtrips_without_serializing_samples_to_json() {
     let (mut sender, mut receiver) = tokio::io::duplex(8192);
     let meta = AudioMeta {
+        stream_id: Uuid::from_u128(2),
         source: key(),
         sequence: 3,
         captured_ns: 400,

@@ -2,6 +2,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+use crate::control::{Event, Reply, Request};
 use crate::protocol::{
     AudioMeta, ImageFormat, MAX_IMAGE_PIXELS, MAX_MEDIA_BYTES, ProtocolError, SourceKey,
 };
@@ -59,6 +60,9 @@ pub enum Header {
     Image(ImageMeta),
     Unchanged(ImageMeta),
     Audio(AudioMeta),
+    Request(Request),
+    Reply(Reply),
+    Event(Event),
     Ping { nonce: u64 },
     Pong { nonce: u64 },
 }
@@ -81,6 +85,18 @@ impl Header {
                 require_empty(len)?;
             }
             Self::Ping { .. } | Self::Pong { .. } => require_empty(len)?,
+            Self::Request(request) => {
+                request.validate()?;
+                require_empty(len)?;
+            }
+            Self::Reply(reply) => {
+                reply.validate()?;
+                require_empty(len)?;
+            }
+            Self::Event(event) => {
+                event.validate()?;
+                require_empty(len)?;
+            }
         }
         Ok(())
     }

@@ -11,6 +11,7 @@ fn source() -> SourceKey {
 #[test]
 fn audio_size_is_derived_from_samples_and_channels() {
     let mut audio = AudioMeta {
+        stream_id: Uuid::from_u128(2),
         source: source(),
         sequence: 4,
         captured_ns: 10_000,

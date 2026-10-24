@@ -98,7 +98,7 @@ impl CropPixels {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ImageSubscription {
     pub source: SourceKey,
     pub interval_ms: u32,
@@ -127,7 +127,7 @@ impl ImageSubscription {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct CaptureSettings {
     pub images: Vec<ImageSubscription>,
     pub audio: Vec<SourceKey>,
@@ -158,6 +158,7 @@ impl CaptureSettings {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AudioMeta {
     pub source: SourceKey,
+    pub stream_id: Uuid,
     pub sequence: u64,
     pub captured_ns: u64,
     pub sample_position: u64,
@@ -171,6 +172,7 @@ impl AudioMeta {
     pub fn validate_payload(&self, bytes: usize) -> Result<(), ProtocolError> {
         self.source.validate()?;
         if !(8000..=384_000).contains(&self.sample_rate)
+            || self.stream_id.is_nil()
             || !(1..=8).contains(&self.channels)
             || !(1..=8192).contains(&self.frames)
             || self
