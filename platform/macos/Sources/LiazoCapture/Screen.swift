@@ -1,4 +1,5 @@
 import AVFoundation
+import AppKit
 import CoreGraphics
 import Foundation
 @preconcurrency import ScreenCaptureKit
@@ -26,7 +27,9 @@ public struct ScreenOptions: Sendable {
 @MainActor public final class ScreenCapture {
     private var content: SCShareableContent?
 
-    public init() {}
+    public init() {
+        _ = NSScreen.screens
+    }
 
     public static var hasPermission: Bool { CGPreflightScreenCaptureAccess() }
 
