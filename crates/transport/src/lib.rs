@@ -1,8 +1,10 @@
+mod credentials;
 mod identity;
 mod pairing;
 mod peer;
 mod session;
 
+pub use credentials::{CredentialError, DeviceCredentials, StoredPeer};
 pub use identity::{Fingerprint, Identity, fingerprint};
 pub use pairing::{
     ApprovedPeer, PairingInvitation, PairingServer, PendingPairing, request_pairing,
