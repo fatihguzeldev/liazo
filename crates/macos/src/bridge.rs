@@ -192,26 +192,23 @@ unsafe extern "C" fn audio_callback(
         return;
     }
     let mut result = unsafe { packet(status, meta, meta_len, bytes, len) };
-    if status == 1 {
-        if let Some(ready) = context
+    if status == 1
+        && let Some(ready) = context
             .ready
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
-        {
-            let message = result
-                .as_ref()
-                .err()
-                .map(ToString::to_string)
-                .unwrap_or_default();
-            let _ = ready.send(Err(NativeError::Failure(message)));
-        }
+    {
+        let message = result
+            .as_ref()
+            .err()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let _ = ready.send(Err(NativeError::Failure(message)));
     }
     let discontinuity = context.overrun.swap(false, Ordering::AcqRel);
-    if discontinuity {
-        if let Ok(packet) = &mut result {
-            packet.metadata["discontinuity"] = Value::Bool(true);
-        }
+    if discontinuity && let Ok(packet) = &mut result {
+        packet.metadata["discontinuity"] = Value::Bool(true);
     }
     if context.sender.try_send(result).is_err() {
         context.overrun.store(true, Ordering::Release);

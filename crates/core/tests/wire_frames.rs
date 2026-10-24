@@ -76,6 +76,7 @@ fn unchanged_images_have_metadata_but_no_duplicate_payload() {
         source: key(),
         sequence: 1,
         captured_ns: 20_000,
+        capture_started_ns: 19_000,
         configuration_revision: 1,
         width: 10,
         height: 10,

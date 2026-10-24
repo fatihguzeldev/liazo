@@ -28,6 +28,8 @@ pub struct ImageMeta {
     pub source: SourceKey,
     pub sequence: u64,
     pub captured_ns: u64,
+    #[serde(default)]
+    pub capture_started_ns: u64,
     pub configuration_revision: u64,
     pub width: u32,
     pub height: u32,
@@ -43,6 +45,9 @@ impl ImageMeta {
             || u64::from(self.width) * u64::from(self.height) > MAX_IMAGE_PIXELS
         {
             return Err(ProtocolError("invalid image dimensions"));
+        }
+        if self.capture_started_ns > self.captured_ns {
+            return Err(ProtocolError("invalid capture time range"));
         }
         Ok(())
     }
