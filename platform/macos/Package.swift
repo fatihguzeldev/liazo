@@ -7,7 +7,7 @@ let info = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
 
 let package = Package(
     name: "LiazoCapture",
-    platforms: [.macOS(.v14)],
+    platforms: [.macOS("14.2")],
     products: [
         .library(name: "LiazoCapture", type: .static, targets: ["LiazoCapture"]),
         .executable(name: "liazo-capture", targets: ["CaptureProbe"]),

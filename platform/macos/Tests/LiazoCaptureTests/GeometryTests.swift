@@ -14,7 +14,16 @@ func rejects(_ operation: () throws -> Void, _ message: String) throws {
 }
 
 @main struct NativeTests {
-    static func main() throws {
+    static func main() {
+        do {
+            try runChecks()
+        } catch {
+            FileHandle.standardError.write(Data("check failed: \(error)\n".utf8))
+            exit(1)
+        }
+    }
+
+    static func runChecks() throws {
         let fitted = try CaptureGeometry.fit(width: 3024, height: 1964, maxWidth: 1512)
         try expect(fitted.width == 1512 && fitted.height == 982, "retina aspect ratio changed")
         let original = try CaptureGeometry.fit(width: 800, height: 600, maxWidth: 1200)
@@ -36,6 +45,7 @@ func rejects(_ operation: () throws -> Void, _ message: String) throws {
                                          within: source)
         print("geometry: aspect, limits, and crop checks passed")
         try checkImages()
+        try checkAudio()
     }
 }
 

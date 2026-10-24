@@ -19,6 +19,20 @@ import LiazoCapture
                 try emit(["screen": screen, "microphone": microphone])
             case "sources":
                 try emit(await ScreenCapture().sources())
+            case "audio-sources":
+                try emit(AudioSources.list())
+            case "audio":
+                guard arguments.count >= 2 else { throw CaptureError.invalidRequest }
+                let seconds = arguments.count > 2 ? Double(arguments[2]) : 2
+                guard let seconds, seconds.isFinite, seconds > 0, seconds <= 10 else {
+                    throw CaptureError.invalidRequest
+                }
+                let stats = AudioStats()
+                let audio = AudioCapture()
+                try audio.start(sourceID: arguments[1]) { stats.receive($0) }
+                defer { audio.stop() }
+                try await Task.sleep(for: .seconds(seconds))
+                try emit(stats.snapshot())
             case "capture":
                 guard arguments.count >= 3 else { throw CaptureError.invalidRequest }
                 var options = ScreenOptions()
@@ -35,7 +49,8 @@ import LiazoCapture
                     "capture_ms": Int((DispatchTime.now().uptimeNanoseconds - started) / 1_000_000)
                 ])
             default:
-                print("liazo-capture status | sources | request-permissions | capture <source> <output.png> [max-width]")
+                print("liazo-capture status | sources | audio-sources | request-permissions")
+                print("liazo-capture capture <source> <output.png> [max-width] | audio <source> [seconds]")
             }
         } catch {
             FileHandle.standardError.write(Data((error.localizedDescription.lowercased() + "\n").utf8))
@@ -48,5 +63,30 @@ import LiazoCapture
         encoder.outputFormatting = [.sortedKeys]
         let encoded = try encoder.encode(value)
         FileHandle.standardOutput.write(encoded + Data([10]))
+    }
+}
+
+final class AudioStats: @unchecked Sendable {
+    private let lock = NSLock()
+    private var chunks = 0
+    private var frames: UInt64 = 0
+    private var failures = 0
+
+    func receive(_ result: Result<AudioChunk, Error>) {
+        lock.lock()
+        defer { lock.unlock() }
+        switch result {
+        case let .success(chunk):
+            chunks += 1
+            frames += UInt64(chunk.frames)
+        case .failure:
+            failures += 1
+        }
+    }
+
+    func snapshot() -> [String: UInt64] {
+        lock.lock()
+        defer { lock.unlock() }
+        return ["chunks": UInt64(chunks), "frames": frames, "errors": UInt64(failures)]
     }
 }
