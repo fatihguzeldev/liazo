@@ -18,11 +18,7 @@ jobs:
       - name: rust toolchain
         shell: pwsh
         run: |
-          rustup update stable --no-self-update
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          rustup default stable
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          rustup component add rustfmt clippy
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy --no-self-update
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $clang = 'C:\Program Files\LLVM\bin'
           if (!(Test-Path "$clang\libclang.dll")) { throw 'libclang is unavailable' }
