@@ -9,3 +9,5 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
+bytes.workspace = true
+tokio.workspace = true
