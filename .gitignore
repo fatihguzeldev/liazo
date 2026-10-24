@@ -10,3 +10,5 @@ dist/
 /recordings/
 /sessions/
 /platform/macos/.build/
+*.pem
+*.key
