@@ -190,8 +190,11 @@ impl DeviceCredentials {
             return Err(CredentialError::InvalidRecord);
         }
         let pins: Vec<_> = bytes[4..]
-            .chunks_exact(32)
-            .map(|pin| Fingerprint(pin.try_into().unwrap()))
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .copied()
+            .map(Fingerprint)
             .collect();
         if pins.iter().collect::<HashSet<_>>().len() != pins.len() {
             return Err(CredentialError::InvalidRecord);
