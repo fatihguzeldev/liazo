@@ -1,0 +1,19 @@
+[package]
+name = "liazo-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+liazo-core = { path = "../core" }
+liazo-transport = { path = "../transport" }
+tokio.workspace = true
+tokio-util = { version = "0.7", features = ["rt"] }
+uuid.workspace = true
+bytes.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+async-trait = "0.1"
+
+[dev-dependencies]
+serde_json.workspace = true
