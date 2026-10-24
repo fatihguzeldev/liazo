@@ -1,9 +1,10 @@
 use std::{
-    collections::HashSet,
+    collections::HashMap,
+    future::Future,
     io,
     net::SocketAddr,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, RwLock},
     task::{Context, Poll},
     time::Duration,
 };
@@ -19,6 +20,7 @@ use tokio::{
     time::timeout,
 };
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 use crate::{Fingerprint, Identity, TransportError, fingerprint};
 
@@ -28,7 +30,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone)]
 pub struct PeerServer {
     acceptor: TlsAcceptor,
-    paired: Arc<HashSet<Fingerprint>>,
+    paired: Arc<RwLock<HashMap<Fingerprint, CancellationToken>>>,
 }
 
 impl PeerServer {
@@ -55,8 +57,27 @@ impl PeerServer {
         config.alpn_protocols = vec![ALPN.to_vec()];
         Ok(Self {
             acceptor: TlsAcceptor::from(Arc::new(config)),
-            paired: Arc::new(trusted.iter().map(fingerprint).collect()),
+            paired: Arc::new(RwLock::new(
+                trusted
+                    .iter()
+                    .map(|cert| (fingerprint(cert), CancellationToken::new()))
+                    .collect(),
+            )),
         })
+    }
+
+    pub fn revoke(&self, peer: Fingerprint) -> bool {
+        let token = self
+            .paired
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&peer);
+        if let Some(token) = token {
+            token.cancel();
+            true
+        } else {
+            false
+        }
     }
 
     pub async fn accept(&self, socket: TcpStream) -> Result<PeerConnection, TransportError> {
@@ -70,15 +91,21 @@ impl PeerServer {
             .and_then(|certs| certs.first())
             .ok_or(TransportError::UntrustedPeer)?;
         let peer = fingerprint(certificate);
-        if !self.paired.contains(&peer) {
-            return Err(TransportError::UntrustedPeer);
-        }
+        let token = self
+            .paired
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&peer)
+            .cloned()
+            .ok_or(TransportError::UntrustedPeer)?;
         if connection.alpn_protocol() != Some(ALPN) {
             return Err(TransportError::Protocol);
         }
         Ok(PeerConnection {
             io: TlsStream::Server(io),
             peer,
+            cancelled_read: Some(Box::pin(token.clone().cancelled_owned())),
+            cancelled_write: Some(Box::pin(token.cancelled_owned())),
         })
     }
 }
@@ -136,6 +163,8 @@ impl PeerClient {
         Ok(PeerConnection {
             io: TlsStream::Client(io),
             peer,
+            cancelled_read: None,
+            cancelled_write: None,
         })
     }
 }
@@ -143,6 +172,8 @@ impl PeerClient {
 pub struct PeerConnection {
     io: TlsStream<TcpStream>,
     peer: Fingerprint,
+    cancelled_read: Option<Pin<Box<WaitForCancellationFutureOwned>>>,
+    cancelled_write: Option<Pin<Box<WaitForCancellationFutureOwned>>>,
 }
 
 impl PeerConnection {
@@ -157,6 +188,9 @@ impl AsyncRead for PeerConnection {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        if is_revoked(&mut self.cancelled_read, cx) {
+            return Poll::Ready(Err(revoked()));
+        }
         Pin::new(&mut self.io).poll_read(cx, buf)
     }
 }
@@ -167,12 +201,37 @@ impl AsyncWrite for PeerConnection {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
+        if is_revoked(&mut self.cancelled_write, cx) {
+            return Poll::Ready(Err(revoked()));
+        }
         Pin::new(&mut self.io).poll_write(cx, buf)
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if is_revoked(&mut self.cancelled_write, cx) {
+            return Poll::Ready(Err(revoked()));
+        }
         Pin::new(&mut self.io).poll_flush(cx)
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if is_revoked(&mut self.cancelled_write, cx) {
+            return Poll::Ready(Err(revoked()));
+        }
         Pin::new(&mut self.io).poll_shutdown(cx)
     }
+}
+
+fn is_revoked(
+    future: &mut Option<Pin<Box<WaitForCancellationFutureOwned>>>,
+    cx: &mut Context<'_>,
+) -> bool {
+    future
+        .as_mut()
+        .is_some_and(|f| f.as_mut().poll(cx).is_ready())
+}
+
+fn revoked() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "peer authorization revoked",
+    )
 }

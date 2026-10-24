@@ -3,6 +3,41 @@ use liazo_core::wire::{Frame, Header};
 use liazo_transport::{Identity, PeerClient, PeerServer};
 use tokio::net::TcpListener;
 
+#[tokio::test]
+async fn revocation_wakes_live_connections_and_rejects_new_connections() {
+    use std::{io::ErrorKind, time::Duration};
+    use tokio::{io::AsyncReadExt, sync::oneshot, time::timeout};
+    let provider = Identity::generate().unwrap();
+    let client = Identity::generate().unwrap();
+    let peer = client.fingerprint();
+    let server = PeerServer::new(&provider, &[client.certificate().clone()]).unwrap();
+    let connector = PeerClient::new(&client, provider.certificate()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let acceptor = server.clone();
+    let (ready, accepted) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut connection = acceptor.accept(socket).await.unwrap();
+        ready.send(()).unwrap();
+        assert_eq!(
+            connection.read_u8().await.unwrap_err().kind(),
+            ErrorKind::PermissionDenied
+        );
+        let (socket, _) = listener.accept().await.unwrap();
+        assert!(acceptor.accept(socket).await.is_err());
+    });
+    let _connection = connector.connect(address).await.unwrap();
+    accepted.await.unwrap();
+    assert!(server.revoke(peer));
+    assert!(!server.revoke(peer));
+    let _ = connector.connect(address).await;
+    timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 #[test]
 fn persisted_identity_preserves_its_pin_and_rejects_a_mismatched_key() {
     let identity = Identity::generate().unwrap();
