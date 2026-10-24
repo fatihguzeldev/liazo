@@ -1,0 +1,19 @@
+[package]
+name = "liazo-macos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+links = "liazo_capture"
+
+[dependencies]
+liazo-core = { path = "../core" }
+bytes.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+
+[build-dependencies]
+bindgen = "0.72"
+
+[dev-dependencies]
+uuid.workspace = true
