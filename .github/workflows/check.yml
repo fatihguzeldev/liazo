@@ -1,0 +1,35 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: rust toolchain
+        shell: pwsh
+        run: |
+          rustup update stable --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup component add rustfmt clippy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $clang = 'C:\Program Files\LLVM\bin'
+          if (!(Test-Path "$clang\libclang.dll")) { throw 'libclang is unavailable' }
+          "LIBCLANG_PATH=$clang" >> $env:GITHUB_ENV
+      - name: format
+        run: cargo fmt --all --check
+      - name: native build and tests
+        run: cargo test --workspace --all-targets --locked
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
