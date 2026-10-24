@@ -14,7 +14,8 @@ let package = Package(
         .executable(name: "capture-tests", targets: ["CaptureTests"])
     ],
     targets: [
-        .target(name: "LiazoCapture"),
+        .target(name: "CLiazoCapture"),
+        .target(name: "LiazoCapture", dependencies: ["CLiazoCapture"]),
         .executableTarget(
             name: "CaptureProbe", dependencies: ["LiazoCapture"],
             linkerSettings: [.unsafeFlags(["-Xlinker", "-sectcreate", "-Xlinker", "__TEXT",

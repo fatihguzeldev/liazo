@@ -16,7 +16,7 @@ public struct ScreenSource: Codable, Sendable {
 
 public struct ScreenOptions: Sendable {
     public var maxWidth: Int?
-    public var crop: CGRect?
+    public var cropPixels: CGRect?
     public var format: ImageFormat = .png
     public var quality: Double = 0.9
     public var showsCursor = false
@@ -78,7 +78,11 @@ public struct ScreenOptions: Sendable {
             throw CaptureError.sourceMissing
         }
         let bounds = CGRect(origin: .zero, size: filter.contentRect.size)
-        let selected = options.crop ?? bounds
+        let scale = CGFloat(filter.pointPixelScale)
+        let selected = options.cropPixels.map {
+            CGRect(x: $0.minX / scale, y: $0.minY / scale,
+                   width: $0.width / scale, height: $0.height / scale)
+        } ?? bounds
         try CaptureGeometry.validateCrop(selected, within: bounds)
         let size = try CaptureGeometry.fit(
             width: Int(selected.width * CGFloat(filter.pointPixelScale)),
