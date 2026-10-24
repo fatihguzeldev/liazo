@@ -1,2 +1,21 @@
 pub mod backend;
+mod capture;
 pub mod images;
+mod live;
+pub mod provider;
+pub mod receiver;
+pub use live::{AgeRange, ConnectionState, Freshness, Observation, ObservedImage};
+
+#[derive(Debug, thiserror::Error)]
+pub enum RuntimeError {
+    #[error(transparent)]
+    Wire(#[from] liazo_core::wire::WireError),
+    #[error(transparent)]
+    Transport(#[from] liazo_transport::TransportError),
+    #[error(transparent)]
+    Failure(#[from] liazo_core::control::Failure),
+    #[error("session closed")]
+    Closed,
+    #[error("invalid session message")]
+    Protocol,
+}

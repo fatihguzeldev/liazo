@@ -1,0 +1,574 @@
+use crate::{
+    RuntimeError,
+    live::{ClockMap, ConnectionState, LiveState, Observation},
+};
+use bytes::Bytes;
+use liazo_core::{
+    catalog::SourceSnapshot,
+    control::{Command, Event, Failure, FailureCode, ReplyValue, Request},
+    protocol::{CaptureSettings, PROTOCOL_VERSION, SourceKey},
+    wire::{Frame, Header},
+};
+use liazo_transport::{PeerClient, PeerSession};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+use tokio::{
+    sync::{Notify, Semaphore, broadcast, mpsc, oneshot},
+    task::{JoinHandle, JoinSet},
+    time::{Instant as Deadline, timeout, timeout_at},
+};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+struct Pending {
+    command: Command,
+    reply: oneshot::Sender<ReplyValue>,
+}
+struct Router {
+    next_id: u64,
+    pending: HashMap<u64, Pending>,
+}
+struct Shared {
+    state: Mutex<LiveState>,
+    router: Mutex<Router>,
+    sender: mpsc::Sender<Frame>,
+    permits: Semaphore,
+    changed: Notify,
+    sources_dirty: Notify,
+    cancelled: CancellationToken,
+    clock: Instant,
+    audio: broadcast::Sender<Frame>,
+}
+
+impl Shared {
+    fn now_ns(&self) -> u64 {
+        self.clock.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+    }
+    fn signal(&self) {
+        self.changed.notify_waiters();
+    }
+}
+
+struct PendingGuard {
+    shared: Arc<Shared>,
+    id: u64,
+}
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.shared
+            .router
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending
+            .remove(&self.id);
+    }
+}
+
+struct Owner {
+    shared: Arc<Shared>,
+    supervisor: Mutex<Option<JoinHandle<()>>>,
+    config: tokio::sync::Mutex<()>,
+    stop: tokio::sync::Mutex<()>,
+    operations: Arc<Semaphore>,
+}
+impl Drop for Owner {
+    fn drop(&mut self) {
+        self.shared.cancelled.cancel();
+    }
+}
+
+#[derive(Clone)]
+pub struct ReceiverSession(Arc<Owner>);
+
+impl ReceiverSession {
+    pub async fn connect(
+        client: &PeerClient,
+        address: SocketAddr,
+        session: Uuid,
+    ) -> Result<Self, RuntimeError> {
+        Self::attach(PeerSession::connect(client, address, session).await?).await
+    }
+
+    pub async fn attach(peer: PeerSession) -> Result<Self, RuntimeError> {
+        let (sender, mut outgoing) = mpsc::channel::<Frame>(32);
+        let (audio, _) = broadcast::channel(32);
+        let shared = Arc::new(Shared {
+            state: Mutex::new(LiveState::new(peer.binding)),
+            router: Mutex::new(Router {
+                next_id: 1,
+                pending: HashMap::new(),
+            }),
+            sender,
+            permits: Semaphore::new(16),
+            changed: Notify::new(),
+            sources_dirty: Notify::new(),
+            cancelled: CancellationToken::new(),
+            clock: Instant::now(),
+            audio,
+        });
+        let (mut control_reader, mut control_writer) = tokio::io::split(peer.control);
+        let mut tasks: JoinSet<Result<(), RuntimeError>> = JoinSet::new();
+        let reader = shared.clone();
+        tasks.spawn(async move {
+            loop {
+                let frame = tokio::select! { _ = reader.cancelled.cancelled() => return Ok(()), frame = Frame::read_from(&mut control_reader) => frame? };
+                match frame.map(|frame| frame.header) {
+                    Some(Header::Reply(reply)) => {
+                        let pending = reader.router.lock().unwrap_or_else(|e| e.into_inner()).pending.remove(&reply.id);
+                        if let Some(pending) = pending {
+                            if !reply_matches(&pending.command, &reply.result) { return Err(RuntimeError::Protocol); }
+                            {
+                                let mut state = reader.state.lock().unwrap_or_else(|e| e.into_inner());
+                                match &reply.result {
+                                    ReplyValue::Applied { revision, settings } => state.applied(*revision, settings.clone()),
+                                    ReplyValue::Stopped => {
+                                        state.connection = ConnectionState::Stopped; state.changed();
+                                        let receipt = Frame::new(Header::Pong { nonce: reply.id }, Bytes::new())?;
+                                        reader.sender.try_send(receipt).map_err(|_| RuntimeError::Closed)?;
+                                    },
+                                    _ => {},
+                                }
+                            }
+                            let _ = pending.reply.send(reply.result);
+                            reader.signal();
+                        }
+                    }
+                    Some(Header::Event(Event::CatalogChanged { .. })) => reader.sources_dirty.notify_one(),
+                    Some(Header::Event(event)) => {
+                        reader.state.lock().unwrap_or_else(|e| e.into_inner()).event(event);
+                        reader.signal();
+                    }
+                    _ => return Err(RuntimeError::Protocol),
+                }
+            }
+        });
+        let writer = shared.clone();
+        tasks.spawn(async move {
+            loop {
+                let frame = tokio::select! { _ = writer.cancelled.cancelled() => return Ok(()), frame = outgoing.recv() => { let Some(frame) = frame else { return Ok(()); }; frame } };
+                timeout(Duration::from_secs(5), frame.write_to(&mut control_writer)).await.map_err(|_| failure(FailureCode::Timeout, "provider request stalled"))??;
+            }
+        });
+        let images = shared.clone();
+        tasks.spawn(async move {
+            let mut stream = peer.images;
+            loop {
+                let frame = tokio::select! { _ = images.cancelled.cancelled() => return Ok(()), frame = Frame::read_from(&mut stream) => frame? };
+                images.state.lock().unwrap_or_else(|e| e.into_inner()).image(frame.ok_or(RuntimeError::Closed)?).map_err(|_| RuntimeError::Protocol)?;
+                images.signal();
+            }
+        });
+        let audio = shared.clone();
+        tasks.spawn(async move {
+            let mut stream = peer.audio;
+            loop {
+                let mut frame = tokio::select! { _ = audio.cancelled.cancelled() => return Ok(()), frame = Frame::read_from(&mut stream) => frame?.ok_or(RuntimeError::Closed)? };
+                let selected = audio.state.lock().unwrap_or_else(|e| e.into_inner()).audio(&mut frame).map_err(|_| RuntimeError::Protocol)?;
+                if selected { let _ = audio.audio.send(frame); audio.signal(); }
+            }
+        });
+        let refresh = shared.clone();
+        tasks.spawn(async move {
+            loop {
+                let ready = refresh.changed.notified();
+                tokio::pin!(ready);
+                ready.as_mut().enable();
+                if refresh.state.lock().unwrap_or_else(|e| e.into_inner()).connection == ConnectionState::Connected { break; }
+                tokio::select! { _ = refresh.cancelled.cancelled() => return Ok(()), _ = ready => {} }
+            }
+            let mut clock = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                tokio::select! {
+                    _ = refresh.cancelled.cancelled() => return Ok(()),
+                    _ = refresh.sources_dirty.notified() => { fetch_sources(&refresh).await?; },
+                    _ = clock.tick() => { sync_clock(&refresh).await?; },
+                }
+            }
+        });
+        let supervisor_state = shared.clone();
+        let supervisor = tokio::spawn(async move {
+            let _ = tasks.join_next().await;
+            supervisor_state.cancelled.cancel();
+            {
+                let mut state = supervisor_state
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if state.connection != ConnectionState::Stopped {
+                    state.connection = ConnectionState::Disconnected;
+                    state.gaps += 1;
+                }
+                state.changed();
+            }
+            supervisor_state
+                .router
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .pending
+                .clear();
+            supervisor_state.signal();
+            while tasks.join_next().await.is_some() {}
+        });
+        let receiver = Self(Arc::new(Owner {
+            shared,
+            supervisor: Mutex::new(Some(supervisor)),
+            config: tokio::sync::Mutex::new(()),
+            stop: tokio::sync::Mutex::new(()),
+            operations: Arc::new(Semaphore::new(8)),
+        }));
+        let hello = rpc(
+            &receiver.0.shared,
+            Command::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .await?;
+        if !matches!(
+            hello,
+            ReplyValue::Hello {
+                version: PROTOCOL_VERSION,
+                ..
+            }
+        ) {
+            return Err(RuntimeError::Protocol);
+        }
+        sync_clock(&receiver.0.shared).await?;
+        fetch_sources(&receiver.0.shared).await?;
+        {
+            let mut state = receiver
+                .0
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if state.connection == ConnectionState::Disconnected {
+                return Err(RuntimeError::Closed);
+            }
+            state.connection = ConnectionState::Connected;
+            state.changed();
+        }
+        receiver.0.shared.signal();
+        Ok(receiver)
+    }
+
+    pub fn sources(&self) -> SourceSnapshot {
+        self.0
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .sources
+            .clone()
+    }
+    pub fn settings(&self) -> CaptureSettings {
+        self.0
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .settings
+            .clone()
+    }
+    pub fn subscribe_audio(&self) -> broadcast::Receiver<Frame> {
+        self.0.shared.audio.subscribe()
+    }
+
+    pub async fn configure(&self, settings: CaptureSettings) -> Result<u64, RuntimeError> {
+        settings
+            .validate()
+            .map_err(|error| failure(FailureCode::InvalidRequest, &error.to_string()))?;
+        let permit = self
+            .0
+            .operations
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| RuntimeError::Closed)?;
+        let receiver = self.clone();
+        let (reply, result) = oneshot::channel();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let _configuration = receiver.0.config.lock().await;
+            receiver
+                .0
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .preparing(&settings);
+            let response = rpc(&receiver.0.shared, Command::Configure(settings)).await;
+            if response.is_err() {
+                receiver
+                    .0
+                    .shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .config_failed();
+            }
+            let result = response.and_then(|reply| match reply {
+                ReplyValue::Applied { revision, .. } => Ok(revision),
+                _ => Err(RuntimeError::Protocol),
+            });
+            let _ = reply.send(result);
+        });
+        result.await.map_err(|_| RuntimeError::Closed)?
+    }
+
+    pub async fn observe(
+        &self,
+        after: u64,
+        include_current: bool,
+        selected: &[SourceKey],
+        wait: Duration,
+    ) -> Observation {
+        let deadline = Deadline::now() + wait.min(Duration::from_secs(30));
+        loop {
+            let changed = self.0.shared.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let snapshot = self
+                .0
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .observe(after, include_current, selected, self.0.shared.now_ns());
+            if snapshot.cursor > after
+                || wait.is_zero()
+                || matches!(
+                    snapshot.connection,
+                    ConnectionState::Disconnected | ConnectionState::Stopped
+                )
+            {
+                return snapshot;
+            }
+            if timeout_at(deadline, changed).await.is_err() {
+                return snapshot;
+            }
+        }
+    }
+
+    pub async fn capture_now(&self, sources: Vec<SourceKey>) -> Result<Observation, RuntimeError> {
+        let queued = rpc(
+            &self.0.shared,
+            Command::CaptureNow {
+                sources: sources.clone(),
+            },
+        )
+        .await?;
+        let ReplyValue::CaptureQueued {
+            revision,
+            not_before_ns,
+        } = queued
+        else {
+            return Err(RuntimeError::Protocol);
+        };
+        let deadline = Deadline::now() + Duration::from_secs(4);
+        loop {
+            let changed = self.0.shared.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let state = self
+                    .0
+                    .shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if state.connection != ConnectionState::Connected {
+                    return Err(RuntimeError::Closed);
+                }
+                if state.revision != revision {
+                    return Err(failure(
+                        FailureCode::SourceChanged,
+                        "capture settings changed",
+                    ));
+                }
+                if state.fresh_after(&sources, revision, not_before_ns) {
+                    return Ok(state.observe(0, true, &sources, self.0.shared.now_ns()));
+                }
+            }
+            timeout_at(deadline, changed)
+                .await
+                .map_err(|_| failure(FailureCode::Timeout, "fresh capture timed out"))?;
+        }
+    }
+
+    pub async fn stop(&self) -> Result<(), RuntimeError> {
+        let _stopping = self.0.stop.lock().await;
+        if self
+            .0
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .connection
+            == ConnectionState::Stopped
+        {
+            return Ok(());
+        }
+        rpc(&self.0.shared, Command::Stop).await?;
+        let supervisor = self
+            .0
+            .supervisor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(supervisor) = supervisor
+            && timeout(Duration::from_secs(5), supervisor).await.is_err()
+        {
+            self.0.shared.cancelled.cancel();
+        }
+        Ok(())
+    }
+}
+
+fn failure(code: FailureCode, message: &str) -> RuntimeError {
+    Failure::new(code, message).into()
+}
+
+async fn rpc(shared: &Arc<Shared>, command: Command) -> Result<ReplyValue, RuntimeError> {
+    let _permit = shared
+        .permits
+        .acquire()
+        .await
+        .map_err(|_| RuntimeError::Closed)?;
+    if shared.cancelled.is_cancelled() {
+        return Err(RuntimeError::Closed);
+    }
+    let (reply, result) = oneshot::channel();
+    let guard = {
+        let mut router = shared.router.lock().unwrap_or_else(|e| e.into_inner());
+        let id = router.next_id;
+        router.next_id = id.checked_add(1).ok_or(RuntimeError::Protocol)?;
+        let frame = Frame::new(
+            Header::Request(Request {
+                id,
+                command: command.clone(),
+            }),
+            Bytes::new(),
+        )?;
+        router.pending.insert(id, Pending { command, reply });
+        if shared.sender.try_send(frame).is_err() {
+            router.pending.remove(&id);
+            return Err(RuntimeError::Closed);
+        }
+        PendingGuard {
+            shared: shared.clone(),
+            id,
+        }
+    };
+    let result = timeout(Duration::from_secs(5), result)
+        .await
+        .map_err(|_| failure(FailureCode::Timeout, "provider request timed out"))?
+        .map_err(|_| RuntimeError::Closed)?;
+    drop(guard);
+    match result {
+        ReplyValue::Failed(failed) => Err(failed.into()),
+        result => Ok(result),
+    }
+}
+
+fn reply_matches(command: &Command, reply: &ReplyValue) -> bool {
+    matches!(
+        (command, reply),
+        (_, ReplyValue::Failed(_))
+            | (Command::Hello { .. }, ReplyValue::Hello { .. })
+            | (Command::Sources { .. }, ReplyValue::Sources(_))
+            | (Command::Configure(_), ReplyValue::Applied { .. })
+            | (Command::CaptureNow { .. }, ReplyValue::CaptureQueued { .. })
+            | (Command::Clock { .. }, ReplyValue::Clock { .. })
+            | (Command::Stop, ReplyValue::Stopped)
+    )
+}
+
+async fn sync_clock(shared: &Arc<Shared>) -> Result<(), RuntimeError> {
+    let sent = shared.now_ns();
+    let clock = rpc(
+        shared,
+        Command::Clock {
+            client_send_ns: sent,
+        },
+    )
+    .await?;
+    let received = shared.now_ns();
+    let ReplyValue::Clock {
+        client_send_ns,
+        received_ns,
+        sent_ns,
+    } = clock
+    else {
+        return Err(RuntimeError::Protocol);
+    };
+    if client_send_ns != sent {
+        return Err(RuntimeError::Protocol);
+    }
+    let mapping =
+        ClockMap::new(sent, received, received_ns, sent_ns).ok_or(RuntimeError::Protocol)?;
+    shared.state.lock().unwrap_or_else(|e| e.into_inner()).clock = Some(mapping);
+    Ok(())
+}
+
+async fn fetch_sources(shared: &Arc<Shared>) -> Result<(), RuntimeError> {
+    for _ in 0..3 {
+        let mut after = None;
+        let mut snapshot = SourceSnapshot {
+            revision: 0,
+            sources: vec![],
+            issues: vec![],
+        };
+        let mut restart = false;
+        for page_index in 0..32 {
+            let reply = rpc(
+                shared,
+                Command::Sources {
+                    after: after.clone(),
+                },
+            )
+            .await?;
+            let ReplyValue::Sources(page) = reply else {
+                return Err(RuntimeError::Protocol);
+            };
+            if page_index > 0 && page.revision != snapshot.revision {
+                restart = true;
+                break;
+            }
+            if page
+                .sources
+                .windows(2)
+                .any(|sources| sources[0].key.id >= sources[1].key.id)
+                || page.sources.first().is_some_and(|source| {
+                    after.as_ref().is_some_and(|after| source.key.id <= *after)
+                })
+            {
+                return Err(RuntimeError::Protocol);
+            }
+            snapshot.revision = page.revision;
+            snapshot.issues = page.issues;
+            snapshot.sources.extend(page.sources);
+            after = page.next_after;
+            if after.is_none() {
+                let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                if snapshot.revision >= state.sources.revision {
+                    state.sources = snapshot;
+                    state.changed();
+                }
+                drop(state);
+                shared.signal();
+                return Ok(());
+            }
+        }
+        if !restart {
+            return Err(RuntimeError::Protocol);
+        }
+    }
+    Err(failure(
+        FailureCode::Busy,
+        "sources changed during discovery",
+    ))
+}
