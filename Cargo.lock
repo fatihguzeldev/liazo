@@ -339,6 +339,7 @@ dependencies = [
  "bindgen",
  "bytes",
  "liazo-core",
+ "liazo-transport",
  "serde_json",
  "thiserror",
  "tokio",

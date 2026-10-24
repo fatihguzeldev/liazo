@@ -17,3 +17,4 @@ bindgen = "0.72"
 
 [dev-dependencies]
 uuid.workspace = true
+liazo-transport = { path = "../transport" }
