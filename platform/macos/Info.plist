@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key><string>app.liazo.capture</string>
+    <key>CFBundleName</key><string>liazo</string>
+    <key>CFBundleVersion</key><string>0.1.0</string>
+    <key>LSUIElement</key><true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>liazo sends selected microphone audio to your paired computer.</string>
+    <key>NSAudioCaptureUsageDescription</key>
+    <string>liazo sends selected system and application audio to your paired computer.</string>
+    <key>NSLocalNetworkUsageDescription</key>
+    <string>liazo connects to your paired computers on this network.</string>
+    <key>NSBonjourServices</key>
+    <array><string>_liazo._tcp</string></array>
+</dict>
+</plist>
