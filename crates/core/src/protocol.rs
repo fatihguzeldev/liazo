@@ -49,7 +49,7 @@ pub enum SourceAvailability {
     Unavailable,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Source {
     pub key: SourceKey,
     pub label: String,
