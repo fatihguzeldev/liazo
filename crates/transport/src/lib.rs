@@ -1,12 +1,14 @@
 mod identity;
 mod pairing;
 mod peer;
+mod session;
 
 pub use identity::{Fingerprint, Identity, fingerprint};
 pub use pairing::{
     ApprovedPeer, PairingInvitation, PairingServer, PendingPairing, request_pairing,
 };
 pub use peer::{PeerClient, PeerConnection, PeerServer};
+pub use session::{AcceptedLane, LaneKind, PeerSession, SessionBinding, SessionServer};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TransportError {

@@ -22,10 +22,34 @@ use tokio::{
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
+use crate::session::{SessionLease, SessionState};
 use crate::{Fingerprint, Identity, TransportError, fingerprint};
 
 const ALPN: &[u8] = b"liazo/1";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct Interrupt {
+    future: Pin<Box<WaitForCancellationFutureOwned>>,
+    kind: io::ErrorKind,
+    message: &'static str,
+}
+
+impl Interrupt {
+    fn revoked(token: CancellationToken) -> Self {
+        Self {
+            future: Box::pin(token.cancelled_owned()),
+            kind: io::ErrorKind::PermissionDenied,
+            message: "peer authorization revoked",
+        }
+    }
+    fn session(token: CancellationToken) -> Self {
+        Self {
+            future: Box::pin(token.cancelled_owned()),
+            kind: io::ErrorKind::ConnectionAborted,
+            message: "peer session closed",
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct PeerServer {
@@ -104,8 +128,9 @@ impl PeerServer {
         Ok(PeerConnection {
             io: TlsStream::Server(io),
             peer,
-            cancelled_read: Some(Box::pin(token.clone().cancelled_owned())),
-            cancelled_write: Some(Box::pin(token.cancelled_owned())),
+            cancelled_read: vec![Interrupt::revoked(token.clone())],
+            cancelled_write: vec![Interrupt::revoked(token)],
+            session: None,
         })
     }
 }
@@ -163,8 +188,9 @@ impl PeerClient {
         Ok(PeerConnection {
             io: TlsStream::Client(io),
             peer,
-            cancelled_read: None,
-            cancelled_write: None,
+            cancelled_read: Vec::new(),
+            cancelled_write: Vec::new(),
+            session: None,
         })
     }
 }
@@ -172,13 +198,28 @@ impl PeerClient {
 pub struct PeerConnection {
     io: TlsStream<TcpStream>,
     peer: Fingerprint,
-    cancelled_read: Option<Pin<Box<WaitForCancellationFutureOwned>>>,
-    cancelled_write: Option<Pin<Box<WaitForCancellationFutureOwned>>>,
+    cancelled_read: Vec<Interrupt>,
+    cancelled_write: Vec<Interrupt>,
+    session: Option<SessionLease>,
 }
 
 impl PeerConnection {
     pub fn fingerprint(&self) -> Fingerprint {
         self.peer
+    }
+
+    pub(crate) fn bind_session(&mut self, state: Arc<SessionState>) {
+        self.cancelled_read
+            .push(Interrupt::session(state.cancelled.clone()));
+        self.cancelled_write
+            .push(Interrupt::session(state.cancelled.clone()));
+        self.session = Some(SessionLease(state));
+    }
+
+    fn close_session(&self) {
+        if let Some(session) = &self.session {
+            session.close();
+        }
     }
 }
 
@@ -188,10 +229,20 @@ impl AsyncRead for PeerConnection {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if is_revoked(&mut self.cancelled_read, cx) {
-            return Poll::Ready(Err(revoked()));
+        if let Some(error) = interrupted(&mut self.cancelled_read, cx) {
+            return Poll::Ready(Err(error));
         }
-        Pin::new(&mut self.io).poll_read(cx, buf)
+        let before = buf.filled().len();
+        let capacity = buf.remaining();
+        let result = Pin::new(&mut self.io).poll_read(cx, buf);
+        if matches!(&result, Poll::Ready(Err(_)))
+            || (matches!(&result, Poll::Ready(Ok(())))
+                && capacity > 0
+                && buf.filled().len() == before)
+        {
+            self.close_session();
+        }
+        result
     }
 }
 
@@ -201,37 +252,40 @@ impl AsyncWrite for PeerConnection {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if is_revoked(&mut self.cancelled_write, cx) {
-            return Poll::Ready(Err(revoked()));
+        if let Some(error) = interrupted(&mut self.cancelled_write, cx) {
+            return Poll::Ready(Err(error));
         }
-        Pin::new(&mut self.io).poll_write(cx, buf)
+        let result = Pin::new(&mut self.io).poll_write(cx, buf);
+        if matches!(&result, Poll::Ready(Err(_))) {
+            self.close_session();
+        }
+        result
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if is_revoked(&mut self.cancelled_write, cx) {
-            return Poll::Ready(Err(revoked()));
+        if let Some(error) = interrupted(&mut self.cancelled_write, cx) {
+            return Poll::Ready(Err(error));
         }
-        Pin::new(&mut self.io).poll_flush(cx)
+        let result = Pin::new(&mut self.io).poll_flush(cx);
+        if matches!(&result, Poll::Ready(Err(_))) {
+            self.close_session();
+        }
+        result
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if is_revoked(&mut self.cancelled_write, cx) {
-            return Poll::Ready(Err(revoked()));
+        if let Some(error) = interrupted(&mut self.cancelled_write, cx) {
+            return Poll::Ready(Err(error));
         }
         Pin::new(&mut self.io).poll_shutdown(cx)
     }
 }
 
-fn is_revoked(
-    future: &mut Option<Pin<Box<WaitForCancellationFutureOwned>>>,
-    cx: &mut Context<'_>,
-) -> bool {
-    future
-        .as_mut()
-        .is_some_and(|f| f.as_mut().poll(cx).is_ready())
-}
-
-fn revoked() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::PermissionDenied,
-        "peer authorization revoked",
-    )
+fn interrupted(interrupts: &mut [Interrupt], cx: &mut Context<'_>) -> Option<io::Error> {
+    interrupts.iter_mut().find_map(|interrupt| {
+        interrupt
+            .future
+            .as_mut()
+            .poll(cx)
+            .is_ready()
+            .then(|| io::Error::new(interrupt.kind, interrupt.message))
+    })
 }
