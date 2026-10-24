@@ -62,9 +62,11 @@ public func nativeSources(_ id: UInt64, _ callback: LiazoCallback?, _ user: Unsa
                     let screens: [ScreenSource]
                     let audio: [AudioSource]
                     let screen_error: String?
+                    let screen_allowed: Bool
                     let microphone_allowed: Bool
                 }
                 let catalog = Catalog(screens: screens, audio: audio, screen_error: screenError,
+                                      screen_allowed: ScreenCapture.hasPermission,
                                       microphone_allowed: AVCaptureDevice.authorizationStatus(for: .audio) == .authorized)
                 reply.send(try JSONEncoder().encode(catalog))
             } catch { reply.fail(error) }

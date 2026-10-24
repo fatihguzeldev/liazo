@@ -6,6 +6,7 @@ import Foundation
 
 public struct ScreenSource: Codable, Sendable {
     public let id: String
+    public let instance: String
     public let kind: String
     public let title: String
     public let width: Int
@@ -36,9 +37,10 @@ public struct ScreenOptions: Sendable {
     public func sources() async throws -> [ScreenSource] {
         let content = try await refresh()
         let displays = content.displays.map { display in
+            let instance = NativeIdentity.display(display.displayID)
             let filter = SCContentFilter(display: display, excludingWindows: [])
             return ScreenSource(
-                id: "display:\(display.displayID)", kind: "display",
+                id: "display:\(display.displayID)", instance: instance, kind: "display",
                 title: "display \(display.displayID)",
                 width: Int(filter.contentRect.width * CGFloat(filter.pointPixelScale)),
                 height: Int(filter.contentRect.height * CGFloat(filter.pointPixelScale)),
@@ -46,10 +48,12 @@ public struct ScreenOptions: Sendable {
             )
         }
         let windows = content.windows.filter { $0.windowLayer == 0 && $0.frame.width > 1 && $0.frame.height > 1 }
-            .map { window in
+            .compactMap { window -> ScreenSource? in
+                guard let pid = window.owningApplication?.processID,
+                      let process = NativeIdentity.process(pid) else { return nil }
                 let filter = SCContentFilter(desktopIndependentWindow: window)
                 return ScreenSource(
-                    id: "window:\(window.windowID)", kind: "window",
+                    id: "window:\(window.windowID)", instance: "\(process):window:\(window.windowID)", kind: "window",
                     title: window.title ?? window.owningApplication?.applicationName ?? "window",
                     width: Int(filter.contentRect.width * CGFloat(filter.pointPixelScale)),
                     height: Int(filter.contentRect.height * CGFloat(filter.pointPixelScale)),

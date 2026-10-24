@@ -55,6 +55,7 @@ enum HAL {
 
 public struct AudioSource: Codable, Sendable {
     public let id: String
+    public let instance: String
     public let kind: String
     public let title: String
     public let uid: String?
@@ -64,25 +65,27 @@ public struct AudioSource: Codable, Sendable {
 @MainActor public enum AudioSources {
     public static func list() throws -> [AudioSource] {
         let system = AudioObjectID(kAudioObjectSystemObject)
-        var sources = [AudioSource(id: "audio:system", kind: "system_audio",
+        var sources = [AudioSource(id: "audio:system", instance: "system", kind: "system_audio",
                                    title: "system audio", uid: nil, processID: nil)]
         for object in try HAL.ids(system, kAudioHardwarePropertyProcessObjectList) {
             guard let pid = try? HAL.value(object, kAudioProcessPropertyPID, initial: Int32(0)),
                   pid != getpid(),
                   let running = try? HAL.value(object, kAudioProcessPropertyIsRunningOutput, initial: UInt32(0)),
-                  running != 0 else { continue }
+                  running != 0,
+                  let process = NativeIdentity.process(pid) else { continue }
             let application = NSRunningApplication(processIdentifier: pid)
             sources.append(AudioSource(
-                id: "audio:process:\(object)", kind: "process_audio",
+                id: "audio:process:\(object)", instance: "\(process):audio:\(object)", kind: "process_audio",
                 title: application?.localizedName ?? "process \(pid)",
                 uid: try? HAL.string(object, kAudioProcessPropertyBundleID), processID: pid
             ))
         }
         for device in try HAL.ids(system, kAudioHardwarePropertyDevices) where HAL.hasInput(device) {
+            guard let uid = try? HAL.string(device, kAudioDevicePropertyDeviceUID) else { continue }
             sources.append(AudioSource(
-                id: "audio:input:\(device)", kind: "microphone",
+                id: "audio:input:\(device)", instance: uid, kind: "microphone",
                 title: (try? HAL.string(device, kAudioObjectPropertyName)) ?? "microphone",
-                uid: try? HAL.string(device, kAudioDevicePropertyDeviceUID), processID: nil
+                uid: uid, processID: nil
             ))
         }
         return sources

@@ -427,6 +427,7 @@ dependencies = [
  "bytes",
  "liazo-core",
  "liazo-transport",
+ "serde",
  "serde_json",
  "thiserror",
  "tokio",
