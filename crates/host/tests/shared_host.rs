@@ -814,13 +814,26 @@ async fn authenticated_consumers_share_one_session_and_binary_media_without_a_gu
         liazo_runtime::ConnectionState::Disconnected
     );
     assert!(held.configure(CaptureSettings::default()).await.is_err());
-    let retained = host
-        .archive_sources(liazo_host::requests::ArchiveSources {
-            binding: held.archive_identity().binding,
-            after: None,
-        })
-        .await
-        .unwrap();
+    // Revocation interrupts live media immediately; archive closure drains separately.
+    let retained = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match host
+                .archive_sources(liazo_host::requests::ArchiveSources {
+                    binding: held.archive_identity().binding,
+                    after: None,
+                })
+                .await
+            {
+                Ok(retained) => break retained,
+                Err(liazo_host::HostError::Archive(liazo_runtime::archive::ArchiveError::Busy)) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => panic!("retained archive failed after revocation: {error}"),
+            }
+        }
+    })
+    .await
+    .expect("an ordinary archive writer must finish its asynchronous close");
     assert!(retained.entries.iter().any(|entry| entry.key == source()));
     mcp.cancel().await.unwrap();
     cancel.cancel();
