@@ -145,16 +145,36 @@ impl WhisperDecoder {
         samples: &[f32],
         cancelled: Arc<AtomicBool>,
     ) -> Result<Vec<RecognizedSegment>, TranscriptionError> {
+        self.transcribe_inner(samples, None, cancelled)
+    }
+
+    pub(crate) fn transcribe_window(
+        &mut self,
+        window: &streaming::InferenceWindow,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Vec<RecognizedSegment>, TranscriptionError> {
+        self.transcribe_inner(&window.samples, Some(window), cancelled)
+    }
+
+    fn transcribe_inner(
+        &mut self,
+        samples: &[f32],
+        window: Option<&streaming::InferenceWindow>,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<Vec<RecognizedSegment>, TranscriptionError> {
         validate_input(samples)?;
         if cancelled.load(Ordering::Acquire) {
             return Err(TranscriptionError::Cancelled);
         }
         // Keep filtering on this worker, with the original samples and timestamps.
         // A failed gate falls back to Whisper rather than silently losing speech.
-        let speech = self
-            .speech_gate
-            .as_mut()
-            .is_none_or(|gate| gate.has_speech(samples).unwrap_or(true));
+        let speech = self.speech_gate.as_mut().is_none_or(|gate| {
+            match window {
+                Some(window) => gate.has_speech_window(window),
+                None => gate.has_speech(samples),
+            }
+            .unwrap_or(true)
+        });
         if cancelled.load(Ordering::Acquire) {
             return Err(TranscriptionError::Cancelled);
         }

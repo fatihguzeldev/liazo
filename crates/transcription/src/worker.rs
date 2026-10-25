@@ -79,7 +79,7 @@ impl InferenceWorker {
                     }
                 };
                 while let Some((window, abort)) = queue.take() {
-                    let result = decoder.transcribe(&window.samples, abort.clone());
+                    let result = decoder.transcribe_window(&window, abort.clone());
                     queue
                         .queue
                         .lock()
