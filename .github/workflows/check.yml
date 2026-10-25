@@ -25,6 +25,15 @@ jobs:
           "LIBCLANG_PATH=$clang" >> $env:GITHUB_ENV
       - name: format
         run: cargo fmt --all --check
+      - name: frontend
+        working-directory: desktop
+        run: |
+          npm ci --no-audit --no-fund
+          npm run bindings
+          git diff --exit-code -- src/bindings.ts
+          npm exec playwright install chromium
+          npm test
+          npm run build
       - name: native build and tests
         run: cargo test --workspace --all-targets --locked
       - name: clippy

@@ -12,3 +12,7 @@ dist/
 /platform/macos/.build/
 *.pem
 *.key
+/desktop/src-tauri/gen/
+/desktop/src-tauri/binaries/
+/desktop/test-results/
+/desktop/playwright-report/
