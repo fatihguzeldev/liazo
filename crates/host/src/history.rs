@@ -26,8 +26,8 @@ impl SessionHost {
     }
     async fn active_archive(&self, binding: SessionBinding) -> Option<ReceiverSession> {
         let receiver = self.receiver(binding).await.ok()?;
-        if receiver.archive_status().is_none()
-            && receiver.connection() != liazo_runtime::ConnectionState::Connected
+        if receiver.connection() != liazo_runtime::ConnectionState::Connected
+            && (receiver.archive_status().is_none() || receiver.archive_retiring())
         {
             return None;
         }

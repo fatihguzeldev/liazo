@@ -132,6 +132,11 @@ impl ReceiverSession {
         self.archive_client().map(|archive| archive.status())
     }
 
+    pub fn archive_retiring(&self) -> bool {
+        self.archive_client()
+            .is_some_and(|archive| archive.is_closing())
+    }
+
     pub async fn flush_archive(&self) -> Result<(), RuntimeError> {
         if let Some(archive) = self.archive_client() {
             archive.flush().await?;
@@ -215,6 +220,9 @@ impl ReceiverSession {
     }
 
     pub async fn retire_archive(&self) -> Result<(), RuntimeError> {
+        if let Some(archive) = self.archive_client() {
+            archive.request_stop();
+        }
         let mut owner = self.0.archive.lock().await;
         if let Some(worker) = owner.as_mut()
             && !worker.stop().await

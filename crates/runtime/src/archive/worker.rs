@@ -271,6 +271,37 @@ impl Drop for ArchiveTestHold {
 }
 
 impl ArchiveClient {
+    pub(crate) fn request_stop(&self) {
+        {
+            let _missing = self
+                .control
+                .missing
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if self.control.closing.swap(true, Ordering::AcqRel) {
+                return;
+            }
+            if !self.control.sealed.load(Ordering::Acquire) {
+                self.control.ended_at.store(
+                    self.control
+                        .clock
+                        .elapsed()
+                        .as_nanos()
+                        .min(u128::from(u64::MAX)) as u64,
+                    Ordering::Release,
+                );
+            }
+        }
+        self.control
+            .status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .phase = ArchivePhase::Stopping;
+        let _ = self.sender.try_send(Command::Wake);
+    }
+    pub(crate) fn is_closing(&self) -> bool {
+        self.control.closing.load(Ordering::Acquire)
+    }
     #[cfg(any(test, feature = "test-support"))]
     pub async fn database_full(&self, enabled: bool) -> Result<(), ArchiveError> {
         let (reply, result) = oneshot::channel();
@@ -672,33 +703,7 @@ impl ArchiveWorker {
     }
     pub async fn stop(&mut self) -> bool {
         self.ticker.abort();
-        {
-            let _missing = self
-                .client
-                .control
-                .missing
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            self.client.control.closing.store(true, Ordering::Release);
-            if !self.client.control.sealed.load(Ordering::Acquire) {
-                self.client.control.ended_at.store(
-                    self.client
-                        .control
-                        .clock
-                        .elapsed()
-                        .as_nanos()
-                        .min(u128::from(u64::MAX)) as u64,
-                    Ordering::Release,
-                );
-            }
-        }
-        self.client
-            .control
-            .status
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .phase = ArchivePhase::Stopping;
-        let _ = self.client.sender.try_send(Command::Wake);
+        self.client.request_stop();
         if let Some(done) = &mut self.done {
             if tokio::time::timeout(Duration::from_secs(5), done)
                 .await
@@ -1335,6 +1340,11 @@ mod tests {
         }
         assert_eq!(client.control.budget.available_permits(), 4);
         assert!(client.control.missing.lock().unwrap().sources.is_empty());
+        client.request_stop();
+        let ended_at = client.control.ended_at.load(Ordering::Acquire);
+        assert!(client.is_closing());
+        client.request_stop();
+        assert_eq!(client.control.ended_at.load(Ordering::Acquire), ended_at);
     }
 
     #[tokio::test]
@@ -1405,6 +1415,10 @@ mod tests {
         ));
         client.seal().await.unwrap();
         client.seal().await.unwrap();
+        assert!(
+            !client.is_closing(),
+            "a sealed worker still serves history queries"
+        );
         assert_eq!(client.sources(None).await.unwrap().entries[0].key, source);
         assert_eq!(
             client.image(source.clone(), at).await.unwrap().state,
@@ -1423,6 +1437,7 @@ mod tests {
             client.image(source, at).await,
             Err(ArchiveError::Stopped)
         ));
+        assert!(client.is_closing());
         assert!(matches!(
             client.sources(None).await,
             Err(ArchiveError::Stopped)
