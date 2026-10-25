@@ -12,6 +12,8 @@ use uuid::Uuid;
 mod host;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+mod node;
 mod profile;
 #[cfg(target_os = "macos")]
 mod provide;
@@ -39,6 +41,20 @@ enum Command {
         #[arg(long, default_value = "127.0.0.1:45811")]
         listen: SocketAddr,
     },
+    /// Start the Mac capture node in the background.
+    Start {
+        #[arg(long, default_value = "0.0.0.0:45810")]
+        listen: SocketAddr,
+        #[arg(long)]
+        advertise: Option<IpAddr>,
+        /// Print a single-use pairing code for a new client.
+        #[arg(long)]
+        pair: bool,
+    },
+    /// Stop this profile's background Mac capture node.
+    Stop,
+    /// Show whether this profile's background Mac capture node is running.
+    Status,
     Provide {
         #[arg(long, default_value = "0.0.0.0:45810")]
         listen: SocketAddr,
@@ -46,6 +62,8 @@ enum Command {
         advertise: Option<IpAddr>,
         #[arg(long)]
         pair: bool,
+        #[arg(long, hide = true)]
+        ready_file: Option<PathBuf>,
     },
     Pair {
         #[arg(long, default_value = "client")]
@@ -147,6 +165,17 @@ async fn run(cli: Cli) -> Result<()> {
         return capture_permissions(*request_screen, *request_microphone).await;
     }
     let profile = profile::Profile::open(cli.profile)?;
+    #[cfg(target_os = "macos")]
+    match &cli.command {
+        Command::Start {
+            listen,
+            advertise,
+            pair,
+        } => return node::start(profile, *listen, *advertise, *pair).await,
+        Command::Stop => return node::stop(profile).await,
+        Command::Status => return node::status(profile).await,
+        _ => {}
+    }
     if matches!(cli.command, Command::Mcp) {
         let endpoint = liazo_host::launcher::Launcher {
             executable: std::env::current_exe()?,
@@ -161,6 +190,9 @@ async fn run(cli: Cli) -> Result<()> {
     let credentials = profile.credentials()?;
     match cli.command {
         Command::Mcp | Command::Permissions { .. } => unreachable!(),
+        Command::Start { .. } | Command::Stop | Command::Status => {
+            Err("background capture nodes require macos".into())
+        }
         Command::Host { listen } => host::run(profile, credentials, listen).await,
         Command::Unlock => {
             let _ = profile.identity(&credentials)?;
@@ -173,7 +205,8 @@ async fn run(cli: Cli) -> Result<()> {
             listen,
             advertise,
             pair,
-        } => provide::run(profile, credentials, listen, advertise, pair).await,
+            ready_file,
+        } => provide::run(profile, credentials, listen, advertise, pair, ready_file).await,
         #[cfg(not(target_os = "macos"))]
         Command::Provide { .. } => Err("capture provider requires macos".into()),
         Command::Peers => {
@@ -345,4 +378,34 @@ async fn capture_permissions(request_screen: bool, request_microphone: bool) -> 
 #[cfg(not(target_os = "macos"))]
 async fn capture_permissions(_request_screen: bool, _request_microphone: bool) -> Result<()> {
     Err("capture permissions require macos".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn background_commands_are_available_without_a_persistent_terminal() {
+        for arguments in [
+            vec!["liazo", "start"],
+            vec![
+                "liazo",
+                "--profile",
+                "my-mac",
+                "start",
+                "--pair",
+                "--advertise",
+                "100.100.12.90",
+            ],
+            vec!["liazo", "stop"],
+            vec!["liazo", "status"],
+        ] {
+            Cli::try_parse_from(arguments).unwrap();
+        }
+    }
+
+    #[test]
+    fn stopping_a_node_cannot_open_pairing() {
+        assert!(Cli::try_parse_from(["liazo", "stop", "--pair"]).is_err());
+    }
 }

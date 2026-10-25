@@ -5,7 +5,10 @@ use liazo_transport::{
 };
 use std::{
     collections::HashMap,
+    fs::OpenOptions,
+    io::Write,
     net::{IpAddr, SocketAddr},
+    path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -58,6 +61,7 @@ pub async fn run(
     listen: SocketAddr,
     advertise: Option<IpAddr>,
     pair: bool,
+    ready_file: Option<PathBuf>,
 ) -> Result<()> {
     let _owner = profile.lock("provider")?;
     let identity = profile.identity(&credentials)?;
@@ -93,17 +97,32 @@ pub async fn run(
         })
         .transpose()?
         .map(Arc::new);
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let code = invitation
+        .as_ref()
+        .map(|pairing| pairing.invitation().encode())
+        .transpose()?;
     println!(
         "{}",
         serde_json::json!({"event":"ready","address":address.to_string(),"fingerprint":identity.fingerprint().to_string()})
     );
-    if let Some(pairing) = &invitation {
-        // This is the explicitly requested setup code, never part of operational media logs.
-        println!(
-            "{}",
-            serde_json::json!({"event":"pair_code","code":pairing.invitation().encode()?})
-        );
-    }
+    let _ready_file = if let Some(path) = ready_file {
+        let mut readiness = serde_json::json!({
+            "pid":std::process::id(),
+            "address":address.to_string(),
+            "fingerprint":identity.fingerprint().to_string(),
+        });
+        if let Some(code) = &code {
+            readiness["pair_code"] = code.clone().into();
+        }
+        Some(ReadyFile::publish(path, &readiness)?)
+    } else {
+        if let Some(code) = &code {
+            // An explicitly requested setup code never enters daemon logs.
+            println!("{}", serde_json::json!({"event":"pair_code","code":code}));
+        }
+        None
+    };
     let backend = Arc::new(crate::macos::MacCapture::default());
     let cancel = CancellationToken::new();
     let mut handshakes = JoinSet::new();
@@ -117,6 +136,7 @@ pub async fn run(
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
+            _ = terminate.recv() => break,
             accepted = listener.accept(), if handshakes.len() < 16 => {
                 let (socket, _) = accepted?;
                 let sessions = sessions.clone();
@@ -186,6 +206,7 @@ pub async fn run(
     _: SocketAddr,
     _: Option<IpAddr>,
     _: bool,
+    _: Option<PathBuf>,
 ) -> Result<()> {
     Err("capture provider requires macos".into())
 }
@@ -200,6 +221,46 @@ async fn complete_pairing(
     let peer = request.fingerprint();
     request.approve().await?;
     Ok(peer)
+}
+
+struct ReadyFile(PathBuf);
+
+impl ReadyFile {
+    fn publish(path: PathBuf, value: &serde_json::Value) -> Result<Self> {
+        let temporary = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temporary)?;
+            file.write_all(&serde_json::to_vec(value)?)?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, &path)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result?;
+        Ok(Self(path))
+    }
+}
+
+impl Drop for ReadyFile {
+    fn drop(&mut self) {
+        if ready_file_owner(&self.0) == Some(u64::from(std::process::id())) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+}
+
+fn ready_file_owner(path: &Path) -> Option<u64> {
+    serde_json::from_slice::<serde_json::Value>(&std::fs::read(path).ok()?)
+        .ok()?
+        .get("pid")?
+        .as_u64()
 }
 
 fn advertised_ip(bound: IpAddr, explicit: Option<IpAddr>) -> Result<IpAddr> {
@@ -225,6 +286,7 @@ fn advertised_ip(bound: IpAddr, explicit: Option<IpAddr>) -> Result<IpAddr> {
 mod tests {
     use super::*;
     use liazo_transport::{Identity, PeerClient, request_pairing};
+    use std::os::unix::fs::PermissionsExt;
 
     #[tokio::test]
     async fn a_valid_token_registers_the_exact_client_without_interactive_approval() {
@@ -288,5 +350,36 @@ mod tests {
                 .is_err()
         );
         assert!(client.await.unwrap().is_err());
+    }
+
+    #[test]
+    fn readiness_is_private_and_removed_after_its_owner_exits() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ready.json");
+        let ready = ReadyFile::publish(
+            path.clone(),
+            &serde_json::json!({"pid":std::process::id(),"pair_code":"test-only-code"}),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(ready_file_owner(&path), Some(u64::from(std::process::id())));
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+        drop(ready);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn an_old_owner_does_not_remove_a_replacement_readiness_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ready.json");
+        let ready =
+            ReadyFile::publish(path.clone(), &serde_json::json!({"pid":std::process::id()}))
+                .unwrap();
+        std::fs::write(&path, b"{\"pid\":0}").unwrap();
+        drop(ready);
+        assert!(path.exists());
     }
 }
