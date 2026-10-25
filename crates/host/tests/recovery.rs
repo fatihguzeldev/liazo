@@ -567,7 +567,6 @@ async fn reconnect_preserves_settings_across_failed_attempt_and_keeps_closed_epo
     let current = fixture.epoch_after(first).await;
     assert_eq!(current.binding.session, first.session);
     assert_ne!(current.binding.epoch, first.epoch);
-    assert!(current.recovery.is_empty());
     let new = fixture.host.receiver(current.binding).await.unwrap();
     assert_eq!(new.settings(), settings());
     let fresh = new
@@ -579,6 +578,8 @@ async fn reconnect_preserves_settings_across_failed_attempt_and_keeps_closed_epo
         fresh.images[0].payload.as_ref().unwrap().as_ref(),
         b"fixture image"
     );
+    let current = fixture.archive_ready(current.binding).await;
+    assert!(current.recovery.is_empty());
     assert_eq!(
         new.archive_status().unwrap().raw_audio_sources,
         vec![audio_key()]

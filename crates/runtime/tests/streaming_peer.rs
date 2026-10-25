@@ -10,6 +10,8 @@ use liazo_core::{
     wire::{Frame, Header, ImageMeta},
 };
 use liazo_runtime::{
+    ConnectionState,
+    archive::{ArchiveBudget, ArchiveError, ArchiveLimits, ArchivePhase},
     backend::{AudioTrack, CaptureBackend},
     provider,
     receiver::ReceiverSession,
@@ -27,6 +29,52 @@ use std::{
 use tokio::{net::TcpListener, sync::Semaphore, time::timeout};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+async fn start_archive_when_ready(
+    session: &ReceiverSession,
+    root: PathBuf,
+    limits: ArchiveLimits,
+    budget: Option<ArchiveBudget>,
+) {
+    let binding = session.archive_identity().binding;
+    let started = Instant::now();
+    let mut attempts = 0;
+    let mut last = String::new();
+    timeout(Duration::from_secs(15), async {
+        loop {
+            assert_eq!(session.archive_identity().binding, binding);
+            assert_eq!(session.connection(), ConnectionState::Connected);
+            attempts += 1;
+            last = format!(
+                "attempts={attempts} elapsed={:?} binding={binding:?} connection={:?} archive={:?}",
+                started.elapsed(),
+                session.connection(),
+                session.archive_status(),
+            );
+            match session
+                .start_archive_with_budget(root.clone(), limits, budget.clone())
+                .await
+            {
+                Ok(()) => {
+                    assert_eq!(session.connection(), ConnectionState::Connected);
+                    assert_eq!(
+                        session.archive_status().unwrap().phase,
+                        ArchivePhase::Recording
+                    );
+                    return;
+                }
+                Err(liazo_runtime::RuntimeError::Archive(ArchiveError::Busy)) => {
+                    // Busy is bounded native startup/admission backpressure, not
+                    // evidence that this connected session has an archive yet.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!("archive startup failed after {attempts} attempts: {error}"),
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("archive startup did not become ready: {last}"));
+}
 
 fn source(audio: bool) -> SourceKey {
     SourceKey {
@@ -255,13 +303,13 @@ async fn real_speech_crosses_peer_transport_and_shared_observation_without_block
     let fixture = fixture(pcm, false);
     let (session, provider) = pair(fixture.clone()).await;
     let archive = tempfile::tempdir().unwrap();
-    session
-        .start_archive(
-            archive.path().to_owned(),
-            liazo_runtime::archive::ArchiveLimits::default(),
-        )
-        .await
-        .unwrap();
+    start_archive_when_ready(
+        &session,
+        archive.path().to_owned(),
+        ArchiveLimits::default(),
+        None,
+    )
+    .await;
     let history_start = Instant::now();
     session
         .configure(CaptureSettings {
@@ -508,16 +556,16 @@ mod storage_failures {
         let fixture = fixture(vec![], true);
         let (session, provider) = pair(fixture.clone()).await;
         let archive = tempfile::tempdir().unwrap();
-        session
-            .start_archive(
-                archive.path().to_owned(),
-                ArchiveLimits {
-                    duration_ms: 60_000,
-                    max_bytes: 4 * 1024 * 1024,
-                },
-            )
-            .await
-            .unwrap();
+        start_archive_when_ready(
+            &session,
+            archive.path().to_owned(),
+            ArchiveLimits {
+                duration_ms: 60_000,
+                max_bytes: 4 * 1024 * 1024,
+            },
+            None,
+        )
+        .await;
         session
             .configure(CaptureSettings {
                 images: vec![ImageSubscription {
@@ -664,27 +712,18 @@ mod storage_failures {
             .unwrap();
             assert!(fresh.images[0].payload.is_some());
             drop(held);
-            timeout(Duration::from_secs(3), async {
-                loop {
-                    match session
-                        .start_archive_with_budget(
-                            root(&session),
-                            ArchiveLimits {
-                                duration_ms: 60_000,
-                                max_bytes: 4 * 1024 * 1024,
-                            },
-                            budget.clone(),
-                        )
-                        .await
-                    {
-                        Ok(()) => break,
-                        Err(liazo_runtime::RuntimeError::Archive(
-                            liazo_runtime::archive::ArchiveError::Busy,
-                        )) => tokio::time::sleep(Duration::from_millis(10)).await,
-                        Err(error) => panic!("startup recovery failed: {error}"),
-                    }
-                }
-            })
+            timeout(
+                Duration::from_secs(3),
+                start_archive_when_ready(
+                    &session,
+                    root(&session),
+                    ArchiveLimits {
+                        duration_ms: 60_000,
+                        max_bytes: 4 * 1024 * 1024,
+                    },
+                    budget.clone(),
+                ),
+            )
             .await
             .unwrap();
             assert_eq!(
