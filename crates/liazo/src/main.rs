@@ -61,6 +61,8 @@ enum Command {
         model: Option<PathBuf>,
         #[arg(long, default_value_t = 4)]
         threads: u8,
+        #[arg(long)]
+        no_archive: bool,
     },
     Peers,
     Discover,
@@ -186,6 +188,7 @@ async fn run(cli: Cli) -> Result<()> {
             transcribe,
             model,
             threads,
+            no_archive,
         } => {
             let _owner = profile.lock("receiver")?;
             let identity = profile.identity(&credentials)?;
@@ -200,6 +203,17 @@ async fn run(cli: Cli) -> Result<()> {
                 Uuid::new_v4(),
             )
             .await?;
+            if !no_archive {
+                let binding = session.archive_identity().binding;
+                let root = profile
+                    .root
+                    .join("sessions")
+                    .join(binding.session.to_string())
+                    .join(binding.epoch.to_string());
+                session
+                    .start_archive(root, liazo_runtime::archive::ArchiveLimits::default())
+                    .await?;
+            }
             let sources = session.sources();
             let resolve = |id: &str| {
                 sources

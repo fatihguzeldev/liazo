@@ -1,0 +1,153 @@
+use super::{ReceiverSession, failure};
+use crate::{
+    RuntimeError,
+    archive::{
+        ArchiveClient, ArchiveError, ArchiveLimits, ArchiveStatus, ArchiveWorker, TranscriptPage,
+    },
+    live::ConnectionState,
+};
+use liazo_core::{control::FailureCode, protocol::SourceKey};
+use std::{path::PathBuf, time::Duration};
+use tokio::sync::oneshot;
+
+impl ReceiverSession {
+    pub async fn start_archive(
+        &self,
+        root: PathBuf,
+        limits: ArchiveLimits,
+    ) -> Result<(), RuntimeError> {
+        limits.validate()?;
+        let permit = self
+            .0
+            .operations
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| RuntimeError::Closed)?;
+        let receiver = self.clone();
+        let (reply, result) = oneshot::channel();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let result = receiver.install_archive(root, limits).await;
+            let _ = reply.send(result);
+        });
+        result.await.map_err(|_| RuntimeError::Closed)?
+    }
+
+    async fn install_archive(
+        &self,
+        root: PathBuf,
+        limits: ArchiveLimits,
+    ) -> Result<(), RuntimeError> {
+        let mut owner = self.0.archive.lock().await;
+        {
+            let mut state = self
+                .0
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if state.connection != ConnectionState::Connected {
+                return Err(RuntimeError::Closed);
+            }
+            state.archive = None;
+        }
+        if let Some(previous) = owner.as_mut()
+            && !previous.stop().await
+        {
+            return Err(ArchiveError::Busy.into());
+        }
+        owner.take();
+        let worker =
+            ArchiveWorker::start(root, self.archive_identity(), limits, self.0.shared.clock)
+                .await?;
+        let client = worker.client();
+        *owner = Some(worker);
+        {
+            let mut state = self
+                .0
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if state.connection != ConnectionState::Connected {
+                return Err(RuntimeError::Closed);
+            }
+            state.attach_archive(client, self.0.shared.now_ns());
+        }
+        self.0.shared.signal();
+        Ok(())
+    }
+
+    fn archive_client(&self) -> Option<ArchiveClient> {
+        self.0
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .archive
+            .clone()
+    }
+
+    pub fn archive_status(&self) -> Option<ArchiveStatus> {
+        self.archive_client().map(|archive| archive.status())
+    }
+
+    pub async fn flush_archive(&self) -> Result<(), RuntimeError> {
+        if let Some(archive) = self.archive_client() {
+            archive.flush().await?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn seal_archive(&self) -> Result<(), RuntimeError> {
+        let _owner = self.0.archive.lock().await;
+        if let Some(archive) = self.archive_client() {
+            archive.seal().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn history_transcripts(
+        &self,
+        older: Duration,
+        newer: Duration,
+        selected: &[SourceKey],
+    ) -> Result<TranscriptPage, RuntimeError> {
+        if older < newer || selected.len() > 8 {
+            return Err(failure(
+                FailureCode::InvalidRequest,
+                "invalid transcript history range",
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for source in selected {
+            source
+                .validate()
+                .map_err(|error| failure(FailureCode::InvalidRequest, &error.to_string()))?;
+            if !seen.insert(source) {
+                return Err(failure(
+                    FailureCode::InvalidRequest,
+                    "duplicate transcript source",
+                ));
+            }
+        }
+        let now = self.0.shared.now_ns();
+        let relative = |age: Duration| {
+            u64::try_from(age.as_nanos())
+                .ok()
+                .and_then(|age| now.checked_sub(age))
+                .ok_or_else(|| {
+                    failure(
+                        FailureCode::InvalidRequest,
+                        "requested time predates this session",
+                    )
+                })
+        };
+        let (first, last) = (relative(older)?, relative(newer)?);
+        let archive = self
+            .archive_client()
+            .ok_or_else(|| failure(FailureCode::Unavailable, "disk archive is not enabled"))?;
+        Ok(archive.transcripts(first, last, selected.to_vec()).await?)
+    }
+}

@@ -48,6 +48,13 @@ pub(crate) struct ClockMap {
 }
 
 impl ClockMap {
+    pub(crate) fn project(self, start: u64, end: u64) -> crate::archive::ReceiverTimeRange {
+        let bound = |value: i128| value.clamp(0, i128::from(u64::MAX)) as u64;
+        crate::archive::ReceiverTimeRange {
+            earliest_ns: bound(i128::from(start) + self.lower_offset),
+            latest_ns: bound(i128::from(end) + self.upper_offset),
+        }
+    }
     pub fn new(
         sent: u64,
         received: u64,
@@ -85,6 +92,7 @@ pub struct ObservedImage {
 
 #[derive(Clone, Serialize)]
 pub struct Observation {
+    pub archive: Option<crate::archive::ArchiveStatus>,
     pub binding: SessionBinding,
     pub cursor: u64,
     pub connection: ConnectionState,
@@ -100,6 +108,7 @@ pub struct Observation {
 }
 
 struct Image {
+    arrived_ns: u64,
     metadata: ImageMeta,
     payload: Bytes,
     changed_at: u64,
@@ -111,6 +120,7 @@ struct Health {
 }
 
 pub(crate) struct LiveState {
+    pub archive: Option<crate::archive::ArchiveClient>,
     pub history: RamHistory,
     pub transcripts: TranscriptBuffer,
     pub binding: SessionBinding,
@@ -131,6 +141,7 @@ pub(crate) struct LiveState {
 impl LiveState {
     pub fn new(binding: SessionBinding) -> Self {
         Self {
+            archive: None,
             history: RamHistory::new(HistoryLimits::default()).unwrap(),
             transcripts: TranscriptBuffer::default(),
             binding,
@@ -155,20 +166,72 @@ impl LiveState {
     pub fn changed(&mut self) {
         self.cursor = self.cursor.saturating_add(1);
     }
+
+    pub fn attach_archive(&mut self, client: crate::archive::ArchiveClient, now: u64) {
+        for image in self.images.values() {
+            let interval_ms = self
+                .settings
+                .images
+                .iter()
+                .find(|setting| setting.source == image.metadata.source)
+                .map_or(500, |setting| setting.interval_ms);
+            client.submit(crate::archive::ArchiveRecord::Image {
+                metadata: image.metadata.clone(),
+                payload_id: image.payload_id,
+                bytes: image.payload.clone(),
+                arrived_ns: image.arrived_ns,
+                max_gap_ns: (u64::from(interval_ms) * 3 + 1000) * 1_000_000,
+            });
+        }
+        self.archive = Some(client);
+        self.archive_transcripts(0, now);
+        self.changed();
+    }
+
+    pub fn archive_transcripts(&self, after: u64, now: u64) {
+        if let Some(archive) = &self.archive {
+            for transcript in self.transcripts.snapshot(after, &[], now).0 {
+                let range = self
+                    .clock
+                    .map(|clock| clock.project(transcript.start_ns, transcript.end_ns));
+                archive.submit(crate::archive::ArchiveRecord::Transcript {
+                    transcript,
+                    received_ns: now,
+                    range,
+                });
+            }
+        }
+    }
+
+    fn history_gap(&mut self, source: SourceKey, now: u64, reason: GapReason) {
+        if let Some(archive) = &self.archive {
+            archive.submit(crate::archive::ArchiveRecord::Gap {
+                source: source.clone(),
+                at: now,
+                reason,
+            });
+        }
+        self.history.gap(source, now, reason);
+    }
     pub fn preparing(&mut self, settings: &CaptureSettings) {
         self.expected = settings.images.clone();
         self.expected_audio = settings.audio.clone();
     }
     pub fn applied(&mut self, revision: u64, settings: CaptureSettings, now: u64) {
-        for old in &self.settings.images {
-            if !settings
-                .images
-                .iter()
-                .any(|image| image.source == old.source)
-            {
-                self.history
-                    .gap(old.source.clone(), now, GapReason::Stopped);
-            }
+        let removed: Vec<_> = self
+            .settings
+            .images
+            .iter()
+            .filter(|old| {
+                !settings
+                    .images
+                    .iter()
+                    .any(|image| image.source == old.source)
+            })
+            .map(|old| old.source.clone())
+            .collect();
+        for source in removed {
+            self.history_gap(source, now, GapReason::Stopped);
         }
         self.revision = revision;
         self.settings = settings;
@@ -184,6 +247,7 @@ impl LiveState {
     }
 
     pub fn sources_changed(&mut self, sources: SourceSnapshot, now: u64) {
+        let mut gaps = Vec::new();
         for image in self.settings.images.iter().chain(&self.expected) {
             let availability = sources
                 .sources
@@ -195,7 +259,10 @@ impl LiveState {
                 Some(SourceAvailability::PermissionRequired) => GapReason::PermissionRequired,
                 _ => GapReason::Unavailable,
             };
-            self.history.gap(image.source.clone(), now, reason);
+            gaps.push((image.source.clone(), reason));
+        }
+        for (source, reason) in gaps {
+            self.history_gap(source, now, reason);
         }
         self.sources = sources;
         self.changed();
@@ -294,6 +361,15 @@ impl LiveState {
             .chain(&self.settings.images)
             .find(|image| image.source == meta.source)
             .map_or(500, |image| image.interval_ms);
+        if let Some(archive) = &self.archive {
+            archive.submit(crate::archive::ArchiveRecord::Image {
+                metadata: meta.clone(),
+                payload_id,
+                bytes: payload.clone(),
+                arrived_ns: now,
+                max_gap_ns: (u64::from(interval_ms) * 3 + 1000) * 1_000_000,
+            });
+        }
         self.history.image(
             meta.clone(),
             payload_id,
@@ -311,6 +387,7 @@ impl LiveState {
         self.images.insert(
             meta.source.clone(),
             Image {
+                arrived_ns: now,
                 metadata: meta,
                 payload,
                 changed_at,
@@ -406,7 +483,7 @@ impl LiveState {
                 } else {
                     GapReason::Unavailable
                 };
-                self.history.gap(source.clone(), now, reason);
+                self.history_gap(source.clone(), now, reason);
                 self.failures.insert(
                     source,
                     Health {
@@ -429,8 +506,9 @@ impl LiveState {
         } else {
             GapReason::Disconnected
         };
-        for source in self.images.keys() {
-            self.history.gap(source.clone(), now, reason);
+        let sources: Vec<_> = self.images.keys().cloned().collect();
+        for source in sources {
+            self.history_gap(source, now, reason);
         }
     }
 
@@ -516,6 +594,7 @@ impl LiveState {
         let (transcripts, transcript_deltas_lost) =
             self.transcripts.snapshot(after, selected, now_ns);
         Observation {
+            archive: self.archive.as_ref().map(|archive| archive.status()),
             binding: self.binding,
             cursor: self.cursor,
             connection: self.connection.clone(),

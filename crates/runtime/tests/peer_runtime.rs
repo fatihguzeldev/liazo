@@ -195,6 +195,76 @@ fn capture() -> Arc<Capture> {
 }
 
 #[tokio::test]
+async fn disk_history_survives_ram_eviction_and_stays_queryable_after_stop() {
+    use liazo_runtime::{
+        archive::{ArchiveLimits, ArchivePhase},
+        history::{HistoryLimits, HistoryState},
+    };
+    let capture = capture();
+    capture.gate.add_permits(1);
+    let (session, provider) = pair(capture).await;
+    let directory = tempfile::tempdir().unwrap();
+    session
+        .start_archive(directory.path().to_owned(), ArchiveLimits::default())
+        .await
+        .unwrap();
+    session.configure(settings()).await.unwrap();
+    timeout(Duration::from_secs(2), async {
+        let mut cursor = 0;
+        loop {
+            let observation = session
+                .observe(cursor, false, &[], Duration::from_millis(100))
+                .await;
+            cursor = observation.cursor;
+            if !observation.images.is_empty() {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    session.flush_archive().await.unwrap();
+    let before = session
+        .history_at(Duration::ZERO, &[source()])
+        .await
+        .unwrap();
+    let saved_at = Instant::now();
+    session
+        .configure_history(HistoryLimits {
+            duration_ms: 100,
+            max_bytes: 4096,
+        })
+        .unwrap();
+    timeout(Duration::from_secs(2), async {
+        while session.history_stats().payloads != 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let restored = session
+        .history_at(saved_at.elapsed(), &[source()])
+        .await
+        .unwrap();
+    assert!(matches!(
+        restored.images[0].state,
+        HistoryState::Available | HistoryState::Sampled
+    ));
+    assert_eq!(restored.images[0].payload, before.images[0].payload);
+    session.stop().await.unwrap();
+    assert_eq!(
+        session.archive_status().unwrap().phase,
+        ArchivePhase::Stopped
+    );
+    let after = session
+        .history_at(saved_at.elapsed(), &[source()])
+        .await
+        .unwrap();
+    assert_eq!(after.images[0].payload, before.images[0].payload);
+    provider.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn blocked_capture_does_not_block_control_or_leave_a_worker_after_stop() {
     let capture = capture();
     let (session, provider) = pair(capture.clone()).await;

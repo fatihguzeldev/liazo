@@ -24,6 +24,8 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+mod archive;
+
 struct Pending {
     command: Command,
     reply: oneshot::Sender<ReplyValue>,
@@ -71,6 +73,7 @@ impl Drop for PendingGuard {
 }
 
 struct Owner {
+    archive: tokio::sync::Mutex<Option<crate::archive::ArchiveWorker>>,
     cleanup: JoinHandle<()>,
     speech: tokio::sync::Mutex<Option<crate::speech::SpeechTask>>,
     shared: Arc<Shared>,
@@ -249,6 +252,7 @@ impl ReceiverSession {
             }
         });
         let receiver = Self(Arc::new(Owner {
+            archive: tokio::sync::Mutex::new(None),
             cleanup,
             speech: tokio::sync::Mutex::new(None),
             shared,
@@ -381,32 +385,58 @@ impl ReceiverSession {
                 ));
             }
         }
-        let mut state = self
-            .0
-            .shared
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let now = self.0.shared.now_ns();
-        let ago = u64::try_from(age.as_nanos())
-            .map_err(|_| failure(FailureCode::InvalidRequest, "invalid history time"))?;
-        let at = now.checked_sub(ago).ok_or_else(|| {
-            failure(
-                FailureCode::InvalidRequest,
-                "requested time predates this session",
-            )
-        })?;
-        let selected: Vec<_> = if selected.is_empty() {
-            state
-                .settings
-                .images
-                .iter()
-                .map(|image| image.source.clone())
-                .collect()
-        } else {
-            selected.to_vec()
+        let (mut snapshot, archive) = {
+            let mut state = self
+                .0
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let now = self.0.shared.now_ns();
+            let ago = u64::try_from(age.as_nanos())
+                .map_err(|_| failure(FailureCode::InvalidRequest, "invalid history time"))?;
+            let at = now.checked_sub(ago).ok_or_else(|| {
+                failure(
+                    FailureCode::InvalidRequest,
+                    "requested time predates this session",
+                )
+            })?;
+            let selected: Vec<_> = if selected.is_empty() {
+                state
+                    .settings
+                    .images
+                    .iter()
+                    .map(|image| image.source.clone())
+                    .collect()
+            } else {
+                selected.to_vec()
+            };
+            (state.history.at(at, now, &selected), state.archive.clone())
         };
-        Ok(state.history.at(at, now, &selected))
+        if let Some(archive) = archive {
+            use crate::history::{GapReason, HistoryState};
+            if let Some(stats) = archive.status().stats {
+                snapshot.retention_floor_ns =
+                    snapshot.retention_floor_ns.min(stats.retention_floor_ns);
+            }
+            for image in &mut snapshot.images {
+                if matches!(
+                    image.state,
+                    HistoryState::Expired
+                        | HistoryState::NotRetained
+                        | HistoryState::NotObserved
+                        | HistoryState::Gap(GapReason::Capacity | GapReason::NoData)
+                ) {
+                    let stored = archive
+                        .image(image.source.clone(), snapshot.requested_ns)
+                        .await?;
+                    if stored.state != HistoryState::NotObserved {
+                        *image = stored;
+                    }
+                }
+            }
+        }
+        Ok(snapshot)
     }
 
     pub async fn start_transcription(
@@ -604,6 +634,7 @@ impl ReceiverSession {
             == ConnectionState::Stopped
         {
             self.stop_transcription().await;
+            self.seal_archive().await?;
             return Ok(());
         }
         rpc(&self.0.shared, Command::Stop).await?;
@@ -619,6 +650,7 @@ impl ReceiverSession {
             self.0.shared.cancelled.cancel();
         }
         self.stop_transcription().await;
+        self.seal_archive().await?;
         Ok(())
     }
 }

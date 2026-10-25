@@ -14,6 +14,8 @@ pub use transcripts::TranscriptionStatus;
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
     #[error(transparent)]
+    Archive(#[from] archive::ArchiveError),
+    #[error(transparent)]
     Transcription(#[from] liazo_transcription::TranscriptionError),
     #[error(transparent)]
     Wire(#[from] liazo_core::wire::WireError),

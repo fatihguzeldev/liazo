@@ -231,6 +231,15 @@ async fn real_speech_crosses_peer_transport_and_shared_observation_without_block
     let session = ReceiverSession::connect(&client, address, Uuid::new_v4())
         .await
         .unwrap();
+    let archive = tempfile::tempdir().unwrap();
+    session
+        .start_archive(
+            archive.path().to_owned(),
+            liazo_runtime::archive::ArchiveLimits::default(),
+        )
+        .await
+        .unwrap();
+    let history_start = Instant::now();
     session
         .configure(CaptureSettings {
             images: vec![ImageSubscription {
@@ -304,6 +313,22 @@ async fn real_speech_crosses_peer_transport_and_shared_observation_without_block
             .is_empty()
     );
     session.stop_transcription().await;
+    session.flush_archive().await.unwrap();
+    let stored = session
+        .history_transcripts(history_start.elapsed(), Duration::ZERO, &[source(true)])
+        .await
+        .unwrap();
+    let expected = final_.as_ref().unwrap();
+    let final_record = stored
+        .entries
+        .iter()
+        .find(|entry| entry.transcript.id == expected.id)
+        .expect("final transcript archived");
+    assert_eq!(
+        serde_json::to_value(&final_record.transcript).unwrap(),
+        serde_json::to_value(expected).unwrap()
+    );
+    assert!(final_record.receiver_range.is_some());
     let idle = session.observe(0, false, &[], Duration::ZERO).await;
     let waiting = Instant::now();
     let quiet = session

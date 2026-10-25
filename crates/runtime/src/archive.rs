@@ -16,6 +16,9 @@ pub use retention::{ArchiveLimits, ArchiveStats};
 mod transcripts;
 pub use transcripts::{ArchivedTranscript, ReceiverTimeRange, TranscriptPage};
 mod lifecycle;
+mod worker;
+pub(crate) use worker::ArchiveRecord;
+pub use worker::{ArchiveClient, ArchivePhase, ArchiveStatus, ArchiveWorker};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ArchiveError {
@@ -37,6 +40,8 @@ pub enum ArchiveError {
     SessionMismatch,
     #[error("archive limit reached")]
     Capacity,
+    #[error("archive worker stopped")]
+    Stopped,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

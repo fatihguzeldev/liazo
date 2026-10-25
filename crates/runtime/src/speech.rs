@@ -162,7 +162,9 @@ impl Drop for Publication {
     fn drop(&mut self) {
         let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
         let cursor = state.cursor.saturating_add(1);
-        state.transcripts.stop(cursor, self.0.now_ns());
+        let now = self.0.now_ns();
+        state.transcripts.stop(cursor, now);
+        state.archive_transcripts(cursor.saturating_sub(1), now);
         state.changed();
         drop(state);
         self.0.signal();
@@ -172,7 +174,9 @@ impl Drop for Publication {
 fn publish(shared: &Shared, update: RecognitionUpdate) {
     let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
     let cursor = state.cursor.saturating_add(1);
-    if state.transcripts.publish(update, cursor, shared.now_ns()) {
+    let now = shared.now_ns();
+    if state.transcripts.publish(update, cursor, now) {
+        state.archive_transcripts(cursor.saturating_sub(1), now);
         state.changed();
     }
     drop(state);
