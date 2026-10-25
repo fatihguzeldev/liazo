@@ -99,12 +99,30 @@ try {
             [Environment]::SetEnvironmentVariable($name, $text.Substring($separator + 1), 'Process')
         }
         Remove-Variable devEnvironment
+        if (!$env:VCToolsInstallDir) { throw 'MSVC toolchain directory was not configured' }
+        $compilerDirectory = (Resolve-Path (Join-Path $env:VCToolsInstallDir 'bin/Hostx64/x64')).Path
+        $compilerPath = [IO.Path]::GetFullPath((Join-Path $compilerDirectory 'cl.exe'))
+        $linkerPath = [IO.Path]::GetFullPath((Join-Path $compilerDirectory 'link.exe'))
+        if (!(Test-Path -LiteralPath $compilerPath) -or !(Test-Path -LiteralPath $linkerPath)) {
+            throw 'native x64 MSVC compiler or linker is unavailable'
+        }
+        if (!$changedEnvironment.ContainsKey('PATH')) {
+            $changedEnvironment['PATH'] = [Environment]::GetEnvironmentVariable('PATH', 'Process')
+        }
+        [Environment]::SetEnvironmentVariable('PATH', "$compilerDirectory;$env:PATH", 'Process')
         $compiler = Get-Command cl.exe -CommandType Application -ErrorAction Stop
         $linker = Get-Command link.exe -CommandType Application -ErrorAction Stop
         $tools = (Resolve-Path (Join-Path $visualStudio 'VC/Tools/MSVC')).Path
-        if (!$compiler.Source.StartsWith($tools, [StringComparison]::OrdinalIgnoreCase) -or
-            $linker.Source -ne (Join-Path (Split-Path $compiler.Source -Parent) 'link.exe') -or
-            $env:VSCMD_ARG_TGT_ARCH -ne 'x64' -or $env:VSCMD_ARG_HOST_ARCH -ne 'x64') {
+        $compilerMatches = [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($compiler.Source), $compilerPath)
+        $linkerMatches = [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($linker.Source), $linkerPath)
+        Write-Host (@{
+            compiler = $compiler.Source; linker = $linker.Source
+            expectedCompiler = $compilerPath; expectedLinker = $linkerPath
+            hostArch = $env:VSCMD_ARG_HOST_ARCH; targetArch = $env:VSCMD_ARG_TGT_ARCH
+        } | ConvertTo-Json -Compress)
+        if (!$compilerDirectory.StartsWith($tools + [IO.Path]::DirectorySeparatorChar, [StringComparison]::OrdinalIgnoreCase) -or
+            !$compilerMatches -or !$linkerMatches -or
+            ([string]$env:VSCMD_ARG_TGT_ARCH).Trim() -ne 'x64' -or ([string]$env:VSCMD_ARG_HOST_ARCH).Trim() -ne 'x64') {
             throw 'expected the native x64 MSVC compiler and linker'
         }
         $includeDirectories = @($env:INCLUDE -split ';' | Where-Object { $_ })
