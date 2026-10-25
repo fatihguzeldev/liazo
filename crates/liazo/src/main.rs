@@ -28,6 +28,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    Mcp,
     Host {
         #[arg(long, default_value = "127.0.0.1:45811")]
         listen: SocketAddr,
@@ -130,8 +131,20 @@ fn execute(cli: Cli) -> Result<()> {
 
 async fn run(cli: Cli) -> Result<()> {
     let profile = profile::Profile::open(cli.profile)?;
+    if matches!(cli.command, Command::Mcp) {
+        let endpoint = liazo_host::launcher::Launcher {
+            executable: std::env::current_exe()?,
+            profile: profile.name,
+            root: profile.root,
+        }
+        .ensure()
+        .await?;
+        liazo_host::proxy::stdio(&endpoint).await?;
+        return Ok(());
+    }
     let credentials = profile.credentials()?;
     match cli.command {
+        Command::Mcp => unreachable!(),
         Command::Host { listen } => host::run(profile, credentials, listen).await,
         Command::Unlock => {
             let _ = profile.identity(&credentials)?;

@@ -409,6 +409,61 @@ async fn authenticated_consumers_share_one_session_and_binary_media_without_a_gu
         .unwrap();
     assert_eq!(image.headers()["cache-control"], "no-store");
     assert_eq!(image.bytes().await.unwrap().as_ref(), b"fixture-image");
+    std::fs::write(
+        root.path().join("host.json"),
+        serde_json::to_vec(&endpoint).unwrap(),
+    )
+    .unwrap();
+    let attached = liazo_host::launcher::Launcher {
+        executable: root.path().join("does-not-exist"),
+        profile: "fixture".into(),
+        root: root.path().to_owned(),
+    }
+    .ensure()
+    .await
+    .unwrap();
+    assert_eq!(
+        attached.address, endpoint.address,
+        "an existing host is reused without starting a process"
+    );
+    let proxy = liazo_host::proxy::McpProxy::connect(&attached)
+        .await
+        .unwrap();
+    let (proxy_io, consumer_io) = tokio::io::duplex(64 * 1024);
+    let proxy_server = tokio::spawn(async move {
+        proxy
+            .serve(proxy_io)
+            .await
+            .unwrap()
+            .waiting()
+            .await
+            .unwrap()
+    });
+    let consumer = ClientConfig::default().serve(consumer_io).await.unwrap();
+    let through_proxy = consumer
+        .call_tool(
+            CallToolRequestParams::new("observe").with_arguments(
+                json!({"binding":binding,"current":true})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(
+        through_proxy
+            .content
+            .iter()
+            .any(|content| content.as_image().is_some())
+    );
+    consumer.cancel().await.unwrap();
+    proxy_server.await.unwrap();
+    assert_eq!(
+        host.current().await.unwrap().connection,
+        liazo_runtime::ConnectionState::Connected,
+        "closing an MCP consumer leaves shared capture running"
+    );
     let scope: liazo_transport::SessionBinding = serde_json::from_value(binding.clone()).unwrap();
     let held = host.receiver(scope).await.unwrap();
     let cursor = held.observe(0, false, &[], Duration::ZERO).await.cursor;

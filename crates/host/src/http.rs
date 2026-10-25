@@ -35,6 +35,19 @@ pub struct Endpoint {
     pub token: String,
 }
 impl Endpoint {
+    pub fn validate(&self) -> std::io::Result<()> {
+        if self.version != 1
+            || !self.address.ip().is_loopback()
+            || self.address.port() == 0
+            || self.token.len() != 43
+            || !URL_SAFE_NO_PAD
+                .decode(&self.token)
+                .is_ok_and(|token| token.len() == 32)
+        {
+            return Err(std::io::Error::other("invalid local host endpoint"));
+        }
+        Ok(())
+    }
     pub fn new(address: SocketAddr) -> std::io::Result<Self> {
         if !address.ip().is_loopback() || address.port() == 0 {
             return Err(std::io::Error::other(
@@ -67,6 +80,7 @@ pub async fn serve(
     endpoint: Endpoint,
     cancel: CancellationToken,
 ) -> std::io::Result<()> {
+    endpoint.validate()?;
     if listener.local_addr()? != endpoint.address || !endpoint.address.ip().is_loopback() {
         return Err(std::io::Error::other(
             "local endpoint does not match listener",
