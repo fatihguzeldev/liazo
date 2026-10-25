@@ -110,10 +110,9 @@ pub async fn run(
     host.models().cancel().await;
     if let Some(current) = host.current().await
         && let Ok(receiver) = host.receiver(current.binding).await
+        && receiver.stop().await.is_err()
     {
-        if receiver.stop().await.is_err() {
-            let _ = receiver.disconnect().await;
-        }
+        let _ = receiver.disconnect().await;
     }
     cancel.cancel();
     if !server.is_finished() && timeout(Duration::from_secs(5), &mut server).await.is_err() {
