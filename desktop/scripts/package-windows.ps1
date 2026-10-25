@@ -1,6 +1,7 @@
 param(
     [ValidateSet('baseline', 'avx2')][string]$Cpu = 'baseline',
-    [ValidateSet('cpu', 'vulkan')][string]$Backend = 'cpu'
+    [ValidateSet('cpu', 'vulkan')][string]$Backend = 'cpu',
+    [string]$BuildRoot = ''
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -38,7 +39,7 @@ $variant = if ($Backend -eq 'cpu') { $Cpu } else { "$Cpu-$Backend" }
 $buildDirectory = if ($Backend -eq 'vulkan') {
     if ($Cpu -eq 'baseline') { 'target/vb' } else { 'target/va' }
 } else { "target/packages/windows-$variant" }
-$targetDir = Join-Path $root $buildDirectory
+$targetDir = if ($BuildRoot) { [IO.Path]::GetFullPath($BuildRoot) } else { Join-Path $root $buildDirectory }
 $output = Join-Path $root "target/distribution/$target-$variant"
 $stage = Join-Path $root 'desktop/src-tauri/binaries'
 $runtime = Join-Path $stage 'runtime'
