@@ -20,7 +20,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -45,6 +45,7 @@ struct Fixture {
     pcm: Arc<Vec<f32>>,
     gate: Arc<Semaphore>,
     active: Arc<AtomicUsize>,
+    changing: AtomicBool,
 }
 struct Track {
     clock: Instant,
@@ -134,6 +135,8 @@ impl CaptureBackend for Fixture {
         revision: u64,
     ) -> Result<Frame, Failure> {
         let started = self.clock_ns();
+        let changing = self.changing.load(Ordering::SeqCst);
+        let fingerprint = [if changing { sequence as u8 } else { 1 }; 32];
         let meta = ImageMeta {
             source: image.source.clone(),
             sequence,
@@ -143,12 +146,17 @@ impl CaptureBackend for Fixture {
             width: 1,
             height: 1,
             format: ImageFormat::Png,
-            fingerprint: [1; 32],
+            fingerprint,
         };
-        Ok(if previous.is_some() {
+        Ok(if previous == Some(fingerprint) {
             Frame::new(Header::Unchanged(meta), Bytes::new()).unwrap()
         } else {
-            Frame::new(Header::Image(meta), Bytes::from_static(b"image-fixture")).unwrap()
+            let bytes = if changing {
+                Bytes::from(format!("image-fixture-{sequence}"))
+            } else {
+                Bytes::from_static(b"image-fixture")
+            };
+            Frame::new(Header::Image(meta), bytes).unwrap()
         })
     }
     async fn audio(
@@ -170,32 +178,21 @@ impl CaptureBackend for Fixture {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires LIAZO_TEST_MODEL and a 16 khz mono LIAZO_TEST_SPEECH fixture"]
-async fn real_speech_crosses_peer_transport_and_shared_observation_without_blocking_images() {
-    let model = PathBuf::from(std::env::var_os("LIAZO_TEST_MODEL").expect("model path"));
-    let model = tokio::task::spawn_blocking(move || WhisperModel::load(&model))
-        .await
-        .unwrap()
-        .unwrap();
-    let mut reader =
-        hound::WavReader::open(std::env::var_os("LIAZO_TEST_SPEECH").expect("fixture path"))
-            .unwrap();
-    assert_eq!(
-        (reader.spec().sample_rate, reader.spec().channels),
-        (16_000, 1)
-    );
-    // A controlled 48 kHz source also exercises the actual streaming resampler.
-    let pcm: Vec<_> = reader
-        .samples::<i16>()
-        .flat_map(|sample| std::iter::repeat_n(f32::from(sample.unwrap()) / 32768.0, 3))
-        .collect();
-    let fixture = Arc::new(Fixture {
+fn fixture(pcm: Vec<f32>, changing: bool) -> Arc<Fixture> {
+    Arc::new(Fixture {
         clock: Instant::now(),
         pcm: Arc::new(pcm),
         gate: Arc::new(Semaphore::new(0)),
         active: Arc::new(AtomicUsize::new(0)),
-    });
+        changing: AtomicBool::new(changing),
+    })
+}
+async fn pair(
+    fixture: Arc<Fixture>,
+) -> (
+    ReceiverSession,
+    tokio::task::JoinHandle<Result<(), liazo_runtime::RuntimeError>>,
+) {
     let identity = Identity::generate().unwrap();
     let receiver = Identity::generate().unwrap();
     let server =
@@ -231,6 +228,31 @@ async fn real_speech_crosses_peer_transport_and_shared_observation_without_block
     let session = ReceiverSession::connect(&client, address, Uuid::new_v4())
         .await
         .unwrap();
+    (session, provider)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires LIAZO_TEST_MODEL and a 16 khz mono LIAZO_TEST_SPEECH fixture"]
+async fn real_speech_crosses_peer_transport_and_shared_observation_without_blocking_images() {
+    let model = PathBuf::from(std::env::var_os("LIAZO_TEST_MODEL").expect("model path"));
+    let model = tokio::task::spawn_blocking(move || WhisperModel::load(&model))
+        .await
+        .unwrap()
+        .unwrap();
+    let mut reader =
+        hound::WavReader::open(std::env::var_os("LIAZO_TEST_SPEECH").expect("fixture path"))
+            .unwrap();
+    assert_eq!(
+        (reader.spec().sample_rate, reader.spec().channels),
+        (16_000, 1)
+    );
+    // A controlled 48 kHz source also exercises the actual streaming resampler.
+    let pcm: Vec<_> = reader
+        .samples::<i16>()
+        .flat_map(|sample| std::iter::repeat_n(f32::from(sample.unwrap()) / 32768.0, 3))
+        .collect();
+    let fixture = fixture(pcm, false);
+    let (session, provider) = pair(fixture.clone()).await;
     let archive = tempfile::tempdir().unwrap();
     session
         .start_archive(
@@ -263,6 +285,14 @@ async fn real_speech_crosses_peer_transport_and_shared_observation_without_block
         .configure_raw_audio(vec![source(true)])
         .await
         .unwrap();
+    #[cfg(feature = "test-support")]
+    let mut disk_hold = {
+        fixture.changing.store(true, Ordering::SeqCst);
+        session.set_archive_database_full(true).await.unwrap();
+        Some(session.hold_archive().await.unwrap())
+    };
+    #[cfg(feature = "test-support")]
+    let mut storage_recovered = false;
     fixture.gate.add_permits(1);
     let mut cursor = 0;
     let mut partials = Vec::new();
@@ -275,6 +305,17 @@ async fn real_speech_crosses_peer_transport_and_shared_observation_without_block
                 .await;
             cursor = observed.cursor;
             assert_eq!(observed.transcription.gaps, 0);
+            #[cfg(feature = "test-support")]
+            if responsive
+                && !storage_recovered
+                && observed.archive.as_ref().is_some_and(|status| {
+                    status.phase == liazo_runtime::archive::ArchivePhase::Failed
+                })
+            {
+                session.set_archive_database_full(false).await.unwrap();
+                fixture.changing.store(false, Ordering::SeqCst);
+                storage_recovered = true;
+            }
             for transcript in observed.transcripts {
                 assert_eq!(transcript.source, source(true));
                 if transcript.ending.is_none() && !transcript.text.is_empty() {
@@ -289,6 +330,11 @@ async fn real_speech_crosses_peer_transport_and_shared_observation_without_block
                         .unwrap();
                         assert!(image.images[0].payload.is_some());
                         responsive = true;
+                        #[cfg(feature = "test-support")]
+                        {
+                            assert!(session.archive_status().unwrap().dropped_records > 0);
+                            drop(disk_hold.take());
+                        }
                     }
                 } else if transcript.ending.is_some()
                     && transcript.text.split_whitespace().count() >= 3
@@ -300,6 +346,11 @@ async fn real_speech_crosses_peer_transport_and_shared_observation_without_block
     })
     .await
     .unwrap();
+    #[cfg(feature = "test-support")]
+    assert!(
+        storage_recovered,
+        "real STT must continue through both held and full archive storage"
+    );
     assert!(responsive && partials.contains(&final_.as_ref().unwrap().id));
     let independent = session.observe(0, false, &[], Duration::ZERO).await;
     assert!(
@@ -376,4 +427,231 @@ async fn real_speech_crosses_peer_transport_and_shared_observation_without_block
             .transcription
             .active
     );
+}
+
+#[cfg(feature = "test-support")]
+mod storage_failures {
+    use super::*;
+    use liazo_runtime::{
+        archive::{ArchiveLimits, ArchivePhase},
+        history::GapReason,
+    };
+
+    async fn setup() -> (
+        Arc<Fixture>,
+        ReceiverSession,
+        tokio::task::JoinHandle<Result<(), liazo_runtime::RuntimeError>>,
+        tempfile::TempDir,
+    ) {
+        let fixture = fixture(vec![], true);
+        let (session, provider) = pair(fixture.clone()).await;
+        let archive = tempfile::tempdir().unwrap();
+        session
+            .start_archive(
+                archive.path().to_owned(),
+                ArchiveLimits {
+                    duration_ms: 60_000,
+                    max_bytes: 4 * 1024 * 1024,
+                },
+            )
+            .await
+            .unwrap();
+        session
+            .configure(CaptureSettings {
+                images: vec![ImageSubscription {
+                    source: source(false),
+                    interval_ms: 50,
+                    max_width: None,
+                    crop: None,
+                    format: ImageFormat::Png,
+                    quality: 90,
+                    include_cursor: false,
+                }],
+                audio: vec![source(true)],
+            })
+            .await
+            .unwrap();
+        session
+            .configure_raw_audio(vec![source(true)])
+            .await
+            .unwrap();
+        fixture.gate.add_permits(1);
+        progress(&session, 0, 0).await;
+        session.flush_archive().await.unwrap();
+        (fixture, session, provider, archive)
+    }
+
+    async fn progress(
+        session: &ReceiverSession,
+        image: u64,
+        audio: u64,
+    ) -> liazo_runtime::Observation {
+        timeout(Duration::from_secs(3), async {
+            loop {
+                let observed = session.observe(0, true, &[], Duration::ZERO).await;
+                if observed
+                    .images
+                    .first()
+                    .is_some_and(|value| value.metadata.sequence > image)
+                    && observed
+                        .audio
+                        .first()
+                        .is_some_and(|value| value.sequence > audio)
+                {
+                    assert_eq!(observed.gaps, 0);
+                    assert!(observed.images[0].payload.is_some());
+                    return observed;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("live image and audio must progress independently of disk")
+    }
+
+    fn ordered_gap(directory: &std::path::Path, reason: GapReason) {
+        let database = rusqlite::Connection::open_with_flags(
+            directory.join("index.sqlite3"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let (first, end): (u64, u64) = database.query_row(
+            "SELECT first_ns,end_ns FROM gaps WHERE source=?1 AND reason=?2 ORDER BY first_ns LIMIT 1",
+            rusqlite::params![source(false).id, serde_json::to_string(&reason).unwrap()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).expect("the missing image interval must close after recovery");
+        assert!(first < end);
+        let preceding: u64 = database
+            .query_row(
+                "SELECT MAX(last_ns) FROM images WHERE source=?1 AND last_ns<?2",
+                rusqlite::params![source(false).id, first],
+                |row| row.get(0),
+            )
+            .expect("older accepted queued images must survive before the loss marker");
+        assert!(preceding < first);
+        let inside: u64 = database
+            .query_row(
+                "SELECT COUNT(*) FROM images WHERE source=?1 AND first_ns>=?2 AND first_ns<?3",
+                rusqlite::params![source(false).id, first, end],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            inside, 0,
+            "queued pre-gap data cannot be reclassified inside the later missing interval"
+        );
+    }
+
+    async fn finish(
+        session: ReceiverSession,
+        provider: tokio::task::JoinHandle<Result<(), liazo_runtime::RuntimeError>>,
+        fixture: Arc<Fixture>,
+    ) {
+        session.stop().await.unwrap();
+        timeout(Duration::from_secs(3), provider)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(fixture.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stalled_archive_preserves_live_tls_media_and_source_ordered_backpressure_gaps() {
+        let (fixture, session, provider, archive) = setup().await;
+        let before = session.observe(0, false, &[], Duration::ZERO).await;
+        let held = session.hold_archive().await.unwrap();
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if session.archive_status().unwrap().dropped_records > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the bounded archive queue must report overflow while its writer is held");
+        let after = progress(
+            &session,
+            before.images[0].metadata.sequence,
+            before.audio[0].sequence,
+        )
+        .await;
+        let status = after.archive.unwrap();
+        assert!(status.dropped_records > 0);
+        assert!((1..=64 * 1024 * 1024).contains(&status.queued_bytes));
+        let fresh = timeout(
+            Duration::from_secs(2),
+            session.capture_now(vec![source(false)]),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(fresh.images[0].metadata.sequence > before.images[0].metadata.sequence);
+        drop(held);
+        session.flush_archive().await.unwrap();
+        session.capture_now(vec![source(false)]).await.unwrap();
+        session.flush_archive().await.unwrap();
+        ordered_gap(archive.path(), GapReason::ArchiveBackpressure);
+        let audio = session
+            .history_audio(session.elapsed(), Duration::ZERO, &[source(true)])
+            .await
+            .unwrap();
+        assert!(
+            audio
+                .gaps
+                .iter()
+                .any(|gap| gap.reason == GapReason::ArchiveBackpressure)
+        );
+        let recovered = session.archive_status().unwrap();
+        assert_eq!(recovered.phase, ArchivePhase::Recording);
+        assert!(recovered.queued_bytes <= 64 * 1024 * 1024);
+        finish(session, provider, fixture).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sqlite_full_does_not_block_live_tls_media_and_recovery_keeps_a_real_failure_gap() {
+        let (fixture, session, provider, archive) = setup().await;
+        let before = session.observe(0, false, &[], Duration::ZERO).await;
+        session.set_archive_database_full(true).await.unwrap();
+        timeout(Duration::from_secs(4), async {
+            loop {
+                let status = session.archive_status().unwrap();
+                if status.phase == ArchivePhase::Failed && status.dropped_records > 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the actual SQLite page limit must fail an archive write");
+        progress(
+            &session,
+            before.images[0].metadata.sequence,
+            before.audio[0].sequence,
+        )
+        .await;
+        let fresh = timeout(
+            Duration::from_secs(2),
+            session.capture_now(vec![source(false)]),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(fresh.images[0].metadata.sequence > before.images[0].metadata.sequence);
+        session.set_archive_database_full(false).await.unwrap();
+        progress(
+            &session,
+            fresh.images[0].metadata.sequence,
+            before.audio[0].sequence,
+        )
+        .await;
+        session.flush_archive().await.unwrap();
+        ordered_gap(archive.path(), GapReason::ArchiveFailure);
+        assert_eq!(
+            session.archive_status().unwrap().phase,
+            ArchivePhase::Recording
+        );
+        finish(session, provider, fixture).await;
+    }
 }

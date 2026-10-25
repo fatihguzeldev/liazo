@@ -50,7 +50,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p liazo-transcription --test real_engine --locked -- --ignored --test-threads=1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test -p liazo-runtime --test streaming_peer --locked -- --ignored --test-threads=1
+          cargo test -p liazo-runtime --test streaming_peer --features test-support --locked -- --ignored --test-threads=1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p liazo-host --test recovery --locked -- --ignored --test-threads=1
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
