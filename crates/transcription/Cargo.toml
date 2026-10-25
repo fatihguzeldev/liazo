@@ -13,7 +13,7 @@ vulkan = ["whisper-rs/vulkan", "whisper-rs/raw-api"]
 liazo-core = { path = "../core" }
 serde.workspace = true
 thiserror.workspace = true
-whisper-rs = "=0.16.0"
+whisper-rs = { version = "=0.16.0", features = ["raw-api"] }
 rubato = { version = "=5.0.1", default-features = false }
 audioadapter-buffers = "5.1"
 uuid.workspace = true
