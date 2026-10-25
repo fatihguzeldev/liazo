@@ -24,7 +24,7 @@ pub enum WireError {
     Io(#[from] std::io::Error),
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ImageMeta {
     pub source: SourceKey,
     pub sequence: u64,

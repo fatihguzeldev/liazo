@@ -128,7 +128,7 @@ pub async fn serve(
         .route("/v1/transcribe", post(transcribe))
         .route("/v1/transcription-stop", post(transcription_stop))
         .route("/v1/stop", post(stop))
-        .route("/v1/media/{id}", get(media))
+        .route("/v1/media/{id}", get(media).delete(release_media))
         .layer(middleware::from_fn_with_state(state.clone(), authorize))
         .with_state(state);
     axum::serve(listener, router)
@@ -216,14 +216,14 @@ impl IntoResponse for HostError {
     }
 }
 
-#[derive(Serialize)]
-struct ObservationResponse {
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ObservationResponse {
     observation: Observation,
     media: Vec<MediaRef>,
     media_omitted: usize,
 }
-#[derive(Serialize)]
-struct HistoryResponse {
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct HistoryResponse {
     history: HistorySnapshot,
     media: Vec<MediaRef>,
     media_omitted: usize,
@@ -385,4 +385,8 @@ async fn media(State(state): State<HttpState>, Path(id): Path<Uuid>) -> Response
         Some((bytes, mime)) => ([(header::CONTENT_TYPE, mime)], bytes).into_response(),
         None => StatusCode::GONE.into_response(),
     }
+}
+async fn release_media(State(state): State<HttpState>, Path(id): Path<Uuid>) -> StatusCode {
+    state.media.release(id);
+    StatusCode::NO_CONTENT
 }

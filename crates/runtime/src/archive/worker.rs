@@ -23,7 +23,7 @@ const BUDGET_KIB: usize = 64 * 1024;
 const QUEUE: usize = 32;
 const MAX_PENDING_SOURCES: usize = 64;
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ArchivePhase {
     Recording,
@@ -32,7 +32,7 @@ pub enum ArchivePhase {
     Stopped,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, schemars::JsonSchema)]
 pub struct ArchiveStatus {
     pub phase: ArchivePhase,
     pub queued_bytes: u64,

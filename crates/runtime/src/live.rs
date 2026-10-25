@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 use uuid::Uuid;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionState {
     Connecting,
@@ -23,7 +23,7 @@ pub enum ConnectionState {
     Disconnected,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Freshness {
     Live,
@@ -35,10 +35,16 @@ pub enum Freshness {
     Stopped,
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, schemars::JsonSchema)]
 pub struct AgeRange {
     pub minimum_ms: u64,
     pub maximum_ms: u64,
+}
+
+#[derive(Clone, Serialize, schemars::JsonSchema)]
+pub struct AudioAge {
+    pub source: SourceKey,
+    pub age: AgeRange,
 }
 
 #[derive(Clone, Copy)]
@@ -81,7 +87,7 @@ impl ClockMap {
     }
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, schemars::JsonSchema)]
 pub struct ObservedImage {
     pub metadata: ImageMeta,
     pub freshness: Freshness,
@@ -90,7 +96,7 @@ pub struct ObservedImage {
     pub payload: Option<Bytes>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, schemars::JsonSchema)]
 pub struct Observation {
     pub settings: CaptureSettings,
     pub archive: Option<crate::archive::ArchiveStatus>,
@@ -101,6 +107,7 @@ pub struct Observation {
     pub source_revision: u64,
     pub images: Vec<ObservedImage>,
     pub audio: Vec<AudioMeta>,
+    pub audio_ages: Vec<AudioAge>,
     pub transcripts: Vec<Transcript>,
     pub transcription: TranscriptionStatus,
     pub transcript_deltas_lost: bool,
@@ -603,13 +610,30 @@ impl LiveState {
             configuration_revision: self.revision,
             source_revision: self.sources.revision,
             images,
-            audio: self.audio.values().cloned().collect(),
+            audio: self
+                .audio
+                .values()
+                .filter(|meta| selected.is_empty() || selected.contains(&meta.source))
+                .cloned()
+                .collect(),
+            audio_ages: self
+                .audio
+                .values()
+                .filter(|meta| selected.is_empty() || selected.contains(&meta.source))
+                .filter_map(|meta| {
+                    self.clock.map(|clock| AudioAge {
+                        source: meta.source.clone(),
+                        age: clock.age(meta.captured_ns, meta.captured_ns, now_ns),
+                    })
+                })
+                .collect(),
             transcripts,
             transcription: self.transcripts.status.clone(),
             transcript_deltas_lost,
             failures: self
                 .failures
                 .iter()
+                .filter(|(source, _)| selected.is_empty() || selected.contains(source))
                 .map(|(source, health)| (source.clone(), health.failure.clone()))
                 .collect(),
             gaps: self.gaps,
@@ -620,6 +644,17 @@ impl LiveState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_timestamps_keep_clock_uncertainty_when_projected_and_aged() {
+        let clock = ClockMap::new(10_000_000, 20_000_000, 1_002_000_000, 1_004_000_000).unwrap();
+        let range = clock.project(1_010_000_000, 1_020_000_000);
+        assert_eq!(
+            (range.earliest_ns, range.latest_ns),
+            (18_000_000, 36_000_000)
+        );
+        let age = clock.age(1_010_000_000, 1_020_000_000, 100_000_000);
+        assert_eq!((age.minimum_ms, age.maximum_ms), (64, 82));
+    }
     #[test]
     fn audio_progress_is_current_but_only_lifecycle_and_gaps_advance_the_observation_cursor() {
         let key = SourceKey {

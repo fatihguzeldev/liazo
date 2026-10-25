@@ -83,14 +83,14 @@ pub struct CatalogUpdate {
     pub changed: Vec<Source>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SourceIssue {
     pub kind: SourceKind,
     pub availability: SourceAvailability,
     pub message: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SourceSnapshot {
     pub revision: u64,
     pub sources: Vec<Source>,

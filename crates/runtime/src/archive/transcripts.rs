@@ -3,20 +3,20 @@ use liazo_core::{protocol::SourceKey, transcript::Transcript};
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ReceiverTimeRange {
     pub earliest_ns: u64,
     pub latest_ns: u64,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, schemars::JsonSchema)]
 pub struct ArchivedTranscript {
     pub transcript: Transcript,
     pub received_ns: u64,
     pub receiver_range: Option<ReceiverTimeRange>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, schemars::JsonSchema)]
 pub struct TranscriptPage {
     pub entries: Vec<ArchivedTranscript>,
     pub truncated: bool,

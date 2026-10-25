@@ -20,7 +20,7 @@ struct Item {
 #[derive(Clone, Default)]
 pub(crate) struct Media(Arc<Mutex<HashMap<Uuid, Item>>>);
 
-#[derive(Serialize)]
+#[derive(Serialize, schemars::JsonSchema)]
 pub struct MediaRef {
     pub id: Uuid,
     pub source: SourceKey,
@@ -65,5 +65,8 @@ impl Media {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .retain(|_, item| item.expires > Instant::now());
+    }
+    pub fn release(&self, id: Uuid) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
     }
 }

@@ -10,7 +10,7 @@ const KEEP_NS: u64 = 60_000_000_000;
 const MAX_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ROWS: usize = 1024;
 
-#[derive(Clone, Default, Serialize)]
+#[derive(Clone, Default, Serialize, schemars::JsonSchema)]
 pub struct TranscriptionStatus {
     pub active: bool,
     pub sources: Vec<SourceKey>,

@@ -31,7 +31,7 @@ impl SourceKey {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceKind {
     Display,
@@ -41,7 +41,7 @@ pub enum SourceKind {
     Microphone,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceAvailability {
     Available,
@@ -49,7 +49,7 @@ pub enum SourceAvailability {
     Unavailable,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Source {
     pub key: SourceKey,
     pub label: String,
@@ -155,7 +155,7 @@ impl CaptureSettings {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AudioMeta {
     pub source: SourceKey,
     pub stream_id: Uuid,

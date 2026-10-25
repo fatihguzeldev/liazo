@@ -39,7 +39,7 @@ impl HistoryLimits {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum GapReason {
     ArchiveBackpressure,
@@ -55,7 +55,7 @@ pub enum GapReason {
     Capacity,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, schemars::JsonSchema)]
 #[serde(tag = "state", content = "reason", rename_all = "snake_case")]
 pub enum HistoryState {
     Available,
@@ -66,7 +66,7 @@ pub enum HistoryState {
     NotObserved,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, schemars::JsonSchema)]
 pub struct HistoricalImage {
     pub source: SourceKey,
     pub state: HistoryState,
@@ -78,7 +78,7 @@ pub struct HistoricalImage {
     pub payload: Option<Bytes>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, schemars::JsonSchema)]
 pub struct HistorySnapshot {
     // Receiver monotonic session time. Capture metadata retains the provider clock.
     pub requested_ns: u64,

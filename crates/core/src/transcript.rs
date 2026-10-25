@@ -2,7 +2,7 @@ use crate::protocol::{ProtocolError, SourceKey};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum EndReason {
     Silence,
@@ -11,7 +11,7 @@ pub enum EndReason {
     Gap,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum TranscriptionGapReason {
     AudioDiscontinuity,
@@ -28,7 +28,7 @@ pub struct TranscriptionGap {
     pub reason: TranscriptionGapReason,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Transcript {
     pub id: Uuid,
     pub source: SourceKey,

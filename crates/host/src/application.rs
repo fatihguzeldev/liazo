@@ -28,7 +28,7 @@ pub enum HostError {
     Transcription(#[from] liazo_transcription::TranscriptionError),
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, schemars::JsonSchema)]
 pub struct SessionSummary {
     pub binding: SessionBinding,
     pub provider: String,

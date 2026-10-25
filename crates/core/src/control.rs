@@ -64,7 +64,7 @@ pub struct SourcePage {
     pub next_after: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum FailureCode {
     InvalidRequest,
@@ -78,7 +78,7 @@ pub enum FailureCode {
     Internal,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, thiserror::Error)]
+#[derive(Clone, Debug, Serialize, Deserialize, thiserror::Error, schemars::JsonSchema)]
 #[error("{message}")]
 pub struct Failure {
     pub code: FailureCode,

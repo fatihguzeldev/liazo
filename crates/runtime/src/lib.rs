@@ -8,7 +8,7 @@ pub mod provider;
 pub mod receiver;
 mod speech;
 mod transcripts;
-pub use live::{AgeRange, ConnectionState, Freshness, Observation, ObservedImage};
+pub use live::{AgeRange, AudioAge, ConnectionState, Freshness, Observation, ObservedImage};
 pub use transcripts::TranscriptionStatus;
 
 #[derive(Debug, thiserror::Error)]

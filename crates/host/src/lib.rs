@@ -1,4 +1,5 @@
 mod application;
+pub mod bindings;
 pub mod http;
 pub mod launcher;
 mod mcp;

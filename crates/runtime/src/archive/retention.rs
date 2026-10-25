@@ -36,7 +36,7 @@ impl ArchiveLimits {
     }
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, Serialize, schemars::JsonSchema)]
 pub struct ArchiveStats {
     pub accounted_bytes: u64,
     pub metadata_budget_bytes: u64,
