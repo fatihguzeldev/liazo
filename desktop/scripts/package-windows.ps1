@@ -3,6 +3,16 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 if (!$IsWindows) { throw 'Windows packaging requires a native Windows build' }
 
+function Get-SourceStatus([string]$Phase) {
+    $changes = @(& git status --porcelain --untracked-files=normal)
+    if ($LASTEXITCODE -ne 0) { throw 'source status unavailable' }
+    Write-Host "source status ($Phase):"
+    if ($changes.Count) {
+        $changes | ForEach-Object { Write-Host $_ }
+    } else { Write-Host 'clean' }
+    return $changes
+}
+
 $root = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 $target = 'x86_64-pc-windows-msvc'
 $targetDir = Join-Path $root "target/packages/windows-$Cpu"
@@ -33,6 +43,7 @@ if ($Cpu -eq 'avx2') {
 
 Push-Location $root
 try {
+    $sourceChangesBefore = @(Get-SourceStatus 'before cargo')
     foreach ($entry in $settings.GetEnumerator()) {
         $changedEnvironment[$entry.Key] = [Environment]::GetEnvironmentVariable($entry.Key, 'Process')
         [Environment]::SetEnvironmentVariable($entry.Key, $entry.Value, 'Process')
@@ -42,6 +53,7 @@ try {
     $version = ($metadata.packages | Where-Object name -eq 'liazo').version
     & cargo build --locked --release --target $target -p liazo
     if ($LASTEXITCODE -ne 0) { throw 'companion build failed' }
+    Get-SourceStatus 'after companion' | Out-Null
     $release = Join-Path $targetDir "$target/release"
     New-Item -ItemType Directory -Path $stage, $runtime, $output -Force | Out-Null
     Copy-Item (Join-Path $release 'liazo.exe') (Join-Path $stage "liazo-$target.exe") -Force
@@ -60,6 +72,7 @@ try {
         & npm run tauri -- build --target $target --config src-tauri/bundle.windows.json --bundles nsis
         if ($LASTEXITCODE -ne 0) { throw 'desktop installer build failed' }
     } finally { Pop-Location }
+    Get-SourceStatus 'after desktop bundle' | Out-Null
 
     $portable = Join-Path $output 'portable'
     if (Test-Path $portable) { Remove-Item $portable -Recurse -Force }
@@ -95,12 +108,14 @@ try {
 
     $source = & git rev-parse HEAD
     if ($LASTEXITCODE -ne 0) { throw 'source identity unavailable' }
-    $sourceDirty = [bool](& git status --porcelain --untracked-files=normal)
-    if ($LASTEXITCODE -ne 0) { throw 'source status unavailable' }
+    $sourceChanges = @(Get-SourceStatus 'after packaged smoke')
+    $sourceDirty = [bool]$sourceChanges
     @{
         version = $version
         source = $source
         sourceDirty = $sourceDirty
+        sourceChangesBefore = $sourceChangesBefore
+        sourceChanges = $sourceChanges
         target = $target
         cpu = $Cpu
         cpuRequirements = @(if ($Cpu -eq 'avx2') { 'SSE4.2'; 'AVX'; 'AVX2'; 'BMI2'; 'FMA'; 'F16C' } else { 'x86-64 baseline' })
