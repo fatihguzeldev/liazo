@@ -550,6 +550,9 @@ impl ReceiverSession {
                         "capture settings changed",
                     ));
                 }
+                if let Some(failure) = state.capture_failure(&sources, not_before_ns) {
+                    return Err(failure.into());
+                }
                 if state.fresh_after(&sources, revision, not_before_ns) {
                     return Ok(state.observe(0, true, &sources, self.0.shared.now_ns()));
                 }
@@ -718,8 +721,7 @@ async fn fetch_sources(shared: &Arc<Shared>) -> Result<(), RuntimeError> {
             if after.is_none() {
                 let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
                 if snapshot.revision >= state.sources.revision {
-                    state.sources = snapshot;
-                    state.changed();
+                    state.sources_changed(snapshot, shared.now_ns());
                 }
                 drop(state);
                 shared.signal();

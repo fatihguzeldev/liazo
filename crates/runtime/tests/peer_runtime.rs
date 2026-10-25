@@ -18,7 +18,7 @@ use liazo_transport::{Identity, LaneKind, PeerClient, PeerServer, PeerSession, S
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -31,6 +31,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 struct Capture {
+    permission_required: AtomicBool,
     clock: Instant,
     gate: Semaphore,
     started: Notify,
@@ -73,7 +74,11 @@ impl CaptureBackend for Capture {
                 key: source(),
                 label: "fixture".into(),
                 kind: SourceKind::Display,
-                availability: SourceAvailability::Available,
+                availability: if self.permission_required.load(Ordering::SeqCst) {
+                    SourceAvailability::PermissionRequired
+                } else {
+                    SourceAvailability::Available
+                },
                 pixel_width: Some(1200),
                 pixel_height: Some(800),
                 scale: Some(1.0),
@@ -89,6 +94,12 @@ impl CaptureBackend for Capture {
         sequence: u64,
         revision: u64,
     ) -> Result<Frame, Failure> {
+        if self.permission_required.load(Ordering::SeqCst) {
+            return Err(Failure::new(
+                FailureCode::PermissionRequired,
+                "fixture permission revoked",
+            ));
+        }
         struct Active<'a>(&'a AtomicUsize);
         impl Drop for Active<'_> {
             fn drop(&mut self) {
@@ -172,6 +183,7 @@ async fn pair(
 
 fn capture() -> Arc<Capture> {
     Arc::new(Capture {
+        permission_required: AtomicBool::new(false),
         clock: Instant::now(),
         gate: Semaphore::new(0),
         started: Notify::new(),
@@ -297,5 +309,70 @@ async fn history_expires_in_the_background_while_the_current_live_image_stays_av
         stopped.images[0].state,
         HistoryState::Gap(GapReason::Stopped)
     );
+    provider.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn permission_changes_close_history_and_fresh_capture_reports_the_source_error_promptly() {
+    use liazo_runtime::{
+        Freshness, RuntimeError,
+        history::{GapReason, HistoryState},
+    };
+    let capture = capture();
+    capture.gate.add_permits(1);
+    let (session, provider) = pair(capture.clone()).await;
+    session.configure(settings()).await.unwrap();
+    timeout(Duration::from_secs(1), async {
+        let mut cursor = 0;
+        loop {
+            let observed = session
+                .observe(cursor, false, &[], Duration::from_millis(100))
+                .await;
+            if !observed.images.is_empty() {
+                break;
+            }
+            cursor = observed.cursor;
+        }
+    })
+    .await
+    .unwrap();
+    capture.permission_required.store(true, Ordering::SeqCst);
+    timeout(Duration::from_secs(3), async {
+        let mut cursor = 0;
+        loop {
+            let observed = session
+                .observe(cursor, false, &[], Duration::from_millis(250))
+                .await;
+            if observed.images[0].freshness == Freshness::PermissionRequired {
+                break;
+            }
+            cursor = observed.cursor;
+        }
+    })
+    .await
+    .unwrap();
+    let history = session
+        .history_at(Duration::ZERO, &[source()])
+        .await
+        .unwrap();
+    assert_eq!(
+        history.images[0].state,
+        HistoryState::Gap(GapReason::PermissionRequired)
+    );
+    let error = timeout(Duration::from_secs(1), session.capture_now(vec![source()]))
+        .await
+        .unwrap();
+    assert!(matches!(
+        error,
+        Err(RuntimeError::Failure(Failure {
+            code: FailureCode::PermissionRequired,
+            ..
+        }))
+    ));
+    assert_eq!(
+        session.observe(0, false, &[], Duration::ZERO).await.images[0].freshness,
+        Freshness::PermissionRequired
+    );
+    session.stop().await.unwrap();
     provider.await.unwrap().unwrap();
 }

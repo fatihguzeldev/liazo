@@ -182,6 +182,32 @@ impl LiveState {
         self.expected_audio.clear();
         self.prune();
     }
+
+    pub fn sources_changed(&mut self, sources: SourceSnapshot, now: u64) {
+        for image in self.settings.images.iter().chain(&self.expected) {
+            let availability = sources
+                .sources
+                .iter()
+                .find(|source| source.key == image.source)
+                .map(|source| source.availability);
+            let reason = match availability {
+                Some(SourceAvailability::Available) => continue,
+                Some(SourceAvailability::PermissionRequired) => GapReason::PermissionRequired,
+                _ => GapReason::Unavailable,
+            };
+            self.history.gap(image.source.clone(), now, reason);
+        }
+        self.sources = sources;
+        self.changed();
+    }
+
+    pub fn capture_failure(&self, sources: &[SourceKey], not_before: u64) -> Option<Failure> {
+        sources
+            .iter()
+            .filter_map(|source| self.failures.get(source))
+            .find(|health| health.observed_ns >= not_before)
+            .map(|health| health.failure.clone())
+    }
     fn prune(&mut self) {
         self.images.retain(|source, _| {
             self.settings
@@ -398,64 +424,69 @@ impl LiveState {
         selected: &[SourceKey],
         now_ns: u64,
     ) -> Observation {
-        let images = self
-            .images
-            .values()
-            .filter(|image| selected.is_empty() || selected.contains(&image.metadata.source))
-            .map(|image| {
-                let age = self.clock.map(|clock| {
-                    clock.age(
-                        image.metadata.capture_started_ns,
-                        image.metadata.captured_ns,
-                        now_ns,
-                    )
-                });
-                let source = self
-                    .sources
-                    .sources
-                    .iter()
-                    .find(|source| source.key == image.metadata.source);
-                let limit = self
-                    .settings
-                    .images
-                    .iter()
-                    .find(|setting| setting.source == image.metadata.source)
-                    .map_or(2000, |setting| u64::from(setting.interval_ms) * 3 + 1000);
-                let freshness = match self.connection {
-                    ConnectionState::Stopped => Freshness::Stopped,
-                    ConnectionState::Disconnected => Freshness::Disconnected,
-                    ConnectionState::Connecting => Freshness::Waiting,
-                    ConnectionState::Connected => {
-                        if image.metadata.configuration_revision != self.revision {
-                            Freshness::Waiting
-                        } else if self.failures.contains_key(&image.metadata.source)
-                            || source.is_none_or(|source| {
-                                source.availability == SourceAvailability::Unavailable
-                            })
-                        {
-                            Freshness::Unavailable
-                        } else if source.is_some_and(|source| {
-                            source.availability == SourceAvailability::PermissionRequired
-                        }) {
-                            Freshness::PermissionRequired
-                        } else if age.is_none() {
-                            Freshness::Waiting
-                        } else if age.is_some_and(|age| age.maximum_ms > limit) {
-                            Freshness::Stale
-                        } else {
-                            Freshness::Live
+        let images =
+            self.images
+                .values()
+                .filter(|image| selected.is_empty() || selected.contains(&image.metadata.source))
+                .map(|image| {
+                    let age = self.clock.map(|clock| {
+                        clock.age(
+                            image.metadata.capture_started_ns,
+                            image.metadata.captured_ns,
+                            now_ns,
+                        )
+                    });
+                    let source = self
+                        .sources
+                        .sources
+                        .iter()
+                        .find(|source| source.key == image.metadata.source);
+                    let limit = self
+                        .settings
+                        .images
+                        .iter()
+                        .find(|setting| setting.source == image.metadata.source)
+                        .map_or(2000, |setting| u64::from(setting.interval_ms) * 3 + 1000);
+                    let freshness = match self.connection {
+                        ConnectionState::Stopped => Freshness::Stopped,
+                        ConnectionState::Disconnected => Freshness::Disconnected,
+                        ConnectionState::Connecting => Freshness::Waiting,
+                        ConnectionState::Connected => {
+                            if image.metadata.configuration_revision != self.revision {
+                                Freshness::Waiting
+                            } else if self.failures.get(&image.metadata.source).is_some_and(
+                                |health| {
+                                    health.failure.code
+                                        == liazo_core::control::FailureCode::PermissionRequired
+                                },
+                            ) || source.is_some_and(|source| {
+                                source.availability == SourceAvailability::PermissionRequired
+                            }) {
+                                Freshness::PermissionRequired
+                            } else if self.failures.contains_key(&image.metadata.source)
+                                || source.is_none_or(|source| {
+                                    source.availability == SourceAvailability::Unavailable
+                                })
+                            {
+                                Freshness::Unavailable
+                            } else if age.is_none() {
+                                Freshness::Waiting
+                            } else if age.is_some_and(|age| age.maximum_ms > limit) {
+                                Freshness::Stale
+                            } else {
+                                Freshness::Live
+                            }
                         }
+                    };
+                    ObservedImage {
+                        metadata: image.metadata.clone(),
+                        freshness,
+                        age,
+                        payload: (include_current || image.changed_at > after)
+                            .then(|| image.payload.clone()),
                     }
-                };
-                ObservedImage {
-                    metadata: image.metadata.clone(),
-                    freshness,
-                    age,
-                    payload: (include_current || image.changed_at > after)
-                        .then(|| image.payload.clone()),
-                }
-            })
-            .collect();
+                })
+                .collect();
         let (transcripts, transcript_deltas_lost) =
             self.transcripts.snapshot(after, selected, now_ns);
         Observation {
