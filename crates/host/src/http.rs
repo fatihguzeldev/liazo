@@ -1,3 +1,4 @@
+use crate::requests::*;
 use crate::{
     HostError, SessionHost,
     media::{Media, MediaRef},
@@ -13,14 +14,12 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::StreamExt;
-use liazo_core::protocol::{CaptureSettings, SourceKey};
 use liazo_runtime::{
     Observation,
     history::{HistoryLimits, HistorySnapshot},
 };
-use liazo_transport::SessionBinding;
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use subtle::ConstantTimeEq;
 use tokio::{net::TcpListener, sync::Semaphore};
 use tokio_util::sync::CancellationToken;
@@ -59,6 +58,7 @@ struct HttpState {
     authority: String,
     media: Media,
     requests: Arc<Semaphore>,
+    controls: Arc<Semaphore>,
 }
 
 pub async fn serve(
@@ -78,6 +78,7 @@ pub async fn serve(
         authority: endpoint.address.to_string(),
         media: Media::default(),
         requests: Arc::new(Semaphore::new(8)),
+        controls: Arc::new(Semaphore::new(2)),
     };
     let cleanup_media = state.media.clone();
     let cleanup_cancel = cancel.child_token();
@@ -96,6 +97,10 @@ pub async fn serve(
     }
     let _cleanup = Cleanup(cleanup);
     let router = Router::new()
+        .nest_service(
+            "/mcp",
+            crate::mcp::service(state.host.clone(), cancel.child_token()),
+        )
         .route("/v1/status", get(status))
         .route("/v1/peers", get(peers))
         .route("/v1/connect", post(connect))
@@ -140,8 +145,12 @@ async fn authorize(State(state): State<HttpState>, request: Request, next: Next)
     if !bool::from(supplied.ct_eq(state.authorization.as_slice())) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let Ok(permit) = state.requests.clone().try_acquire_owned() else {
-        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    let (permit, reserved) = match state.requests.clone().try_acquire_owned() {
+        Ok(permit) => (permit, false),
+        Err(_) => match state.controls.clone().try_acquire_owned() {
+            Ok(permit) => (permit, true),
+            Err(_) => return StatusCode::TOO_MANY_REQUESTS.into_response(),
+        },
     };
     let (parts, body) = request.into_parts();
     let bytes = match tokio::time::timeout(
@@ -154,6 +163,15 @@ async fn authorize(State(state): State<HttpState>, request: Request, next: Next)
         Ok(Err(_)) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
         Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
     };
+    if reserved {
+        let control = matches!(parts.uri.path(), "/v1/stop" | "/v1/transcription-stop")
+            || (parts.uri.path() == "/mcp"
+                && serde_json::from_slice::<serde_json::Value>(&bytes)
+                    .is_ok_and(|body| body["method"] == "notifications/cancelled"));
+        if !control {
+            return StatusCode::TOO_MANY_REQUESTS.into_response();
+        }
+    }
     let response = next
         .run(Request::from_parts(parts, Body::from(bytes)))
         .await;
@@ -182,75 +200,6 @@ impl IntoResponse for HostError {
         };
         (code, Json(serde_json::json!({"error":self.to_string()}))).into_response()
     }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Scope {
-    binding: SessionBinding,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Connect {
-    address: SocketAddr,
-    peer: String,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Observe {
-    binding: SessionBinding,
-    #[serde(default)]
-    after: u64,
-    #[serde(default)]
-    current: bool,
-    #[serde(default)]
-    sources: Vec<SourceKey>,
-    #[serde(default)]
-    wait_ms: u64,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Configure {
-    binding: SessionBinding,
-    settings: CaptureSettings,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Capture {
-    binding: SessionBinding,
-    sources: Vec<SourceKey>,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct History {
-    binding: SessionBinding,
-    age_ms: u64,
-    #[serde(default)]
-    sources: Vec<SourceKey>,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Transcripts {
-    binding: SessionBinding,
-    older_ms: u64,
-    #[serde(default)]
-    newer_ms: u64,
-    #[serde(default)]
-    sources: Vec<SourceKey>,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Limits {
-    binding: SessionBinding,
-    limits: HistoryLimits,
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Transcribe {
-    binding: SessionBinding,
-    model: PathBuf,
-    threads: u8,
-    sources: Vec<SourceKey>,
 }
 
 #[derive(Serialize)]
@@ -283,19 +232,6 @@ fn image_response(state: &HttpState, mut observation: Observation) -> Observatio
         media_omitted: omitted,
     }
 }
-fn validate_sources(sources: &[SourceKey]) -> Result<(), HostError> {
-    let mut seen = std::collections::HashSet::new();
-    if sources.len() > 8 {
-        return Err(HostError::Invalid);
-    }
-    for source in sources {
-        source.validate().map_err(|_| HostError::Invalid)?;
-        if !seen.insert(source) {
-            return Err(HostError::Invalid);
-        }
-    }
-    Ok(())
-}
 async fn status(State(state): State<HttpState>) -> Json<Option<crate::SessionSummary>> {
     Json(state.host.current().await)
 }
@@ -320,21 +256,9 @@ async fn observe(
     State(state): State<HttpState>,
     Json(args): Json<Observe>,
 ) -> Result<Json<ObservationResponse>, HostError> {
-    validate_sources(&args.sources)?;
-    if args.wait_ms > 25_000 {
-        return Err(HostError::Invalid);
-    }
-    let receiver = state.host.receiver(args.binding).await?;
     Ok(Json(image_response(
         &state,
-        receiver
-            .observe(
-                args.after,
-                args.current,
-                &args.sources,
-                Duration::from_millis(args.wait_ms),
-            )
-            .await,
+        state.host.observe(args).await?,
     )))
 }
 async fn configure(
@@ -353,15 +277,9 @@ async fn capture(
     State(state): State<HttpState>,
     Json(args): Json<Capture>,
 ) -> Result<Json<ObservationResponse>, HostError> {
-    validate_sources(&args.sources)?;
     Ok(Json(image_response(
         &state,
-        state
-            .host
-            .receiver(args.binding)
-            .await?
-            .capture_now(args.sources)
-            .await?,
+        state.host.capture(args).await?,
     )))
 }
 async fn history(

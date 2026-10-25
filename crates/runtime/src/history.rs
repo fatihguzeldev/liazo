@@ -15,7 +15,7 @@ const ROW_BYTES: u64 = 2048;
 const PAYLOAD_OVERHEAD: u64 = 128;
 const MAX_ROWS: usize = 8192;
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct HistoryLimits {
     pub duration_ms: u64,
     pub max_bytes: u64,

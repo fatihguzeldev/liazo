@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+schemars = { version = "1", features = ["uuid1"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

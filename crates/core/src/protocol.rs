@@ -12,7 +12,7 @@ pub const MAX_SOURCES_PER_KIND: usize = 8;
 #[error("{0}")]
 pub struct ProtocolError(pub &'static str);
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SourceKey {
     pub id: String,
     pub generation: Uuid,
@@ -61,7 +61,7 @@ pub struct Source {
     pub process_id: Option<u32>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ImageFormat {
     Png,
@@ -77,7 +77,7 @@ impl ImageFormat {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CropPixels {
     pub x: u32,
     pub y: u32,
@@ -98,7 +98,7 @@ impl CropPixels {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ImageSubscription {
     pub source: SourceKey,
     pub interval_ms: u32,
@@ -127,7 +127,7 @@ impl ImageSubscription {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct CaptureSettings {
     pub images: Vec<ImageSubscription>,
     pub audio: Vec<SourceKey>,

@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+schemars = { version = "1", features = ["uuid1"] }
 liazo-core = { path = "../core" }
 liazo-transport = { path = "../transport" }
 liazo-transcription = { path = "../transcription" }

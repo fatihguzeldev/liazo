@@ -92,6 +92,7 @@ pub struct ObservedImage {
 
 #[derive(Clone, Serialize)]
 pub struct Observation {
+    pub settings: CaptureSettings,
     pub archive: Option<crate::archive::ArchiveStatus>,
     pub binding: SessionBinding,
     pub cursor: u64,
@@ -594,6 +595,7 @@ impl LiveState {
         let (transcripts, transcript_deltas_lost) =
             self.transcripts.snapshot(after, selected, now_ns);
         Observation {
+            settings: self.settings.clone(),
             archive: self.archive.as_ref().map(|archive| archive.status()),
             binding: self.binding,
             cursor: self.cursor,

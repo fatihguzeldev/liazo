@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use liazo_core::{
     catalog::SourceSnapshot,
@@ -19,6 +20,13 @@ use liazo_runtime::{
 };
 use liazo_transport::{Identity, PeerServer, PeerSession, SessionServer, StoredPeer};
 use reqwest::{Client, StatusCode};
+use rmcp::{
+    ServiceExt,
+    model::{CallToolRequestParams, ClientConfig},
+    transport::{
+        StreamableHttpClientTransport, streamable_http_client::StreamableHttpClientTransportConfig,
+    },
+};
 use serde_json::{Value, json};
 use std::{
     sync::{
@@ -295,7 +303,93 @@ async fn authenticated_consumers_share_one_session_and_binary_media_without_a_gu
         second["observation"]["cursor"]
     );
     assert_eq!(capture.calls.load(Ordering::Relaxed), 1);
+    let transport = StreamableHttpClientTransport::from_config(
+        StreamableHttpClientTransportConfig::with_uri(format!("{base}/mcp")).auth_header(token),
+    );
+    let mcp = ClientConfig::default().serve(transport).await.unwrap();
+    let tools = mcp.list_tools(None).await.unwrap();
+    assert!(tools.tools.iter().any(|tool| tool.name == "capture_now"));
+    assert!(
+        tools
+            .tools
+            .iter()
+            .any(|tool| tool.name == "observe" && tool.input_schema.contains_key("$defs"))
+    );
+    let call = CallToolRequestParams::new("observe").with_arguments(
+        json!({"binding":binding,"current":true})
+            .as_object()
+            .unwrap()
+            .clone(),
+    );
+    let observed = mcp.call_tool(call).await.unwrap();
+    assert_eq!(observed.is_error, Some(false));
+    let image = observed
+        .content
+        .iter()
+        .find_map(|content| content.as_image())
+        .expect("native MCP image content");
+    assert_eq!(STANDARD.decode(&image.data).unwrap(), b"fixture-image");
+    assert_eq!(
+        observed.structured_content.as_ref().unwrap()["observation"]["binding"],
+        binding
+    );
+    assert_eq!(capture.calls.load(Ordering::Relaxed), 1);
     let id = first["media"][0]["id"].as_str().unwrap();
+    let after = observed.structured_content.as_ref().unwrap()["observation"]["cursor"]
+        .as_u64()
+        .unwrap();
+    let quiet = mcp
+        .call_tool(
+            CallToolRequestParams::new("observe").with_arguments(
+                json!({"binding":binding,"after":after,"wait_ms":180})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(
+        quiet
+            .content
+            .iter()
+            .all(|content| content.as_image().is_none())
+    );
+    let fresh = mcp
+        .call_tool(
+            CallToolRequestParams::new("capture_now").with_arguments(
+                json!({"binding":binding,"sources":[source()]})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fresh.is_error, Some(false));
+    assert!(
+        fresh
+            .content
+            .iter()
+            .any(|content| content.as_image().is_some())
+    );
+    let retained = mcp
+        .call_tool(
+            CallToolRequestParams::new("history").with_arguments(
+                json!({"binding":binding,"age_ms":0,"sources":[source()]})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(
+        retained
+            .content
+            .iter()
+            .any(|content| content.as_image().is_some())
+    );
     assert_eq!(
         client
             .get(format!("{base}/v1/media/{id}"))
@@ -317,16 +411,66 @@ async fn authenticated_consumers_share_one_session_and_binary_media_without_a_gu
     assert_eq!(image.bytes().await.unwrap().as_ref(), b"fixture-image");
     let scope: liazo_transport::SessionBinding = serde_json::from_value(binding.clone()).unwrap();
     let held = host.receiver(scope).await.unwrap();
+    let cursor = held.observe(0, false, &[], Duration::ZERO).await.cursor;
+    let mut waiters = Vec::new();
+    for _ in 0..8 {
+        let (client, base, token, binding) =
+            (client.clone(), base.clone(), token.clone(), binding.clone());
+        waiters.push(tokio::spawn(async move {
+            client
+                .post(format!("{base}/v1/observe"))
+                .bearer_auth(token)
+                .json(&json!({"binding":binding,"after":cursor,"wait_ms":5000}))
+                .send()
+                .await
+        }));
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if client
+                .get(format!("{base}/v1/status"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                == StatusCode::TOO_MANY_REQUESTS
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let stopped = client
+        .post(format!("{base}/v1/transcription-stop"))
+        .bearer_auth(token)
+        .json(&json!({"binding":binding}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        stopped.status(),
+        StatusCode::OK,
+        "control stays available while observation slots are full"
+    );
+    drop(stopped);
     host.replace_peers(vec![]).await.unwrap();
+    for waiter in waiters {
+        let _ = waiter.await.unwrap();
+    }
     assert!(host.current().await.is_none());
     assert_eq!(
         held.observe(0, false, &[], Duration::ZERO).await.connection,
         liazo_runtime::ConnectionState::Disconnected
     );
     assert!(held.configure(CaptureSettings::default()).await.is_err());
+    mcp.cancel().await.unwrap();
     cancel.cancel();
     running.await.unwrap().unwrap();
     let _ = tokio::time::timeout(Duration::from_secs(2), provider)
         .await
+        .unwrap()
         .unwrap();
 }

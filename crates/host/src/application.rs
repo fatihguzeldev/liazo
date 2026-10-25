@@ -53,6 +53,36 @@ struct Inner {
 pub struct SessionHost(Arc<Inner>);
 
 impl SessionHost {
+    pub async fn observe(
+        &self,
+        args: crate::requests::Observe,
+    ) -> Result<liazo_runtime::Observation, HostError> {
+        validate_sources(&args.sources)?;
+        if args.wait_ms > 25_000 {
+            return Err(HostError::Invalid);
+        }
+        Ok(self
+            .receiver(args.binding)
+            .await?
+            .observe(
+                args.after,
+                args.current,
+                &args.sources,
+                Duration::from_millis(args.wait_ms),
+            )
+            .await)
+    }
+    pub async fn capture(
+        &self,
+        args: crate::requests::Capture,
+    ) -> Result<liazo_runtime::Observation, HostError> {
+        validate_sources(&args.sources)?;
+        Ok(self
+            .receiver(args.binding)
+            .await?
+            .capture_now(args.sources)
+            .await?)
+    }
     pub fn new(identity: Identity, peers: Vec<StoredPeer>, archive_root: PathBuf) -> Self {
         Self(Arc::new(Inner {
             identity,
@@ -243,4 +273,18 @@ impl SessionHost {
         });
         result.await.map_err(|_| HostError::Interrupted)?
     }
+}
+
+fn validate_sources(sources: &[SourceKey]) -> Result<(), HostError> {
+    let mut seen = std::collections::HashSet::new();
+    if sources.len() > 8 {
+        return Err(HostError::Invalid);
+    }
+    for source in sources {
+        source.validate().map_err(|_| HostError::Invalid)?;
+        if !seen.insert(source) {
+            return Err(HostError::Invalid);
+        }
+    }
+    Ok(())
 }

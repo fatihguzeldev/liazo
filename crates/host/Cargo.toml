@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+schemars = { version = "1", features = ["uuid1"] }
 liazo-core = { path = "../core" }
 liazo-runtime = { path = "../runtime" }
 liazo-transport = { path = "../transport" }
@@ -21,8 +22,10 @@ base64 = "0.22"
 getrandom = "0.4"
 subtle = "2"
 futures-util = "0.3"
+rmcp = { version = "=3.7.0", default-features = false, features = ["server", "transport-streamable-http-server"] }
 
 [dev-dependencies]
 async-trait = "0.1"
 tempfile = "3"
+rmcp = { version = "=3.7.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
 reqwest = { version = "0.13", default-features = false, features = ["json"] }

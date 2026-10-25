@@ -25,7 +25,7 @@ const MAGIC: &[u8; 4] = b"LS01";
 const SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_SESSIONS: usize = 16;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct SessionBinding {
     pub session: Uuid,
     pub epoch: Uuid,
