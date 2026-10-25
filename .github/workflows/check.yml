@@ -36,5 +36,21 @@ jobs:
           npm run build
       - name: native build and tests
         run: cargo test --workspace --all-targets --locked
+      - name: real speech model and pipeline
+        shell: pwsh
+        run: |
+          $speechRoot = Join-Path $env:RUNNER_TEMP 'liazo-şö語'
+          New-Item -ItemType Directory -Path $speechRoot -Force | Out-Null
+          $env:LIAZO_TEST_MODEL_ROOT = Join-Path $speechRoot 'models'
+          $env:LIAZO_TEST_MODEL = Join-Path $env:LIAZO_TEST_MODEL_ROOT 'ggml-base.bin'
+          $env:LIAZO_TEST_SPEECH = Join-Path $speechRoot 'speech.wav'
+          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/ggml-org/whisper.cpp/2eeeba56e9edd762b4b38467bab96c2517163158/samples/jfk.wav' -OutFile $env:LIAZO_TEST_SPEECH
+          if ((Get-FileHash $env:LIAZO_TEST_SPEECH -Algorithm SHA256).Hash.ToLowerInvariant() -ne '59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e') { throw 'speech fixture verification failed' }
+          cargo test -p liazo-host --lib --locked pinned_upstream_download -- --ignored
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p liazo-transcription --test real_engine --locked -- --ignored --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p liazo-runtime --test streaming_peer --locked -- --ignored --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
