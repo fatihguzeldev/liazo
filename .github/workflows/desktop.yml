@@ -1,0 +1,61 @@
+name: desktop
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+      - name: native build tools
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $clang = 'C:\Program Files\LLVM\bin'
+          if (!(Test-Path "$clang\libclang.dll")) { throw 'libclang is unavailable' }
+          "LIBCLANG_PATH=$clang" >> $env:GITHUB_ENV
+      - name: frontend
+        working-directory: desktop
+        run: |
+          npm ci --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: standalone desktop
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($name in @('NATIVE', 'SSE42', 'AVX', 'AVX2', 'BMI2', 'AVX512', 'AVX_VNNI', 'FMA', 'F16C')) {
+            [Environment]::SetEnvironmentVariable("GGML_$name", 'OFF', 'Process')
+          }
+          cargo build --locked --release --target x86_64-pc-windows-msvc -p liazo-desktop --features custom-protocol
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $changes = @(& git status --porcelain --untracked-files=normal)
+          if ($LASTEXITCODE -ne 0 -or $changes.Count) { throw 'source changed during the desktop build' }
+          $source = & git rev-parse HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'source identity unavailable' }
+          $output = Join-Path $PWD 'target/desktop-only'
+          New-Item -ItemType Directory -Path $output | Out-Null
+          $binary = Join-Path $output 'liazo-desktop.exe'
+          Copy-Item 'target/x86_64-pc-windows-msvc/release/liazo-desktop.exe' $binary
+          @{
+            source = $source; target = 'x86_64-pc-windows-msvc'; sourceDirty = $false
+            file = 'liazo-desktop.exe'; bytes = (Get-Item $binary).Length
+            sha256 = (Get-FileHash $binary -Algorithm SHA256).Hash.ToLowerInvariant()
+            cargoFeatures = @('custom-protocol'); identifier = 'app.liazo.desktop'
+          } | ConvertTo-Json | Set-Content (Join-Path $output 'build.json') -Encoding utf8
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: liazo-desktop-windows
+          path: target/desktop-only/*
+          if-no-files-found: error
+          retention-days: 14
