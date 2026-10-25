@@ -1,6 +1,6 @@
 use super::{
-    ArchiveError, ArchiveIdentity, ArchiveIndex, ArchiveLimits, ArchiveStats, AudioPage,
-    ReceiverTimeRange, TranscriptPage,
+    ArchiveError, ArchiveIdentity, ArchiveIndex, ArchiveLimits, ArchiveSources, ArchiveStats,
+    AudioPage, ReceiverTimeRange, TranscriptPage,
     audio_groups::{AudioGroups, Group},
 };
 use crate::history::{GapReason, HistoricalImage};
@@ -194,6 +194,10 @@ struct Control {
     status: Mutex<ArchiveStatus>,
 }
 enum Command {
+    Sources {
+        after: Option<SourceKey>,
+        reply: oneshot::Sender<Result<ArchiveSources, ArchiveError>>,
+    },
     AudioPolicy {
         sources: Vec<SourceKey>,
         at: u64,
@@ -244,6 +248,22 @@ pub struct ArchiveWorker {
 }
 
 impl ArchiveClient {
+    pub async fn sources(&self, after: Option<SourceKey>) -> Result<ArchiveSources, ArchiveError> {
+        if self.control.closing.load(Ordering::Acquire) {
+            return Err(ArchiveError::Stopped);
+        }
+        if let Some(after) = &after {
+            after.validate().map_err(|_| ArchiveError::InvalidPayload)?;
+        }
+        let (reply, result) = oneshot::channel();
+        self.sender
+            .try_send(Command::Sources { after, reply })
+            .map_err(|_| ArchiveError::Busy)?;
+        tokio::time::timeout(Duration::from_secs(3), result)
+            .await
+            .map_err(|_| ArchiveError::Busy)?
+            .map_err(|_| ArchiveError::Stopped)?
+    }
     pub fn status(&self) -> ArchiveStatus {
         let mut status = self
             .control
@@ -707,6 +727,12 @@ fn run(
         let refresh_stats = matches!(&command, Command::Tick { .. } | Command::AudioPolicy { .. });
         let mut acknowledgement = None;
         let result = match command {
+            Command::Sources { after, reply } => {
+                if !reply.is_closed() {
+                    let _ = reply.send(index.retained_sources(after));
+                }
+                continue;
+            }
             Command::Record {
                 record,
                 prior,
@@ -1191,8 +1217,27 @@ mod tests {
             client.image(source.clone(), at).await.unwrap().state,
             HistoryState::Available
         );
+        let sources = client.sources(None).await.unwrap();
+        assert_eq!(sources.entries.len(), 1);
+        assert_eq!(sources.entries[0].key, source);
+        assert!(sources.entries[0].image);
+        assert!(
+            client
+                .sources(Some(source.clone()))
+                .await
+                .unwrap()
+                .entries
+                .is_empty()
+        );
+        let mut invalid = source.clone();
+        invalid.generation = Uuid::nil();
+        assert!(matches!(
+            client.sources(Some(invalid)).await,
+            Err(ArchiveError::InvalidPayload)
+        ));
         client.seal().await.unwrap();
         client.seal().await.unwrap();
+        assert_eq!(client.sources(None).await.unwrap().entries[0].key, source);
         assert_eq!(
             client.image(source.clone(), at).await.unwrap().state,
             HistoryState::Available
@@ -1208,6 +1253,10 @@ mod tests {
         assert!(worker.stop().await);
         assert!(matches!(
             client.image(source, at).await,
+            Err(ArchiveError::Stopped)
+        ));
+        assert!(matches!(
+            client.sources(None).await,
             Err(ArchiveError::Stopped)
         ));
     }

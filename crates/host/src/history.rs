@@ -42,7 +42,7 @@ impl SessionHost {
         }
         if let Some(receiver) = self.active_archive(args.binding).await {
             use liazo_core::protocol::SourceKind;
-            let mut sources: Vec<_> = receiver
+            let sources: Vec<_> = receiver
                 .sources()
                 .sources
                 .into_iter()
@@ -52,21 +52,16 @@ impl SessionHost {
                     audio: !matches!(source.kind, SourceKind::Display | SourceKind::Window),
                 })
                 .collect();
-            sources
-                .sort_by(|a, b| (&a.key.id, a.key.generation).cmp(&(&b.key.id, b.key.generation)));
-            if let Some(after) = &args.after {
-                sources.retain(|source| {
-                    (&source.key.id, source.key.generation) > (&after.id, after.generation)
-                });
-            }
-            let truncated = sources.len() > 256;
-            sources.truncate(256);
-            let next_after = truncated.then(|| sources.last().unwrap().key.clone());
-            return Ok(liazo_runtime::archive::ArchiveSources {
-                entries: sources,
-                truncated,
-                next_after,
-            });
+            let retained = if receiver.archive_status().is_some() {
+                receiver.retained_sources(args.after.clone()).await?
+            } else {
+                liazo_runtime::archive::ArchiveSources {
+                    entries: vec![],
+                    truncated: false,
+                    next_after: None,
+                }
+            };
+            return Ok(merge_sources(sources, retained, args.after.as_ref()));
         }
         Ok(self.catalog()?.sources(args.binding, args.after).await?)
     }
@@ -196,4 +191,121 @@ fn range(args: &ArchiveRange) -> Result<(Duration, Duration), HostError> {
         Duration::from_millis(args.from_ms),
         Duration::from_millis(args.to_ms),
     ))
+}
+
+fn merge_sources(
+    mut current: Vec<ArchiveSource>,
+    retained: liazo_runtime::archive::ArchiveSources,
+    after: Option<&liazo_core::protocol::SourceKey>,
+) -> liazo_runtime::archive::ArchiveSources {
+    current.extend(retained.entries);
+    if let Some(after) = after {
+        current.retain(|source| {
+            (&source.key.id, source.key.generation) > (&after.id, after.generation)
+        });
+    }
+    current.sort_by(|a, b| (&a.key.id, a.key.generation).cmp(&(&b.key.id, b.key.generation)));
+    current.dedup_by(|later, first| {
+        if later.key != first.key {
+            return false;
+        }
+        first.image |= later.image;
+        first.audio |= later.audio;
+        true
+    });
+    let truncated = retained.truncated || current.len() > 256;
+    current.truncate(256);
+    let next_after = if truncated {
+        current.last().map(|source| source.key.clone())
+    } else {
+        None
+    };
+    liazo_runtime::archive::ArchiveSources {
+        entries: current,
+        truncated,
+        next_after,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use liazo_core::protocol::SourceKey;
+    use liazo_runtime::archive::ArchiveSources;
+    use uuid::Uuid;
+
+    fn source(id: &str, generation: u128) -> ArchiveSource {
+        ArchiveSource {
+            key: SourceKey {
+                id: id.into(),
+                generation: Uuid::from_u128(generation),
+            },
+            image: true,
+            audio: false,
+        }
+    }
+    #[test]
+    fn an_active_catalog_keeps_retained_generations_and_combines_source_kinds() {
+        let mut retained = source("display:closed-window", 1);
+        retained.audio = true;
+        retained.image = false;
+        let page = merge_sources(
+            vec![
+                source("display:closed-window", 2),
+                source("display:closed-window", 1),
+            ],
+            ArchiveSources {
+                entries: vec![retained],
+                truncated: false,
+                next_after: None,
+            },
+            None,
+        );
+        assert_eq!(page.entries.len(), 2);
+        assert!(page.entries[0].image && page.entries[0].audio);
+        assert_eq!(page.entries[0].key.generation, Uuid::from_u128(1));
+        assert_eq!(page.entries[1].key.generation, Uuid::from_u128(2));
+    }
+    #[test]
+    fn interleaved_live_and_retained_pages_do_not_skip_or_repeat_sources() {
+        let live: Vec<_> = (0..350)
+            .map(|n| source(&format!("display:{:04}", n * 2), 1))
+            .collect();
+        let retained: Vec<_> = (0..350)
+            .map(|n| source(&format!("display:{:04}", n * 2 + 1), 1))
+            .collect();
+        let mut after: Option<SourceKey> = None;
+        let mut all = vec![];
+        loop {
+            let candidates: Vec<_> = retained
+                .iter()
+                .filter(|entry| {
+                    after.as_ref().is_none_or(|key| {
+                        (&entry.key.id, entry.key.generation) > (&key.id, key.generation)
+                    })
+                })
+                .cloned()
+                .collect();
+            let page = merge_sources(
+                live.clone(),
+                ArchiveSources {
+                    entries: candidates.iter().take(256).cloned().collect(),
+                    truncated: candidates.len() > 256,
+                    next_after: None,
+                },
+                after.as_ref(),
+            );
+            after = page.next_after;
+            all.extend(page.entries);
+            if !page.truncated {
+                break;
+            }
+            assert!(after.is_some());
+            assert!(all.len() <= 700);
+        }
+        assert_eq!(all.len(), 700);
+        for (number, entry) in all.iter().enumerate() {
+            assert_eq!(entry.key.id, format!("display:{number:04}"));
+        }
+    }
 }

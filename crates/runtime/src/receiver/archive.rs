@@ -2,8 +2,8 @@ use super::{ReceiverSession, failure};
 use crate::{
     RuntimeError,
     archive::{
-        ArchiveBudget, ArchiveClient, ArchiveError, ArchiveLimits, ArchiveStatus, ArchiveWorker,
-        AudioPage, TranscriptPage,
+        ArchiveBudget, ArchiveClient, ArchiveError, ArchiveLimits, ArchiveSources, ArchiveStatus,
+        ArchiveWorker, AudioPage, TranscriptPage,
     },
     live::ConnectionState,
 };
@@ -229,6 +229,16 @@ impl ReceiverSession {
             .archive_client()
             .ok_or_else(|| failure(FailureCode::Unavailable, "disk archive is not enabled"))?;
         Ok(archive.transcripts(first, last, selected.to_vec()).await?)
+    }
+
+    pub async fn retained_sources(
+        &self,
+        after: Option<SourceKey>,
+    ) -> Result<ArchiveSources, RuntimeError> {
+        let archive = self
+            .archive_client()
+            .ok_or_else(|| failure(FailureCode::Unavailable, "disk archive is not enabled"))?;
+        Ok(archive.sources(after).await?)
     }
 
     fn archive_range(
