@@ -4,7 +4,11 @@
 <dict>
     <key>CFBundleIdentifier</key><string>app.liazo.capture</string>
     <key>CFBundleName</key><string>liazo</string>
+    <key>CFBundleExecutable</key><string>liazo</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleVersion</key><string>0.1.0</string>
+    <key>CFBundleShortVersionString</key><string>0.1.0</string>
+    <key>LSMinimumSystemVersion</key><string>14.2</string>
     <key>LSUIElement</key><true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>liazo sends selected microphone audio to your paired computer.</string>

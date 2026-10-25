@@ -1,0 +1,74 @@
+name: distribution
+
+on:
+  workflow_dispatch:
+    inputs:
+      cpu:
+        description: Windows CPU build
+        default: baseline
+        type: choice
+        options: [baseline, avx2]
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+      - name: native build tools
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $clang = 'C:\Program Files\LLVM\bin'
+          if (!(Test-Path "$clang\libclang.dll")) { throw 'libclang is unavailable' }
+          "LIBCLANG_PATH=$clang" >> $env:GITHUB_ENV
+      - name: frontend dependencies
+        working-directory: desktop
+        run: npm ci --no-audit --no-fund
+      - name: package desktop and independent MCP
+        shell: pwsh
+        env:
+          LIAZO_PACKAGE_CPU: ${{ inputs.cpu || 'baseline' }}
+        run: desktop/scripts/package-windows.ps1 -Cpu $env:LIAZO_PACKAGE_CPU
+      - name: install and exercise the packaged MCP
+        shell: pwsh
+        env:
+          LIAZO_PACKAGE_CPU: ${{ inputs.cpu || 'baseline' }}
+        run: |
+          $output = Join-Path $PWD "target/distribution/x86_64-pc-windows-msvc-$env:LIAZO_PACKAGE_CPU"
+          $installers = @(Get-ChildItem $output -Filter '*-setup.exe')
+          if ($installers.Count -ne 1) { throw 'expected one installer' }
+          $installer = $installers[0]
+          $installed = Join-Path $env:RUNNER_TEMP 'liazo-şö語-installed'
+          $process = Start-Process $installer.FullName -ArgumentList @('/S', "/D=$installed") -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "installation failed: $($process.ExitCode)" }
+          if (!(Test-Path "$installed/liazo-desktop.exe")) { throw 'desktop executable was not installed' }
+          if (!(Test-Path "$installed/liazo.exe")) { throw 'MCP companion was not installed' }
+          $env:LIAZO_TEST_CLI = Join-Path $installed 'liazo.exe'
+          $env:CARGO_TARGET_DIR = Join-Path $PWD "target/packages/windows-$env:LIAZO_PACKAGE_CPU"
+          & cargo test --locked --target x86_64-pc-windows-msvc -p liazo --test mcp_stdio
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $uninstaller = Get-ChildItem $installed -Filter '*uninstall*.exe' | Select-Object -First 1
+          if (!$uninstaller) { throw 'uninstaller was not installed' }
+          $process = Start-Process $uninstaller.FullName -ArgumentList @('/S') -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "uninstall failed: $($process.ExitCode)" }
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: liazo-windows-${{ inputs.cpu || 'baseline' }}
+          path: |
+            target/distribution/*/*.exe
+            target/distribution/*/*.zip
+            target/distribution/*/*.sha256
+            target/distribution/*/build.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

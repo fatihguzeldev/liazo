@@ -41,7 +41,12 @@ async fn the_actual_stdio_command_attaches_without_a_gui_or_native_credential_ac
     let cancel = CancellationToken::new();
     let _cancel = cancel.clone().drop_guard();
     let server = tokio::spawn(serve(listener, host, endpoint, cancel.clone()));
-    let mut command = Command::new(env!("CARGO_BIN_EXE_liazo"));
+    let executable = std::env::var_os("LIAZO_TEST_CLI")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_liazo")));
+    assert!(executable.is_absolute(), "test CLI path must be absolute");
+    assert!(executable.is_file(), "test CLI executable is unavailable");
+    let mut command = Command::new(executable);
     command.arg("--profile").arg(name).arg("mcp");
     let transport = TokioChildProcess::new(command).unwrap();
     let client = tokio::time::timeout(
