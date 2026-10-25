@@ -1,4 +1,4 @@
-use super::{ArchiveError, PayloadDescriptor, PayloadStore};
+use super::{ArchiveError, ArchiveLimits, PayloadDescriptor, PayloadStore};
 use crate::history::{GapReason, HistoricalImage, HistoryState};
 use bytes::Bytes;
 use liazo_core::{
@@ -11,8 +11,9 @@ use std::{collections::HashSet, path::Path, time::Duration};
 use uuid::Uuid;
 
 pub struct ArchiveIndex {
-    database: Connection,
-    payloads: PayloadStore,
+    pub(super) database: Connection,
+    pub(super) payloads: PayloadStore,
+    pub(super) limits: ArchiveLimits,
 }
 
 #[derive(Clone, Copy)]
@@ -32,7 +33,12 @@ struct StoredImage {
 }
 
 impl ArchiveIndex {
-    pub fn open(root: &Path, identity: ArchiveIdentity) -> Result<Self, ArchiveError> {
+    pub fn open(
+        root: &Path,
+        identity: ArchiveIdentity,
+        limits: ArchiveLimits,
+    ) -> Result<Self, ArchiveError> {
+        limits.validate()?;
         if identity.binding.session.is_nil() || identity.binding.epoch.is_nil() {
             return Err(ArchiveError::SessionMismatch);
         }
@@ -53,6 +59,8 @@ impl ArchiveIndex {
                 payload TEXT NOT NULL REFERENCES payloads(id), first_ns INTEGER NOT NULL, last_ns INTEGER NOT NULL,
                 first_meta TEXT NOT NULL, last_meta TEXT NOT NULL, max_gap_ns INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS images_time ON images(source, generation, first_ns DESC);
+            CREATE INDEX IF NOT EXISTS images_retention ON images(last_ns);
+            CREATE INDEX IF NOT EXISTS images_payload ON images(payload);
             CREATE TABLE IF NOT EXISTS gaps (id INTEGER PRIMARY KEY, source TEXT NOT NULL, generation TEXT NOT NULL,
                 first_ns INTEGER NOT NULL, end_ns INTEGER, reason TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS gaps_time ON gaps(source, generation, first_ns DESC);")?;
@@ -84,7 +92,18 @@ impl ArchiveIndex {
             })
             .collect::<Result<HashSet<_>, _>>()?;
         payloads.recover(&referenced)?;
-        Ok(Self { database, payloads })
+        database.pragma_update(None, "max_page_count", limits.index_bytes() / 4096)?;
+        let actual: u64 = database.pragma_query_value(None, "max_page_count", |row| row.get(0))?;
+        if actual > limits.index_bytes() / 4096 {
+            return Err(ArchiveError::Capacity);
+        }
+        let mut archive = Self {
+            database,
+            payloads,
+            limits,
+        };
+        archive.make_room(0, 0)?;
+        Ok(archive)
     }
 
     pub fn record_image(
@@ -102,6 +121,17 @@ impl ArchiveIndex {
         {
             return Err(ArchiveError::InvalidPayload);
         }
+        let indexed: bool = self.database.query_row(
+            "SELECT EXISTS(SELECT 1 FROM payloads WHERE id=?1)",
+            [id.to_string()],
+            |row| row.get(0),
+        )?;
+        let reserve = if indexed {
+            0
+        } else {
+            (bytes.len() as u64).div_ceil(4096) * 4096 + 4096
+        };
+        self.make_room(arrived_ns, reserve)?;
         let old = self.last(&metadata.source, arrived_ns)?;
         if old.as_ref().is_some_and(|old| old.last_ns > arrived_ns) {
             return Err(ArchiveError::InvalidPayload);
@@ -114,6 +144,11 @@ impl ArchiveIndex {
         if latest_gap.is_some_and(|started| started > arrived_ns) {
             return Err(ArchiveError::InvalidPayload);
         }
+        // Account for bytes before a write. Failed writes stay charged until cleanup.
+        self.database.execute(
+            "INSERT OR IGNORE INTO payloads (id,length,hash) VALUES (?1,?2,?3)",
+            params![id.to_string(), bytes.len() as u64, [0_u8; 32].as_slice()],
+        )?;
         let descriptor = self.payloads.put(id, &bytes)?;
         let source = &metadata.source;
         let generation = source.generation.to_string();
@@ -124,7 +159,7 @@ impl ArchiveIndex {
             params![source.id, generation, arrived_ns],
         )?;
         tx.execute(
-            "INSERT OR IGNORE INTO payloads (id,length,hash) VALUES (?1,?2,?3)",
+            "UPDATE payloads SET length=?2,hash=?3 WHERE id=?1",
             params![
                 id.to_string(),
                 descriptor.length,
@@ -182,6 +217,7 @@ impl ArchiveIndex {
         if at > i64::MAX as u64 {
             return Err(ArchiveError::InvalidPayload);
         }
+        self.make_room(at, 0)?;
         let generation = source.generation.to_string();
         let reason = serde_json::to_string(&reason)?;
         let tx = self.database.transaction()?;
@@ -223,12 +259,27 @@ impl ArchiveIndex {
             last_capture: None,
             payload: None,
         };
+        if at < self.stats()?.retention_floor_ns {
+            result.state = HistoryState::Expired;
+            return Ok(result);
+        }
         let gap: Option<String> = self.database.query_row("SELECT reason FROM gaps WHERE source=?1 AND generation=?2 AND first_ns<=?3 AND (end_ns IS NULL OR end_ns>?3) ORDER BY first_ns DESC LIMIT 1", params![source.id, source.generation.to_string(), at], |row| row.get(0)).optional()?;
         if let Some(reason) = gap {
             result.state = HistoryState::Gap(serde_json::from_str(&reason)?);
             return Ok(result);
         }
         let Some(row) = self.last(source, at)? else {
+            let before: Option<String> = self
+                .database
+                .query_row(
+                    "SELECT value FROM meta WHERE key='capacity_before'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if before.is_some_and(|before| before.parse::<u64>().is_ok_and(|before| at <= before)) {
+                result.state = HistoryState::NotRetained;
+            }
             return Ok(result);
         };
         if at.saturating_sub(row.last_ns) > row.max_gap_ns {
@@ -326,7 +377,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let binding = binding();
         let id = Uuid::new_v4();
-        let mut archive = ArchiveIndex::open(root.path(), binding).unwrap();
+        let mut archive =
+            ArchiveIndex::open(root.path(), binding, ArchiveLimits::default()).unwrap();
         archive
             .record_image(meta(1), id, Bytes::from_static(b"fixture"), 100, 300)
             .unwrap();
@@ -340,7 +392,7 @@ mod tests {
             .record_image(meta(3), id, Bytes::from_static(b"fixture"), 600, 300)
             .unwrap();
         drop(archive);
-        let archive = ArchiveIndex::open(root.path(), binding).unwrap();
+        let archive = ArchiveIndex::open(root.path(), binding, ArchiveLimits::default()).unwrap();
         assert_eq!(
             archive
                 .at(&meta(1).source, 150)
@@ -373,7 +425,8 @@ mod tests {
     fn unindexed_publication_is_recovered_and_missing_media_is_never_returned_as_complete() {
         let root = tempfile::tempdir().unwrap();
         let binding = binding();
-        let mut archive = ArchiveIndex::open(root.path(), binding).unwrap();
+        let mut archive =
+            ArchiveIndex::open(root.path(), binding, ArchiveLimits::default()).unwrap();
         let id = Uuid::new_v4();
         archive
             .record_image(meta(1), id, Bytes::from_static(b"fixture"), 100, 300)
@@ -382,9 +435,46 @@ mod tests {
             .payloads
             .put(Uuid::new_v4(), b"not committed")
             .unwrap();
+        let pending = Uuid::new_v4();
+        archive
+            .database
+            .execute(
+                "INSERT INTO payloads (id,length,hash) VALUES (?1,?2,?3)",
+                params![pending.to_string(), 7, [0_u8; 32].as_slice()],
+            )
+            .unwrap();
+        std::fs::write(
+            archive.payloads.root.join(format!("{pending}.part")),
+            b"partial",
+        )
+        .unwrap();
+        let uncommitted = archive
+            .payloads
+            .put(Uuid::new_v4(), b"not indexed")
+            .unwrap();
+        archive
+            .database
+            .execute(
+                "INSERT INTO payloads (id,length,hash) VALUES (?1,?2,?3)",
+                params![
+                    uncommitted.id.to_string(),
+                    uncommitted.length,
+                    [0_u8; 32].as_slice()
+                ],
+            )
+            .unwrap();
         drop(archive);
-        let archive = ArchiveIndex::open(root.path(), binding).unwrap();
+        let archive = ArchiveIndex::open(root.path(), binding, ArchiveLimits::default()).unwrap();
         assert!(!archive.payloads.path(orphan.id).exists());
+        assert!(!archive.payloads.path(uncommitted.id).exists());
+        assert!(
+            !archive
+                .payloads
+                .root
+                .join(format!("{pending}.part"))
+                .exists()
+        );
+        assert_eq!(archive.stats().unwrap().payloads, 1);
         archive.payloads.remove(id).unwrap();
         assert!(matches!(
             archive.at(&meta(1).source, 100),
@@ -392,8 +482,60 @@ mod tests {
         ));
         drop(archive);
         assert!(matches!(
-            ArchiveIndex::open(root.path(), self::binding()),
+            ArchiveIndex::open(root.path(), self::binding(), ArchiveLimits::default()),
             Err(ArchiveError::SessionMismatch)
         ));
+    }
+
+    #[test]
+    fn retention_enforces_media_and_metadata_budgets_and_read_bytes_survive_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let binding = binding();
+        let limits = ArchiveLimits {
+            duration_ms: 1000,
+            max_bytes: 4 * 1024 * 1024,
+        };
+        let mut archive = ArchiveIndex::open(root.path(), binding, limits).unwrap();
+        for sequence in 1..=5 {
+            archive
+                .record_image(
+                    meta(sequence),
+                    Uuid::new_v4(),
+                    Bytes::from(vec![sequence as u8; 1024 * 1024]),
+                    sequence * 100_000_000,
+                    300_000_000,
+                )
+                .unwrap();
+            assert!(archive.stats().unwrap().accounted_bytes <= limits.max_bytes);
+        }
+        assert_eq!(
+            archive.at(&meta(1).source, 100_000_000).unwrap().state,
+            HistoryState::NotRetained
+        );
+        let leased = archive
+            .at(&meta(1).source, 500_000_000)
+            .unwrap()
+            .payload
+            .unwrap();
+        assert_eq!(archive.enforce_limits(2_000_000_000).unwrap().payloads, 0);
+        assert_eq!(leased[0], 5);
+        assert_eq!(
+            archive.at(&meta(1).source, 500_000_000).unwrap().state,
+            HistoryState::Expired
+        );
+        drop(archive);
+        let archive = ArchiveIndex::open(
+            root.path(),
+            binding,
+            ArchiveLimits {
+                duration_ms: 60_000,
+                ..limits
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            archive.at(&meta(1).source, 500_000_000).unwrap().state,
+            HistoryState::Expired
+        );
     }
 }

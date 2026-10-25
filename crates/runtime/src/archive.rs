@@ -11,6 +11,8 @@ use uuid::Uuid;
 
 mod index;
 pub use index::{ArchiveIdentity, ArchiveIndex};
+mod retention;
+pub use retention::{ArchiveLimits, ArchiveStats};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ArchiveError {
@@ -30,6 +32,8 @@ pub enum ArchiveError {
     Metadata(#[from] serde_json::Error),
     #[error("archive belongs to another session or version")]
     SessionMismatch,
+    #[error("archive limit reached")]
+    Capacity,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -142,11 +146,14 @@ impl PayloadStore {
     }
 
     pub fn remove(&self, id: Uuid) -> Result<(), ArchiveError> {
-        match std::fs::remove_file(self.path(id)) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(error) => Err(error.into()),
+        for path in [self.path(id), self.root.join(format!("{id}.part"))] {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
         }
+        Ok(())
     }
 
     pub fn recover(&self, referenced: &HashSet<Uuid>) -> Result<u64, ArchiveError> {
