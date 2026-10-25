@@ -1,5 +1,6 @@
 pub mod backend;
 mod capture;
+pub mod history;
 pub mod images;
 mod live;
 pub mod provider;
