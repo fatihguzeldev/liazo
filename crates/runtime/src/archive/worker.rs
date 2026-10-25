@@ -868,6 +868,7 @@ fn run(
         // SQLite accounting on maintenance/barriers, rather than for every packet.
         let refresh_stats = matches!(&command, Command::Tick { .. } | Command::AudioPolicy { .. });
         let mut acknowledgement = None;
+        let mut persisted = false;
         let result = match command {
             #[cfg(any(test, feature = "test-support"))]
             Command::DatabaseFull { enabled, reply } => {
@@ -907,6 +908,7 @@ fn run(
                     .and_then(|()| record.write(index, &mut groups))
                     .and_then(|ready| {
                         buffered = audio;
+                        persisted = !audio || !ready.is_empty();
                         write_audio(index, ready, &mut failed, &control.dropped)
                     });
                 if result.is_err() {
@@ -937,12 +939,9 @@ fn run(
                     .persist(index, GapReason::ArchiveFailure)
                     .and_then(|()| missing.persist(index, GapReason::ArchiveBackpressure))
                     .and_then(|()| {
-                        write_audio(
-                            index,
-                            groups.take(now, seal || reply.is_some()),
-                            &mut failed,
-                            &control.dropped,
-                        )
+                        let ready = groups.take(now, seal || reply.is_some());
+                        persisted = !ready.is_empty();
+                        write_audio(index, ready, &mut failed, &control.dropped)
                     })
                     .and_then(|()| index.enforce_limits(now).map(|_| ()))
                     .and_then(|()| if seal { index.finish(now) } else { Ok(()) });
@@ -968,6 +967,7 @@ fn run(
                 continue;
             }
             Command::AudioPolicy { sources, at, reply } => {
+                persisted = true;
                 let result =
                     write_audio(index, groups.take(at, true), &mut failed, &control.dropped)
                         .and_then(|()| index.record_audio_policy(&sources, at));
@@ -1029,8 +1029,12 @@ fn run(
         status.phase = if result.is_ok() {
             if control.sealed.load(Ordering::Acquire) {
                 ArchivePhase::Stopped
-            } else {
+            } else if persisted || status.phase != ArchivePhase::Failed {
                 ArchivePhase::Recording
+            } else {
+                // Accepting PCM into a group (or running empty maintenance)
+                // does not prove that the failed media write has recovered.
+                ArchivePhase::Failed
             }
         } else {
             ArchivePhase::Failed
@@ -1320,6 +1324,7 @@ mod tests {
         )
         .await
         .unwrap();
+        worker.ticker.abort();
         let client = worker.client();
         let source = source();
         let stream = Uuid::new_v4();
@@ -1350,7 +1355,27 @@ mod tests {
         assert_eq!(client.status().buffered_audio_bytes, 0);
         drop(outage);
         client.submit(packet(2));
+        // A read command is a FIFO acknowledgement without flushing the audio.
+        client.sources(None).await.unwrap();
+        assert!(client.status().buffered_audio_bytes > 0);
+        assert_eq!(
+            client.status().phase,
+            ArchivePhase::Failed,
+            "buffered audio must not claim a failed disk write has recovered"
+        );
+        client.tick(0);
+        client.sources(None).await.unwrap();
+        assert_eq!(
+            client.status().phase,
+            ArchivePhase::Failed,
+            "maintenance without a payload write must not hide the failure"
+        );
         client.flush().await.unwrap();
+        assert_eq!(
+            client.status().phase,
+            ArchivePhase::Recording,
+            "a successfully persisted audio group recovers recording"
+        );
         let page = client
             .audio(0, clock.elapsed().as_nanos() as u64, vec![source])
             .await
