@@ -73,7 +73,47 @@ try {
     $metadata = & cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
     $version = ($metadata.packages | Where-Object name -eq 'liazo').version
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+    $visualStudio = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+    if ($LASTEXITCODE -ne 0 -or !$visualStudio) { throw 'Visual C++ build tools are unavailable' }
     if ($Backend -eq 'vulkan') {
+        $devCmd = Join-Path $visualStudio 'Common7/Tools/VsDevCmd.bat'
+        if (!(Test-Path -LiteralPath $devCmd)) { throw 'Visual C++ developer environment is unavailable' }
+        $devEnvironment = & $env:ComSpec /d /s /c "call `"$devCmd`" -no_logo -arch=x64 -host_arch=x64 >nul && set" 2>&1
+        if ($LASTEXITCODE -ne 0) { throw 'Visual C++ developer environment setup failed' }
+        $compilerVariables = @(
+            'PATH', 'INCLUDE', 'LIB', 'LIBPATH', 'VCINSTALLDIR', 'VCToolsInstallDir', 'VCToolsVersion',
+            'VSINSTALLDIR', 'VisualStudioVersion', 'WindowsSdkDir', 'WindowsSDKVersion',
+            'WindowsSdkBinPath', 'WindowsSdkVerBinPath', 'UniversalCRTSdkDir', 'UCRTVersion',
+            'VSCMD_ARG_HOST_ARCH', 'VSCMD_ARG_TGT_ARCH', 'VSCMD_VER'
+        )
+        foreach ($line in $devEnvironment) {
+            $text = $line.ToString()
+            $separator = $text.IndexOf('=')
+            if ($separator -le 0) { continue }
+            $name = $text.Substring(0, $separator)
+            if ($name -notin $compilerVariables) { continue }
+            if (!$changedEnvironment.ContainsKey($name)) {
+                $changedEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+            }
+            [Environment]::SetEnvironmentVariable($name, $text.Substring($separator + 1), 'Process')
+        }
+        Remove-Variable devEnvironment
+        $compiler = Get-Command cl.exe -CommandType Application -ErrorAction Stop
+        $linker = Get-Command link.exe -CommandType Application -ErrorAction Stop
+        $tools = (Resolve-Path (Join-Path $visualStudio 'VC/Tools/MSVC')).Path
+        if (!$compiler.Source.StartsWith($tools, [StringComparison]::OrdinalIgnoreCase) -or
+            $linker.Source -ne (Join-Path (Split-Path $compiler.Source -Parent) 'link.exe') -or
+            $env:VSCMD_ARG_TGT_ARCH -ne 'x64' -or $env:VSCMD_ARG_HOST_ARCH -ne 'x64') {
+            throw 'expected the native x64 MSVC compiler and linker'
+        }
+        $includeDirectories = @($env:INCLUDE -split ';' | Where-Object { $_ })
+        foreach ($headerName in @('vcruntime.h', 'corecrt.h', 'windows.h', 'vector')) {
+            if (!@($includeDirectories | Where-Object { Test-Path -LiteralPath (Join-Path $_ $headerName) }).Count) {
+                throw "MSVC or Windows SDK header is unavailable: $headerName"
+            }
+        }
+        Write-Host "Vulkan host compiler: $($compiler.Source)"
         if (!$env:VULKAN_SDK -or
             !(Test-Path (Join-Path $env:VULKAN_SDK 'Include/vulkan/vulkan_core.h')) -or
             !(Test-Path (Join-Path $env:VULKAN_SDK 'Lib/vulkan-1.lib')) -or
@@ -94,9 +134,6 @@ try {
     New-Item -ItemType Directory -Path $stage, $runtime, $output -Force | Out-Null
     Copy-Item (Join-Path $release 'liazo.exe') (Join-Path $stage "liazo-$target.exe") -Force
 
-    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
-    $visualStudio = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-    if ($LASTEXITCODE -ne 0 -or !$visualStudio) { throw 'Visual C++ build tools are unavailable' }
     $redist = Get-ChildItem (Join-Path $visualStudio 'VC/Redist/MSVC/*/x64/Microsoft.VC*.CRT') -Directory |
         Sort-Object FullName -Descending | Select-Object -First 1
     if (!$redist) { throw 'Visual C++ redistributable DLLs are unavailable' }
