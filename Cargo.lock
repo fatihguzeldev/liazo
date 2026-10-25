@@ -2161,6 +2161,7 @@ name = "liazo"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "clap",
  "directories",
  "if-addrs",
@@ -2170,9 +2171,12 @@ dependencies = [
  "liazo-runtime",
  "liazo-transcription",
  "liazo-transport",
+ "reqwest",
  "rmcp",
  "security-framework",
  "serde_json",
+ "sha2",
+ "tempfile",
  "tokio",
  "tokio-util",
  "uuid",
