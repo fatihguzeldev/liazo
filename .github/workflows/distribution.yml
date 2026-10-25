@@ -114,6 +114,17 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or "${test}: test" -notin $tests) { throw 'native no-device test is unavailable' }
           & cargo test --locked --release --target x86_64-pc-windows-msvc -p liazo-transcription --features vulkan --lib $test -- --ignored --exact --test-threads=1 --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: portable package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: liazo-portable-${{ inputs.cpu || 'baseline' }}${{ matrix.backend == 'vulkan' && '-vulkan' || '' }}
+          path: |
+            target/distribution/*/*-portable.zip
+            target/distribution/*/*-portable.zip.sha256
+            target/distribution/*/build.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: liazo-windows-${{ inputs.cpu || 'baseline' }}${{ matrix.backend == 'vulkan' && '-vulkan' || '' }}
