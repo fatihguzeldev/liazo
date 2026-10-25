@@ -1,6 +1,7 @@
 use liazo_core::protocol::SourceKey;
 use liazo_runtime::archive::{
-    ArchiveIdentity, ArchiveIndex, ArchiveLimits, AudioPacket, AudioSegment, ReceiverTimeRange,
+    ArchiveError, ArchiveIdentity, ArchiveIndex, ArchiveLimits, AudioPacket, AudioSegment,
+    ReceiverTimeRange,
 };
 use liazo_transport::{Identity, SessionBinding};
 use uuid::Uuid;
@@ -14,6 +15,63 @@ fn identity() -> ArchiveIdentity {
         },
         wall_anchor_unix_ms: 1_700_000_000_000,
     }
+}
+
+#[test]
+fn byte_pressure_evicts_old_audio_and_a_duplicate_cannot_evict_its_original_payload() {
+    let root = tempfile::tempdir().unwrap();
+    let mut index = ArchiveIndex::open(
+        root.path(),
+        identity(),
+        ArchiveLimits {
+            duration_ms: 60_000,
+            max_bytes: 4 * 1024 * 1024,
+        },
+    )
+    .unwrap();
+    let (mut first, _) = segment();
+    first.sample_rate = 384000;
+    first.channels = 8;
+    first.packets = (0..8)
+        .map(|i| AudioPacket {
+            sequence: i + 1,
+            sample_position: i * 8192,
+            frames: 8192,
+            captured_ns: i * 22_000_000,
+            received_ns: 1_000_000_000 + i * 22_000_000,
+            receiver_range: None,
+            discontinuity: i == 0,
+        })
+        .collect();
+    let pcm = vec![0; 8 * 8192 * 8 * 4];
+    index
+        .record_audio_policy(std::slice::from_ref(&first.source), 900_000_000)
+        .unwrap();
+    index.record_audio(first.clone(), &pcm).unwrap();
+    assert!(matches!(
+        index.record_audio(first.clone(), &pcm),
+        Err(ArchiveError::IdentityCollision)
+    ));
+    let held = index
+        .audio_between(0, 2_000_000_000, &[])
+        .unwrap()
+        .clips
+        .remove(0)
+        .wav;
+    let mut second = first.clone();
+    second.id = Uuid::new_v4();
+    for packet in &mut second.packets {
+        packet.received_ns += 1_000_000_000;
+        packet.captured_ns += 1_000_000_000;
+    }
+    index.record_audio(second.clone(), &pcm).unwrap();
+    let page = index.audio_between(0, 3_000_000_000, &[]).unwrap();
+    assert_eq!(page.clips.len(), 1);
+    assert_eq!(page.clips[0].segment.id, second.id);
+    assert!(page.capacity_before_ns.is_some());
+    assert_eq!(index.stats().unwrap().payloads, 1);
+    assert!(index.stats().unwrap().accounted_bytes <= 4 * 1024 * 1024);
+    assert_eq!(held.len(), pcm.len() + 58);
 }
 fn segment() -> (AudioSegment, Vec<u8>) {
     (

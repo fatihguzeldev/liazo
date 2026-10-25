@@ -200,7 +200,7 @@ impl ReceiverSession {
             let mut stream = peer.audio;
             loop {
                 let mut frame = tokio::select! { _ = audio.cancelled.cancelled() => return Ok(()), frame = Frame::read_from(&mut stream) => frame?.ok_or(RuntimeError::Closed)? };
-                let (selected, significant) = audio.state.lock().unwrap_or_else(|e| e.into_inner()).audio(&mut frame).map_err(|_| RuntimeError::Protocol)?;
+                let (selected, significant) = audio.state.lock().unwrap_or_else(|e| e.into_inner()).audio(&mut frame, audio.now_ns()).map_err(|_| RuntimeError::Protocol)?;
                 if selected { let _ = audio.audio.send(frame); }
                 if significant { audio.signal(); }
             }

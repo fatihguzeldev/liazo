@@ -259,6 +259,10 @@ async fn real_speech_crosses_peer_transport_and_shared_observation_without_block
         .start_transcription(model, 4, vec![source(true)], StreamingSettings::default())
         .await
         .unwrap();
+    session
+        .configure_raw_audio(vec![source(true)])
+        .await
+        .unwrap();
     fixture.gate.add_permits(1);
     let mut cursor = 0;
     let mut partials = Vec::new();
@@ -329,6 +333,20 @@ async fn real_speech_crosses_peer_transport_and_shared_observation_without_block
         serde_json::to_value(expected).unwrap()
     );
     assert!(final_record.receiver_range.is_some());
+    let retained_audio = session
+        .history_audio(history_start.elapsed(), Duration::ZERO, &[source(true)])
+        .await
+        .unwrap();
+    assert!(!retained_audio.clips.is_empty());
+    assert_eq!(retained_audio.policy.len(), 1);
+    assert!(
+        retained_audio
+            .clips
+            .iter()
+            .all(|clip| clip.segment.source == source(true) && clip.segment.sample_rate == 48000)
+    );
+    let wav = hound::WavReader::new(std::io::Cursor::new(&retained_audio.clips[0].wav)).unwrap();
+    assert_eq!(wav.spec().sample_rate, 48000);
     let idle = session.observe(0, false, &[], Duration::ZERO).await;
     let waiting = Instant::now();
     let quiet = session

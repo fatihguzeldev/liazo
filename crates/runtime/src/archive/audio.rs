@@ -52,6 +52,8 @@ pub struct AudioGap {
 }
 #[derive(Clone, Debug, Serialize, schemars::JsonSchema)]
 pub struct AudioPage {
+    pub first_ns: u64,
+    pub last_ns: u64,
     pub clips: Vec<AudioClip>,
     pub policy: Vec<AudioPolicyInterval>,
     pub gaps: Vec<AudioGap>,
@@ -224,7 +226,6 @@ impl ArchiveIndex {
         encoded.extend_from_slice(&json);
         encoded.extend_from_slice(bytes);
         let reserve = (encoded.len() as u64).div_ceil(4096) * 4096 + 4096;
-        self.make_room(segment.last_received_ns(), reserve)?;
         let id = segment.id.to_string();
         if self.database.query_row(
             "SELECT EXISTS(SELECT 1 FROM payloads WHERE id=?1)",
@@ -233,6 +234,7 @@ impl ArchiveIndex {
         )? {
             return Err(ArchiveError::IdentityCollision);
         }
+        self.make_room(segment.last_received_ns(), reserve)?;
         self.database.execute(
             "INSERT INTO payloads (id,length,hash) VALUES (?1,?2,?3)",
             params![id, encoded.len() as u64, [0u8; 32].as_slice()],
@@ -240,6 +242,7 @@ impl ArchiveIndex {
         let descriptor = self.payloads.put(segment.id, &encoded)?;
         let range = segment.receiver_range();
         let tx = self.database.transaction()?;
+        tx.execute("UPDATE gaps SET end_ns=?3 WHERE source=?1 AND generation=?2 AND end_ns IS NULL AND first_ns<=?3", params![segment.source.id, segment.source.generation.to_string(), segment.packets[0].received_ns])?;
         tx.execute(
             "UPDATE payloads SET hash=?2 WHERE id=?1",
             params![id, descriptor.sha256.as_slice()],
@@ -271,6 +274,8 @@ impl ArchiveIndex {
             )
             .optional()?;
         let mut page = AudioPage {
+            first_ns: first,
+            last_ns: last,
             clips: vec![],
             policy: vec![],
             gaps: vec![],

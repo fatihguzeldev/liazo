@@ -413,7 +413,7 @@ impl LiveState {
         Ok(())
     }
 
-    pub fn audio(&mut self, frame: &mut Frame) -> Result<(bool, bool), ()> {
+    pub fn audio(&mut self, frame: &mut Frame, now: u64) -> Result<(bool, bool), ()> {
         let Header::Audio(meta) = &mut frame.header else {
             return Err(());
         };
@@ -451,6 +451,17 @@ impl LiveState {
             significant = true;
         }
         self.audio.insert(meta.source.clone(), meta.clone());
+        if let Some(archive) = &self.archive {
+            let end = meta.captured_ns.saturating_add(
+                (u64::from(meta.frames) * 1_000_000_000).div_ceil(u64::from(meta.sample_rate)),
+            );
+            archive.submit(crate::archive::ArchiveRecord::Audio {
+                metadata: meta.clone(),
+                bytes: frame.payload.clone(),
+                received_ns: now,
+                range: self.clock.map(|clock| clock.project(meta.captured_ns, end)),
+            });
+        }
         if significant {
             self.changed();
         }
@@ -753,7 +764,7 @@ mod tests {
             discontinuity: false,
         };
         let mut frame = Frame::new(Header::Audio(meta.clone()), Bytes::from(vec![0; 640])).unwrap();
-        assert_eq!(state.audio(&mut frame), Ok((true, true)));
+        assert_eq!(state.audio(&mut frame, 0), Ok((true, true)));
         let cursor = state.cursor;
         for sequence in 2..=100 {
             meta.sequence = sequence;
@@ -761,7 +772,7 @@ mod tests {
             meta.captured_ns = sequence * 10_000_000;
             let mut frame =
                 Frame::new(Header::Audio(meta.clone()), Bytes::from(vec![0; 640])).unwrap();
-            assert_eq!(state.audio(&mut frame), Ok((true, false)));
+            assert_eq!(state.audio(&mut frame, 0), Ok((true, false)));
         }
         assert_eq!(state.cursor, cursor);
         assert_eq!(
@@ -771,7 +782,7 @@ mod tests {
         meta.sequence = 102;
         meta.sample_position += 320;
         let mut frame = Frame::new(Header::Audio(meta), Bytes::from(vec![0; 640])).unwrap();
-        assert_eq!(state.audio(&mut frame), Ok((true, true)));
+        assert_eq!(state.audio(&mut frame, 0), Ok((true, true)));
         assert!(state.cursor > cursor);
         assert_eq!(state.gaps, 1);
     }

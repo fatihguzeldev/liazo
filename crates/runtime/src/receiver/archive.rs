@@ -2,7 +2,8 @@ use super::{ReceiverSession, failure};
 use crate::{
     RuntimeError,
     archive::{
-        ArchiveClient, ArchiveError, ArchiveLimits, ArchiveStatus, ArchiveWorker, TranscriptPage,
+        ArchiveClient, ArchiveError, ArchiveLimits, ArchiveStatus, ArchiveWorker, AudioPage,
+        TranscriptPage,
     },
     live::ConnectionState,
 };
@@ -107,6 +108,73 @@ impl ReceiverSession {
         }
         Ok(())
     }
+    pub async fn configure_raw_audio(&self, sources: Vec<SourceKey>) -> Result<(), RuntimeError> {
+        {
+            let state = self
+                .0
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if state.connection != ConnectionState::Connected {
+                return Err(RuntimeError::Closed);
+            }
+            if sources.len() > 8
+                || sources
+                    .iter()
+                    .any(|source| !state.settings.audio.contains(source))
+                || sources
+                    .iter()
+                    .collect::<std::collections::HashSet<_>>()
+                    .len()
+                    != sources.len()
+            {
+                return Err(failure(
+                    FailureCode::InvalidRequest,
+                    "raw audio must use selected audio sources",
+                ));
+            }
+        }
+        let archive = self
+            .archive_client()
+            .ok_or_else(|| failure(FailureCode::Unavailable, "disk archive is not enabled"))?;
+        let permit = self
+            .0
+            .operations
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| failure(FailureCode::Busy, "session is busy"))?;
+        let receiver = self.clone();
+        let (reply, result) = oneshot::channel();
+        tokio::spawn(async move {
+            let _permit = permit;
+            let result = archive.configure_audio(sources).await;
+            receiver
+                .0
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .changed();
+            receiver.0.shared.signal();
+            let _ = reply.send(result);
+        });
+        result.await.map_err(|_| RuntimeError::Closed)??;
+        Ok(())
+    }
+
+    pub async fn history_audio(
+        &self,
+        older: Duration,
+        newer: Duration,
+        selected: &[SourceKey],
+    ) -> Result<AudioPage, RuntimeError> {
+        let (first, last) = self.archive_range(older, newer, selected)?;
+        let archive = self
+            .archive_client()
+            .ok_or_else(|| failure(FailureCode::Unavailable, "disk archive is not enabled"))?;
+        Ok(archive.audio(first, last, selected.to_vec()).await?)
+    }
 
     pub(super) async fn seal_archive(&self) -> Result<(), RuntimeError> {
         let _owner = self.0.archive.lock().await;
@@ -122,10 +190,23 @@ impl ReceiverSession {
         newer: Duration,
         selected: &[SourceKey],
     ) -> Result<TranscriptPage, RuntimeError> {
+        let (first, last) = self.archive_range(older, newer, selected)?;
+        let archive = self
+            .archive_client()
+            .ok_or_else(|| failure(FailureCode::Unavailable, "disk archive is not enabled"))?;
+        Ok(archive.transcripts(first, last, selected.to_vec()).await?)
+    }
+
+    fn archive_range(
+        &self,
+        older: Duration,
+        newer: Duration,
+        selected: &[SourceKey],
+    ) -> Result<(u64, u64), RuntimeError> {
         if older < newer || selected.len() > 8 {
             return Err(failure(
                 FailureCode::InvalidRequest,
-                "invalid transcript history range",
+                "invalid archive history range",
             ));
         }
         let mut seen = std::collections::HashSet::new();
@@ -136,7 +217,7 @@ impl ReceiverSession {
             if !seen.insert(source) {
                 return Err(failure(
                     FailureCode::InvalidRequest,
-                    "duplicate transcript source",
+                    "duplicate archive source",
                 ));
             }
         }
@@ -152,10 +233,6 @@ impl ReceiverSession {
                     )
                 })
         };
-        let (first, last) = (relative(older)?, relative(newer)?);
-        let archive = self
-            .archive_client()
-            .ok_or_else(|| failure(FailureCode::Unavailable, "disk archive is not enabled"))?;
-        Ok(archive.transcripts(first, last, selected.to_vec()).await?)
+        Ok((relative(older)?, relative(newer)?))
     }
 }

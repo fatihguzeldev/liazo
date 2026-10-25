@@ -259,9 +259,11 @@ export interface Observation {
   transcripts: Transcript[];
 }
 export interface ArchiveStatus {
+  buffered_audio_bytes: number;
   dropped_records: number;
   phase: ArchivePhase;
   queued_bytes: number;
+  raw_audio_sources: SourceKey[];
   stats: ArchiveStats | null;
 }
 export interface ArchiveStats {

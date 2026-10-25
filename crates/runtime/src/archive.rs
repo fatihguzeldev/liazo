@@ -16,6 +16,7 @@ pub use retention::{ArchiveLimits, ArchiveStats};
 mod transcripts;
 pub use transcripts::{ArchivedTranscript, ReceiverTimeRange, TranscriptPage};
 mod audio;
+mod audio_groups;
 mod lifecycle;
 pub use audio::{AudioClip, AudioPacket, AudioPage, AudioPolicyInterval, AudioSegment};
 mod worker;
