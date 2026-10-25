@@ -265,6 +265,37 @@ async fn disk_history_survives_ram_eviction_and_stays_queryable_after_stop() {
 }
 
 #[tokio::test]
+async fn peer_disconnect_seals_the_archive_without_a_consumer_stopping_the_session() {
+    use liazo_runtime::{
+        ConnectionState,
+        archive::{ArchiveLimits, ArchivePhase},
+    };
+    let (session, provider) = pair(capture()).await;
+    let directory = tempfile::tempdir().unwrap();
+    session
+        .start_archive(directory.path().to_owned(), ArchiveLimits::default())
+        .await
+        .unwrap();
+    provider.abort();
+    let _ = provider.await;
+    timeout(Duration::from_secs(5), async {
+        while session.archive_status().unwrap().phase != ArchivePhase::Stopped {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        session
+            .observe(0, false, &[], Duration::ZERO)
+            .await
+            .connection,
+        ConnectionState::Disconnected
+    );
+    session.flush_archive().await.unwrap();
+}
+
+#[tokio::test]
 async fn blocked_capture_does_not_block_control_or_leave_a_worker_after_stop() {
     let capture = capture();
     let (session, provider) = pair(capture.clone()).await;

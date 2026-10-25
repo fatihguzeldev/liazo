@@ -73,6 +73,7 @@ impl Drop for PendingGuard {
 }
 
 struct Owner {
+    finalizer: Mutex<Option<JoinHandle<()>>>,
     archive: tokio::sync::Mutex<Option<crate::archive::ArchiveWorker>>,
     cleanup: JoinHandle<()>,
     speech: tokio::sync::Mutex<Option<crate::speech::SpeechTask>>,
@@ -86,6 +87,14 @@ impl Drop for Owner {
     fn drop(&mut self) {
         self.shared.cancelled.cancel();
         self.cleanup.abort();
+        if let Some(finalizer) = self
+            .finalizer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            finalizer.abort();
+        }
     }
 }
 
@@ -252,6 +261,7 @@ impl ReceiverSession {
             }
         });
         let receiver = Self(Arc::new(Owner {
+            finalizer: Mutex::new(None),
             archive: tokio::sync::Mutex::new(None),
             cleanup,
             speech: tokio::sync::Mutex::new(None),
@@ -293,6 +303,22 @@ impl ReceiverSession {
             state.changed();
         }
         receiver.0.shared.signal();
+        let ended = receiver.0.shared.cancelled.clone();
+        let owner = Arc::downgrade(&receiver.0);
+        let finalizer = tokio::spawn(async move {
+            ended.cancelled().await;
+            if let Some(owner) = owner.upgrade() {
+                let receiver = ReceiverSession(owner);
+                receiver.stop_transcription().await;
+                let _ = receiver.seal_archive().await;
+                receiver.0.shared.signal();
+            }
+        });
+        *receiver
+            .0
+            .finalizer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(finalizer);
         Ok(receiver)
     }
 
