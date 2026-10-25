@@ -15,7 +15,9 @@ bytes.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 async-trait = "0.1"
+sha2 = "0.10"
 
 [dev-dependencies]
 serde_json.workspace = true
 hound = "3.5"
+tempfile = "3"

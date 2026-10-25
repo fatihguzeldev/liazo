@@ -1,3 +1,4 @@
+pub mod archive;
 pub mod backend;
 mod capture;
 pub mod history;
