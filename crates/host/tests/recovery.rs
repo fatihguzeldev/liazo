@@ -19,8 +19,9 @@ use liazo_transport::{
     Identity, PeerServer, PeerSession, SessionBinding, SessionServer, StoredPeer,
 };
 use std::{
+    collections::VecDeque,
     sync::{
-        Arc, RwLock,
+        Arc, Mutex, RwLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -55,21 +56,39 @@ struct Capture {
     release: Notify,
     pcm: RwLock<Option<Arc<Vec<f32>>>>,
     gate: Arc<Semaphore>,
+    audio_progress: Arc<Mutex<AudioProgress>>,
+}
+#[derive(Default, serde::Serialize)]
+struct AudioProgress {
+    opened: VecDeque<Uuid>,
+    released: VecDeque<Uuid>,
 }
 struct Audio {
     clock: Instant,
+    origin: Option<(Instant, u64)>,
     stream: Uuid,
     sequence: u64,
     pcm: Option<Arc<Vec<f32>>>,
     gate: Arc<Semaphore>,
+    progress: Arc<Mutex<AudioProgress>>,
 }
 #[async_trait]
 impl AudioTrack for Audio {
     async fn next(&mut self) -> Result<Option<Frame>, Failure> {
-        if self.sequence == 0 && self.pcm.is_some() {
-            self.gate.acquire().await.unwrap().forget();
+        if self.origin.is_none() {
+            if self.pcm.is_some() {
+                self.gate.acquire().await.unwrap().forget();
+                let mut progress = self.progress.lock().unwrap();
+                progress.released.push_back(self.stream);
+                if progress.released.len() > 8 {
+                    progress.released.pop_front();
+                }
+            }
+            self.origin = Some((Instant::now(), self.clock.elapsed().as_nanos() as u64));
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        let (started, anchor_ns) = self.origin.unwrap();
+        let offset_ns = self.sequence * 10_000_000;
+        tokio::time::sleep_until((started + Duration::from_nanos(offset_ns)).into()).await;
         let start = self.sequence as usize * 160;
         let bytes = self
             .pcm
@@ -91,7 +110,7 @@ impl AudioTrack for Audio {
                     sample_rate: 16000,
                     channels: 1,
                     frames: 160,
-                    captured_ns: self.clock.elapsed().as_nanos() as u64,
+                    captured_ns: anchor_ns + offset_ns,
                     discontinuity: self.sequence == 1,
                 }),
                 Bytes::from(bytes),
@@ -170,12 +189,19 @@ impl CaptureBackend for Capture {
         if *key != audio_key() {
             return Err(Failure::new(FailureCode::Unavailable, "unknown audio"));
         }
+        let mut progress = self.audio_progress.lock().unwrap();
+        progress.opened.push_back(stream);
+        if progress.opened.len() > 8 {
+            progress.opened.pop_front();
+        }
         Ok(Box::new(Audio {
             clock: self.clock,
+            origin: None,
             stream,
             sequence: 0,
             pcm: self.pcm.read().unwrap().clone(),
             gate: self.gate.clone(),
+            progress: self.audio_progress.clone(),
         }))
     }
 }
@@ -221,6 +247,7 @@ impl Fixture {
             release: Notify::new(),
             pcm: RwLock::new(None),
             gate: Arc::new(Semaphore::new(0)),
+            audio_progress: Arc::new(Mutex::new(AudioProgress::default())),
         });
         let backend = capture.clone();
         let (send, accepted) = mpsc::channel(8);
@@ -335,6 +362,77 @@ impl Fixture {
         .await
         .unwrap_or_else(|_| panic!("archive recovery did not become ready: {last}"))
     }
+    async fn speech_state(
+        &self,
+        receiver: &liazo_runtime::receiver::ReceiverSession,
+        phase: &str,
+    ) -> (liazo_runtime::Observation, String) {
+        let observed = receiver.observe(0, false, &[], Duration::ZERO).await;
+        let recent: Vec<_> = observed
+            .transcripts
+            .iter()
+            .rev()
+            .take(8)
+            .map(|text| {
+                serde_json::json!({
+                    "id": text.id,
+                    "revision": text.revision,
+                    "start_ns": text.start_ns,
+                    "end_ns": text.end_ns,
+                    "ending": text.ending,
+                    "words": text.text.split_whitespace().count(),
+                    "country": text.text.to_lowercase().contains("country"),
+                })
+            })
+            .collect();
+        let current = self.host.current().await;
+        let state = serde_json::json!({
+            "phase": phase,
+            "session": current,
+            "receiver_binding": observed.binding,
+            "receiver_connection": &observed.connection,
+            "selected_audio": &observed.settings.audio,
+            "audio": &observed.audio,
+            "transcription": &observed.transcription,
+            "archive": &observed.archive,
+            "live_gaps": observed.gaps,
+            "source_failures": observed.failures.len(),
+            "transcript_deltas_lost": observed.transcript_deltas_lost,
+            "transcripts": {
+                "total": observed.transcripts.len(),
+                "partials": observed.transcripts.iter().filter(|text| text.ending.is_none()).count(),
+                "finals": observed.transcripts.iter().filter(|text| text.ending.is_some()).count(),
+                "matching_finals": observed.transcripts.iter().filter(|text| {
+                    text.ending.is_some() && text.text.to_lowercase().contains("country")
+                }).count(),
+                "recent": recent,
+            },
+            "gate": &*self.capture.audio_progress.lock().unwrap(),
+        })
+        .to_string();
+        (observed, state)
+    }
+    async fn speech_final(&self, binding: SessionBinding, phase: &str) {
+        let receiver = self.host.receiver(binding).await.unwrap();
+        let started = Instant::now();
+        let mut last = String::from("waiting for speech observation");
+        timeout(Duration::from_secs(35), async {
+            loop {
+                let (observed, state) = self.speech_state(&receiver, phase).await;
+                last = state;
+                assert_eq!(observed.binding, binding, "epoch changed: {last}");
+                if observed.transcripts.iter().any(|text| {
+                    text.ending.is_some() && text.text.to_lowercase().contains("country")
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{phase} final exceeded 35 s correctness guard: {last}"));
+        eprintln!("{phase} final after {:?}: {last}", started.elapsed());
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -368,6 +466,48 @@ async fn wait_disconnected(host: &SessionHost) {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn delayed_audio_delivery_preserves_the_prerecorded_sample_clock() {
+    use liazo_transcription::audio::Normalizer;
+
+    let mut track = Audio {
+        clock: Instant::now(),
+        origin: None,
+        stream: Uuid::new_v4(),
+        sequence: 0,
+        pcm: Some(Arc::new(vec![0.25; 320])),
+        gate: Arc::new(Semaphore::new(1)),
+        progress: Arc::new(Mutex::new(AudioProgress::default())),
+    };
+    let first = track.next().await.unwrap().unwrap();
+    let Header::Audio(first_metadata) = first.header else {
+        panic!("expected audio metadata");
+    };
+    let mut normalizer = Normalizer::new(audio_key());
+    assert!(
+        !normalizer
+            .push(&first_metadata, &first.payload)
+            .unwrap()
+            .discontinuity
+    );
+    // Delayed delivery of the same recorded samples is not a source-clock gap.
+    tokio::time::sleep(Duration::from_millis(525)).await;
+    let second = track.next().await.unwrap().unwrap();
+    let Header::Audio(second_metadata) = second.header else {
+        panic!("expected audio metadata");
+    };
+    let normalized = normalizer.push(&second_metadata, &second.payload).unwrap();
+    assert!(
+        !normalized.discontinuity,
+        "scheduler delay must not split a continuous recorded utterance"
+    );
+    assert_eq!(
+        second_metadata.captured_ns - first_metadata.captured_ns,
+        10_000_000
+    );
+    assert_eq!(normalized.start_ns, first_metadata.captured_ns + 10_000_000);
 }
 
 #[tokio::test]
@@ -629,9 +769,13 @@ async fn real_speech_reconnects_and_recovers_without_undoing_explicit_transcript
         .await
         .unwrap();
     fixture.capture.gate.add_permits(1);
+    let mut last = String::from("waiting for first speech observation");
     timeout(Duration::from_secs(30), async {
         loop {
-            let observation = first_receiver.observe(0, false, &[], Duration::ZERO).await;
+            let (observation, state) = fixture
+                .speech_state(&first_receiver, "initial_partial")
+                .await;
+            last = state;
             if observation
                 .transcripts
                 .iter()
@@ -643,7 +787,8 @@ async fn real_speech_reconnects_and_recovers_without_undoing_explicit_transcript
         }
     })
     .await
-    .unwrap();
+    .unwrap_or_else(|_| panic!("initial speech exceeded 30 s correctness guard: {last}"));
+    eprintln!("initial speech ready: {last}");
     cancel.cancel();
     let current = fixture.epoch_after(first).await;
     assert_eq!(current.binding.session, first.session);
@@ -673,21 +818,7 @@ async fn real_speech_reconnects_and_recovers_without_undoing_explicit_transcript
     // retirement. Its explicit recovery issue must subsequently clear.
     let current = fixture.archive_ready(current.binding).await;
     fixture.capture.gate.add_permits(1);
-    timeout(Duration::from_secs(35), async {
-        loop {
-            let observation = receiver.observe(0, false, &[], Duration::ZERO).await;
-            if observation
-                .transcripts
-                .iter()
-                .any(|text| text.ending.is_some() && text.text.to_lowercase().contains("country"))
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .unwrap();
+    fixture.speech_final(current.binding, "reconnect").await;
     // A local worker interruption preserves host intent and restarts real inference.
     receiver.stop_transcription().await;
     timeout(Duration::from_secs(5), async {
@@ -709,30 +840,17 @@ async fn real_speech_reconnects_and_recovers_without_undoing_explicit_transcript
     fixture.restart();
     let current = fixture.epoch_after(current.binding).await;
     let receiver = fixture.host.receiver(current.binding).await.unwrap();
+    let mut last = String::from("waiting for restarted speech worker");
     timeout(Duration::from_secs(30), async {
         while !receiver.transcription_status().active {
+            last = fixture.speech_state(&receiver, "restart_active").await.1;
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .unwrap();
+    .unwrap_or_else(|_| panic!("restarted speech worker exceeded 30 s guard: {last}"));
     fixture.capture.gate.add_permits(1);
-    timeout(Duration::from_secs(35), async {
-        loop {
-            if receiver
-                .observe(0, false, &[], Duration::ZERO)
-                .await
-                .transcripts
-                .iter()
-                .any(|text| text.ending.is_some() && text.text.to_lowercase().contains("country"))
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .unwrap();
+    fixture.speech_final(current.binding, "restart").await;
     // Stop while a retry has already copied speech intent; it cannot install that intent.
     fixture.capture.blocked.store(true, Ordering::Release);
     fixture.accepted.recv().await.unwrap().cancel();
