@@ -33,6 +33,11 @@ import LiazoCapture
                 defer { audio.stop() }
                 try await Task.sleep(for: .seconds(seconds))
                 try emit(stats.snapshot())
+            case "measure":
+                try await measureCapture(arguments)
+            case "reference":
+                guard arguments.count == 2 else { throw CaptureError.invalidRequest }
+                try writeReferenceImages(URL(fileURLWithPath: arguments[1], isDirectory: true))
             case "capture":
                 guard arguments.count >= 3 else { throw CaptureError.invalidRequest }
                 var options = ScreenOptions()
@@ -51,6 +56,8 @@ import LiazoCapture
             default:
                 print("liazo-capture status | sources | audio-sources | request-permissions")
                 print("liazo-capture capture <source> <output.png> [max-width] | audio <source> [seconds]")
+                print("liazo-capture measure <source> [samples] [max-width] [png|jpeg] [quality]")
+                print("liazo-capture reference <output-directory>")
             }
         } catch {
             FileHandle.standardError.write(Data((error.localizedDescription.lowercased() + "\n").utf8))

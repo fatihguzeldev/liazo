@@ -25,6 +25,11 @@ public struct ScreenOptions: Sendable {
     public init() {}
 }
 
+public struct CaptureTiming: Sendable {
+    public let captureNS: UInt64
+    public let encodeNS: UInt64
+}
+
 @MainActor public final class ScreenCapture {
     private var content: SCShareableContent?
 
@@ -65,7 +70,8 @@ public struct ScreenOptions: Sendable {
     }
 
     public func capture(sourceID: String, options: ScreenOptions = ScreenOptions(),
-                        previousFingerprint: Data? = nil) async throws -> EncodedImage {
+                        previousFingerprint: Data? = nil,
+                        onMeasurement: ((CaptureTiming) -> Void)? = nil) async throws -> EncodedImage {
         guard Self.hasPermission else { throw CaptureError.permissionRequired }
         if content == nil { _ = try await refresh() }
         guard let content else { throw CaptureError.sourceMissing }
@@ -100,11 +106,16 @@ public struct ScreenOptions: Sendable {
         configuration.showsCursor = options.showsCursor
         configuration.scalesToFit = true
         configuration.ignoreShadowsSingleWindow = true
+        let started = DispatchTime.now().uptimeNanoseconds
         let image = try await SCScreenshotManager.captureImage(
             contentFilter: filter, configuration: configuration
         )
-        return try ImageEncoder.encode(image, format: options.format, quality: options.quality,
-                                       ifDifferentFrom: previousFingerprint)
+        let captured = DispatchTime.now().uptimeNanoseconds
+        let encoded = try ImageEncoder.encode(image, format: options.format, quality: options.quality,
+                                             ifDifferentFrom: previousFingerprint)
+        onMeasurement?(CaptureTiming(captureNS: captured - started,
+                                     encodeNS: DispatchTime.now().uptimeNanoseconds - captured))
+        return encoded
     }
 
     private func refresh() async throws -> SCShareableContent {
