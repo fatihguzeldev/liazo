@@ -97,6 +97,11 @@ impl ArchiveIndex {
         tx.execute("INSERT INTO meta (key,value) VALUES ('retention_floor',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [floor.to_string()])?;
         tx.execute("DELETE FROM images WHERE last_ns<?1", [floor])?;
         tx.execute("DELETE FROM gaps WHERE end_ns<?1", [floor])?;
+        tx.execute("DELETE FROM global_gaps WHERE end_ns<?1", [floor])?;
+        tx.execute(
+            "DELETE FROM transcripts WHERE COALESCE(latest_ns,received_ns)<?1",
+            [floor],
+        )?;
         tx.commit()?;
         self.remove_unused()?;
         for _ in 0..256 {

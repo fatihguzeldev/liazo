@@ -52,13 +52,7 @@ impl TranscriptBuffer {
                     .position(|row| row.transcript.id == transcript.id)
                 {
                     let old = &self.rows[index].transcript;
-                    if old.ending.is_some()
-                        || old.revision >= transcript.revision
-                        || old.source != transcript.source
-                        || old.stream_id != transcript.stream_id
-                        || old.start_ns != transcript.start_ns
-                        || old.end_ns > transcript.end_ns
-                    {
+                    if !transcript.supersedes(old) {
                         return false;
                     }
                     self.rows.remove(index);

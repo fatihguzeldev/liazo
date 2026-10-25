@@ -42,6 +42,10 @@ impl HistoryLimits {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GapReason {
+    ArchiveBackpressure,
+    ArchiveFailure,
+    ArchiveStopped,
+    ArchiveInterrupted,
     Disconnected,
     Stopped,
     PermissionRequired,

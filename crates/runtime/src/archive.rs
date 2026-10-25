@@ -13,6 +13,9 @@ mod index;
 pub use index::{ArchiveIdentity, ArchiveIndex};
 mod retention;
 pub use retention::{ArchiveLimits, ArchiveStats};
+mod transcripts;
+pub use transcripts::{ArchivedTranscript, ReceiverTimeRange, TranscriptPage};
+mod lifecycle;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ArchiveError {

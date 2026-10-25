@@ -103,6 +103,8 @@ impl ArchiveIndex {
             payloads,
             limits,
         };
+        archive.initialize_transcripts()?;
+        archive.initialize_lifecycle()?;
         archive.make_room(0, 0)?;
         Ok(archive)
     }
@@ -264,12 +266,17 @@ impl ArchiveIndex {
             result.state = HistoryState::Expired;
             return Ok(result);
         }
+        let uncertain = self.global_gap(at)?;
         let gap: Option<String> = self.database.query_row("SELECT reason FROM gaps WHERE source=?1 AND generation=?2 AND first_ns<=?3 AND (end_ns IS NULL OR end_ns>?3) ORDER BY first_ns DESC LIMIT 1", params![source.id, source.generation.to_string(), at], |row| row.get(0)).optional()?;
         if let Some(reason) = gap {
             result.state = HistoryState::Gap(serde_json::from_str(&reason)?);
             return Ok(result);
         }
         let Some(row) = self.last(source, at)? else {
+            if let Some(reason) = uncertain {
+                result.state = HistoryState::Gap(reason);
+                return Ok(result);
+            }
             let before: Option<String> = self
                 .database
                 .query_row(
@@ -283,6 +290,12 @@ impl ArchiveIndex {
             }
             return Ok(result);
         };
+        if at > row.last_ns
+            && let Some(reason) = uncertain
+        {
+            result.state = HistoryState::Gap(reason);
+            return Ok(result);
+        }
         if at.saturating_sub(row.last_ns) > row.max_gap_ns {
             result.state = HistoryState::Gap(GapReason::NoData);
             return Ok(result);

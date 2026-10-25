@@ -43,6 +43,16 @@ pub struct Transcript {
 }
 
 impl Transcript {
+    pub fn supersedes(&self, previous: &Self) -> bool {
+        self.id == previous.id
+            && previous.ending.is_none()
+            && self.revision > previous.revision
+            && self.source == previous.source
+            && self.stream_id == previous.stream_id
+            && self.start_ns == previous.start_ns
+            && self.end_ns >= previous.end_ns
+    }
+
     pub fn validate(&self) -> Result<(), ProtocolError> {
         self.source.validate()?;
         if self.id.is_nil()
