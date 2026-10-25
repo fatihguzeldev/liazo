@@ -13,6 +13,10 @@ on:
         default: cpu
         type: choice
         options: [cpu, vulkan, all]
+      client_only:
+        description: Build the client host without the desktop or installer
+        default: false
+        type: boolean
   push:
     tags: ['v*']
 
@@ -30,6 +34,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        if: ${{ !inputs.client_only }}
         with:
           node-version: '24'
       - name: native build tools
@@ -40,6 +45,11 @@ jobs:
           $clang = 'C:\Program Files\LLVM\bin'
           if (!(Test-Path "$clang\libclang.dll")) { throw 'libclang is unavailable' }
           "LIBCLANG_PATH=$clang" >> $env:GITHUB_ENV
+          $accelerated = '${{ inputs.cpu }}' -eq 'avx2'
+          foreach ($name in @('NATIVE', 'SSE42', 'AVX', 'AVX2', 'BMI2', 'AVX512', 'AVX_VNNI', 'FMA', 'F16C')) {
+            $enabled = $accelerated -and $name -notin @('NATIVE', 'AVX512', 'AVX_VNNI')
+            "GGML_$name=$(if ($enabled) { 'ON' } else { 'OFF' })" >> $env:GITHUB_ENV
+          }
       - name: pinned Vulkan SDK
         if: matrix.backend == 'vulkan'
         shell: pwsh
@@ -68,6 +78,7 @@ jobs:
           "LIAZO_VULKAN_SDK_SHA256=$sha256" >> $env:GITHUB_ENV
           (Join-Path $sdk 'Bin') >> $env:GITHUB_PATH
       - name: frontend dependencies
+        if: ${{ !inputs.client_only }}
         working-directory: desktop
         run: npm ci --no-audit --no-fund
       - name: package desktop and independent MCP
@@ -75,8 +86,10 @@ jobs:
         env:
           LIAZO_PACKAGE_CPU: ${{ inputs.cpu || 'baseline' }}
           LIAZO_PACKAGE_BACKEND: ${{ matrix.backend }}
-        run: desktop/scripts/package-windows.ps1 -Cpu $env:LIAZO_PACKAGE_CPU -Backend $env:LIAZO_PACKAGE_BACKEND -BuildRoot $env:LIAZO_VULKAN_BUILD_ROOT
+          LIAZO_CLIENT_ONLY: ${{ inputs.client_only }}
+        run: desktop/scripts/package-windows.ps1 -Cpu $env:LIAZO_PACKAGE_CPU -Backend $env:LIAZO_PACKAGE_BACKEND -BuildRoot $env:LIAZO_VULKAN_BUILD_ROOT -ClientOnly:($env:LIAZO_CLIENT_ONLY -eq 'true')
       - name: install and exercise the packaged MCP
+        if: ${{ !inputs.client_only }}
         shell: pwsh
         env:
           LIAZO_PACKAGE_CPU: ${{ inputs.cpu || 'baseline' }}
@@ -155,6 +168,7 @@ jobs:
           compression-level: 0
           retention-days: 14
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: ${{ !inputs.client_only }}
         with:
           name: liazo-windows-${{ inputs.cpu || 'baseline' }}${{ matrix.backend == 'vulkan' && '-vulkan' || '' }}
           path: |

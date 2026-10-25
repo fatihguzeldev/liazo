@@ -1,7 +1,8 @@
 param(
     [ValidateSet('baseline', 'avx2')][string]$Cpu = 'baseline',
     [ValidateSet('cpu', 'vulkan')][string]$Backend = 'cpu',
-    [string]$BuildRoot = ''
+    [string]$BuildRoot = '',
+    [switch]$ClientOnly
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -200,18 +201,20 @@ try {
         }
     }
 
-    Push-Location (Join-Path $root 'desktop')
-    try {
-        & npm run tauri -- build --target $target --config src-tauri/bundle.windows.json --bundles nsis @featureArgs
-        if ($LASTEXITCODE -ne 0) { throw 'desktop installer build failed' }
-    } finally { Pop-Location }
-    Get-SourceStatus 'after desktop bundle' | Out-Null
+    if (!$ClientOnly) {
+        Push-Location (Join-Path $root 'desktop')
+        try {
+            & npm run tauri -- build --target $target --config src-tauri/bundle.windows.json --bundles nsis @featureArgs
+            if ($LASTEXITCODE -ne 0) { throw 'desktop installer build failed' }
+        } finally { Pop-Location }
+        Get-SourceStatus 'after desktop bundle' | Out-Null
+    }
 
     $portable = Join-Path $output 'portable'
     if (Test-Path $portable) { Remove-Item $portable -Recurse -Force }
     New-Item -ItemType Directory -Path $portable | Out-Null
     Copy-Item (Join-Path $release 'liazo.exe') $portable
-    Copy-Item (Join-Path $release 'liazo-desktop.exe') $portable
+    if (!$ClientOnly) { Copy-Item (Join-Path $release 'liazo-desktop.exe') $portable }
     Copy-Item (Join-Path $runtime '*.dll') $portable
     Get-ChildItem $runtime -Filter '*License*.txt' | Copy-Item -Destination $portable
     $dumpbin = Get-ChildItem (Join-Path $visualStudio 'VC/Tools/MSVC/*/bin/Hostx64/x64/dumpbin.exe') |
@@ -236,12 +239,14 @@ try {
     if ($Backend -eq 'vulkan') {
         Copy-Item (Join-Path $runtime 'vulkan-1.dll') (Join-Path $release 'deps') -Force
     }
-    $previousCli = $env:LIAZO_TEST_CLI
-    $env:LIAZO_TEST_CLI = Join-Path $portable 'liazo.exe'
-    try {
-        & cargo test --locked --release --target $target -p liazo --test mcp_stdio @featureArgs
-        if ($LASTEXITCODE -ne 0) { throw 'packaged MCP smoke test failed' }
-    } finally { $env:LIAZO_TEST_CLI = $previousCli }
+    if (!$ClientOnly) {
+        $previousCli = $env:LIAZO_TEST_CLI
+        $env:LIAZO_TEST_CLI = Join-Path $portable 'liazo.exe'
+        try {
+            & cargo test --locked --release --target $target -p liazo --test mcp_stdio @featureArgs
+            if ($LASTEXITCODE -ne 0) { throw 'packaged MCP smoke test failed' }
+        } finally { $env:LIAZO_TEST_CLI = $previousCli }
+    }
 
     $source = & git rev-parse HEAD
     if ($LASTEXITCODE -ne 0) { throw 'source identity unavailable' }
@@ -256,6 +261,7 @@ try {
         target = $target
         cpu = $Cpu
         backend = $Backend
+        clientOnly = [bool]$ClientOnly
         cargoFeatures = @(if ($Backend -eq 'vulkan') { 'vulkan' })
         vulkanRuntime = $vulkanRuntime
         vulkanSdk = $(if ($Backend -eq 'vulkan') { @{ headerVersion = 363; archiveSha256 = $env:LIAZO_VULKAN_SDK_SHA256 } } else { $null })
@@ -263,12 +269,12 @@ try {
             @{ name = $_.Name; bytes = $_.Length; sha256 = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
         })
         cpuRequirements = @(if ($Cpu -eq 'avx2') { 'SSE4.2'; 'AVX'; 'AVX2'; 'BMI2'; 'FMA'; 'F16C' } else { 'x86-64 baseline' })
-        webview2 = 'installer embeds offline setup; portable desktop requires an installed WebView2 runtime'
+        webview2 = $(if (!$ClientOnly) { 'installer embeds offline setup; portable desktop requires an installed WebView2 runtime' } else { $null })
         signing = 'unsigned'
     } | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $output 'build.json') -Encoding utf8
     Copy-Item (Join-Path $output 'build.json') $portable
     Compress-Archive -Path (Join-Path $portable '*') -DestinationPath (Join-Path $output "liazo-$version-$target-$variant-portable.zip") -Force
-    Copy-Item (Join-Path $release 'bundle/nsis/*-setup.exe') $output -Force
+    if (!$ClientOnly) { Copy-Item (Join-Path $release 'bundle/nsis/*-setup.exe') $output -Force }
     Get-ChildItem $output -File | Where-Object Extension -in '.exe', '.zip' | ForEach-Object {
         $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
         "$hash  $($_.Name)" | Set-Content "$($_.FullName).sha256" -Encoding ascii
