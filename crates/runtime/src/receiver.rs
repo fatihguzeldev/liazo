@@ -322,6 +322,27 @@ impl ReceiverSession {
         Ok(receiver)
     }
 
+    pub fn connection(&self) -> ConnectionState {
+        self.0
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .connection
+            .clone()
+    }
+
+    pub fn transcription_status(&self) -> crate::TranscriptionStatus {
+        self.0
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .transcripts
+            .status
+            .clone()
+    }
+
     pub fn sources(&self) -> SourceSnapshot {
         self.0
             .shared
@@ -653,15 +674,24 @@ impl ReceiverSession {
 
     pub async fn stop(&self) -> Result<(), RuntimeError> {
         let _stopping = self.0.stop.lock().await;
-        if self
-            .0
-            .shared
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .connection
-            == ConnectionState::Stopped
-        {
+        let local = {
+            let mut state = self
+                .0
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if state.connection == ConnectionState::Disconnected
+                || self.0.shared.cancelled.is_cancelled()
+            {
+                state.connection = ConnectionState::Stopped;
+                state.connection_ended(self.0.shared.now_ns());
+                state.changed();
+            }
+            state.connection == ConnectionState::Stopped
+        };
+        if local {
+            self.0.shared.signal();
             self.stop_transcription().await;
             self.seal_archive().await?;
             return Ok(());

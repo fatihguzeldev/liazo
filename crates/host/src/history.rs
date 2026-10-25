@@ -25,7 +25,13 @@ impl SessionHost {
         Ok(self.catalog()?.list(offset).await?)
     }
     async fn active_archive(&self, binding: SessionBinding) -> Option<ReceiverSession> {
-        self.receiver(binding).await.ok()
+        let receiver = self.receiver(binding).await.ok()?;
+        if receiver.archive_status().is_none()
+            && receiver.connection() != liazo_runtime::ConnectionState::Connected
+        {
+            return None;
+        }
+        Some(receiver)
     }
     pub async fn archive_sources(
         &self,

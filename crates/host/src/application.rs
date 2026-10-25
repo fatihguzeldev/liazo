@@ -1,15 +1,23 @@
 use liazo_core::protocol::SourceKey;
-use liazo_runtime::{
-    ConnectionState, RuntimeError, archive::ArchiveLimits, receiver::ReceiverSession,
-};
+use liazo_runtime::{ConnectionState, RuntimeError, receiver::ReceiverSession};
 use liazo_transport::{
-    CredentialError, Fingerprint, Identity, PairingInvitation, PeerClient, SessionBinding,
-    StoredPeer, request_pairing,
+    CredentialError, Fingerprint, Identity, PairingInvitation, SessionBinding, StoredPeer,
+    request_pairing,
 };
 use serde::Serialize;
-use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    path::PathBuf,
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 use tokio::sync::{Mutex, RwLock, Semaphore, oneshot};
-use uuid::Uuid;
+use tokio_util::sync::CancellationToken;
+mod recovery;
+use recovery::start_speech;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
@@ -49,18 +57,48 @@ pub struct SessionSummary {
     pub provider: String,
     pub address: SocketAddr,
     pub connection: ConnectionState,
+    pub recovery: Vec<RecoveryIssue>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryOperation {
+    Capture,
+    Archive,
+    RawAudio,
+    Transcription,
+}
+
+#[derive(Clone, Debug, Serialize, schemars::JsonSchema)]
+pub struct RecoveryIssue {
+    pub operation: RecoveryOperation,
+    pub source: Option<SourceKey>,
+    pub message: String,
+}
+
+#[derive(Clone)]
+struct SpeechIntent {
+    model: liazo_transcription::WhisperModel,
+    threads: u8,
+    sources: Vec<SourceKey>,
 }
 
 struct Active {
     peer: Fingerprint,
     address: SocketAddr,
     receiver: ReceiverSession,
+    reconnect: bool,
+    raw_audio: Vec<SourceKey>,
+    speech: Option<SpeechIntent>,
+    speech_revision: u64,
+    recovery: Vec<RecoveryIssue>,
 }
 struct Inner {
     identity: Identity,
     peers: RwLock<Vec<StoredPeer>>,
     active: RwLock<Option<Active>>,
     operation: Arc<Mutex<()>>,
+    speech_operation: Arc<Mutex<()>>,
     slots: Arc<Semaphore>,
     stops: Arc<Semaphore>,
     pairing: Arc<Mutex<()>>,
@@ -69,6 +107,22 @@ struct Inner {
     archive_root: PathBuf,
     catalog: Option<liazo_runtime::archive::ArchiveCatalog>,
     models: crate::models::ModelStore,
+    revision: AtomicU64,
+    transition: StdMutex<CancellationToken>,
+    monitor: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if let Some(task) = self
+            .monitor
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            task.abort();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -134,6 +188,7 @@ impl SessionHost {
             peers: RwLock::new(peers),
             active: RwLock::new(None),
             operation: Arc::new(Mutex::new(())),
+            speech_operation: Arc::new(Mutex::new(())),
             slots: Arc::new(Semaphore::new(8)),
             stops: Arc::new(Semaphore::new(2)),
             pairing: Arc::new(Mutex::new(())),
@@ -142,6 +197,9 @@ impl SessionHost {
             archive_root,
             catalog,
             models: crate::models::ModelStore::new(model_root),
+            revision: AtomicU64::new(0),
+            transition: StdMutex::new(CancellationToken::new()),
+            monitor: StdMutex::new(None),
         }))
     }
 
@@ -175,12 +233,12 @@ impl SessionHost {
     pub async fn current(&self) -> Option<SessionSummary> {
         let active = self.0.active.read().await;
         let active = active.as_ref()?;
-        let observed = active.receiver.observe(0, false, &[], Duration::ZERO).await;
         Some(SessionSummary {
-            binding: observed.binding,
+            binding: active.receiver.archive_identity().binding,
             provider: active.peer.to_string(),
             address: active.address,
-            connection: observed.connection,
+            connection: active.receiver.connection(),
+            recovery: active.recovery.clone(),
         })
     }
 
@@ -193,87 +251,32 @@ impl SessionHost {
             return Err(HostError::Invalid);
         }
         let host = self.clone();
-        self.owned(async move { host.connect_inner(address, peer).await })
+        self.owned(async move { host.connect_inner(address, peer, None).await })
             .await
-    }
-
-    async fn connect_inner(
-        &self,
-        address: SocketAddr,
-        peer: Fingerprint,
-    ) -> Result<SessionSummary, HostError> {
-        if let Some(current) = self.current().await
-            && current.connection == ConnectionState::Connected
-        {
-            return if current.provider == peer.to_string() && current.address == address {
-                Ok(current)
-            } else {
-                Err(HostError::ActiveSession)
-            };
-        }
-        let previous = self
-            .0
-            .active
-            .read()
-            .await
-            .as_ref()
-            .map(|active| active.receiver.clone());
-        if let Some(previous) = previous {
-            previous.disconnect().await?;
-            previous.retire_archive().await?;
-            self.0.active.write().await.take();
-        }
-        let certificate = self
-            .0
-            .peers
-            .read()
-            .await
-            .iter()
-            .find(|candidate| candidate.fingerprint() == peer)
-            .map(|peer| peer.certificate.clone())
-            .ok_or(HostError::Unpaired)?;
-        let receiver = ReceiverSession::connect(
-            &PeerClient::new(&self.0.identity, &certificate)?,
-            address,
-            Uuid::new_v4(),
-        )
-        .await?;
-        let binding = receiver.archive_identity().binding;
-        receiver
-            .start_archive(
-                self.0
-                    .archive_root
-                    .join(binding.session.to_string())
-                    .join(binding.epoch.to_string()),
-                ArchiveLimits::default(),
-            )
-            .await?;
-        let trusted = self.0.peers.read().await;
-        if !trusted
-            .iter()
-            .any(|candidate| candidate.fingerprint() == peer)
-        {
-            drop(trusted);
-            receiver.disconnect().await?;
-            return Err(HostError::Unpaired);
-        }
-        *self.0.active.write().await = Some(Active {
-            peer,
-            address,
-            receiver,
-        });
-        drop(trusted);
-        self.current().await.ok_or(HostError::NoSession)
     }
 
     pub async fn stop(&self, binding: SessionBinding) -> Result<(), HostError> {
-        let host = self.clone();
+        let receiver = {
+            let mut active = self.0.active.write().await;
+            let active = active.as_mut().ok_or(HostError::NoSession)?;
+            if active.receiver.archive_identity().binding != binding {
+                return Err(HostError::NoSession);
+            }
+            active.reconnect = false;
+            active.speech = None;
+            active.speech_revision = active.speech_revision.saturating_add(1);
+            self.0.revision.fetch_add(1, Ordering::AcqRel);
+            self.0
+                .transition
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .cancel();
+            active.receiver.clone()
+        };
+        let speech = self.0.speech_operation.clone();
         Self::spawn_owned(self.0.stops.clone(), async move {
-            host.receiver(binding)
-                .await?
-                .stop()
-                .await
-                .map_err(Into::into)
+            let _speech = speech.lock().await;
+            receiver.stop().await.map_err(Into::into)
         })
         .await
     }
@@ -288,6 +291,12 @@ impl SessionHost {
                     .iter()
                     .any(|peer| peer.fingerprint() == session.peer)
             }) {
+                self.0.revision.fetch_add(1, Ordering::AcqRel);
+                self.0
+                    .transition
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .cancel();
                 active.take().map(|session| session.receiver)
             } else {
                 None
@@ -383,21 +392,82 @@ impl SessionHost {
         if !(1..=16).contains(&threads) || sources.is_empty() || sources.len() > 8 {
             return Err(HostError::Invalid);
         }
+        validate_sources(&sources)?;
         let host = self.clone();
         self.owned(async move {
             let receiver = host.receiver(binding).await?;
+            let revision = host
+                .0
+                .active
+                .read()
+                .await
+                .as_ref()
+                .ok_or(HostError::NoSession)?
+                .speech_revision;
             let model =
                 tokio::task::spawn_blocking(move || liazo_transcription::WhisperModel::load(&path))
                     .await
                     .map_err(|_| HostError::Interrupted)??;
-            receiver
-                .start_transcription(
-                    model,
-                    threads,
-                    sources,
-                    liazo_transcription::streaming::StreamingSettings::default(),
-                )
-                .await?;
+            let speech = SpeechIntent {
+                model,
+                threads,
+                sources,
+            };
+            let _speech = host.0.speech_operation.lock().await;
+            {
+                let active = host.0.active.read().await;
+                let active = active.as_ref().ok_or(HostError::NoSession)?;
+                if active.speech_revision != revision || !active.reconnect {
+                    return Err(HostError::Interrupted);
+                }
+            }
+            start_speech(&receiver, &speech).await?;
+            let installed = {
+                let mut active = host.0.active.write().await;
+                let active = active.as_mut().ok_or(HostError::NoSession)?;
+                if active.speech_revision == revision && active.reconnect {
+                    active.speech = Some(speech);
+                    active
+                        .recovery
+                        .retain(|issue| issue.operation != RecoveryOperation::Transcription);
+                    true
+                } else {
+                    false
+                }
+            };
+            if !installed {
+                receiver.stop_transcription().await;
+                return Err(HostError::Interrupted);
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn stop_transcription(&self, binding: SessionBinding) -> Result<(), HostError> {
+        let receiver = {
+            let mut active = self.0.active.write().await;
+            let active = active.as_mut().ok_or(HostError::NoSession)?;
+            if active.receiver.archive_identity().binding != binding {
+                return Err(HostError::NoSession);
+            }
+            active.speech = None;
+            active.speech_revision = active.speech_revision.saturating_add(1);
+            self.0.revision.fetch_add(1, Ordering::AcqRel);
+            self.0
+                .transition
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .cancel();
+            active
+                .recovery
+                .retain(|issue| issue.operation != RecoveryOperation::Transcription);
+            active.receiver.clone()
+        };
+        let speech = self.0.speech_operation.clone();
+        Self::spawn_owned(self.0.stops.clone(), async move {
+            let _speech = speech.lock().await;
+            receiver.stop_transcription().await;
             Ok(())
         })
         .await
@@ -458,6 +528,7 @@ pub(crate) fn validate_sources(sources: &[SourceKey]) -> Result<(), HostError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn stop_is_available_while_other_owned_operations_are_busy() {

@@ -540,12 +540,7 @@ async fn transcription_stop(
     State(state): State<HttpState>,
     Json(args): Json<Scope>,
 ) -> Result<Json<serde_json::Value>, HostError> {
-    state
-        .host
-        .receiver(args.binding)
-        .await?
-        .stop_transcription()
-        .await;
+    state.host.stop_transcription(args.binding).await?;
     Ok(Json(serde_json::json!({"stopped":true})))
 }
 async fn stop(

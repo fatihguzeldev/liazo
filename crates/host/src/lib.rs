@@ -12,4 +12,4 @@ mod trust;
 pub use trust::TrustStore;
 pub mod requests;
 
-pub use application::{HostError, SessionHost, SessionSummary};
+pub use application::{HostError, RecoveryIssue, RecoveryOperation, SessionHost, SessionSummary};

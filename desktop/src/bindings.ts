@@ -63,6 +63,8 @@ export type TranscriptionGapReason =
   | "engine_failure"
   | "interrupted";
 export type EndReason = "silence" | "limit" | "stopped" | "gap";
+export type RecoveryOperation =
+  "capture" | "archive" | "raw_audio" | "transcription";
 export type SourceAvailability =
   "available" | "permission_required" | "unavailable";
 export type SourceKind =
@@ -464,6 +466,12 @@ export interface SessionSummary {
   binding: SessionBinding;
   connection: ConnectionState;
   provider: string;
+  recovery: RecoveryIssue[];
+}
+export interface RecoveryIssue {
+  message: string;
+  operation: RecoveryOperation;
+  source: SourceKey | null;
 }
 export interface SourceSnapshot {
   issues: SourceIssue[];
