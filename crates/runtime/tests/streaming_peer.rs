@@ -71,9 +71,6 @@ impl AudioTrack for Track {
             self.origin = Some((Instant::now(), self.clock.elapsed().as_nanos() as u64));
         }
         let (start, ns) = self.origin.unwrap();
-        if self.position >= self.pcm.len() + 48_000 {
-            std::future::pending::<()>().await;
-        }
         tokio::time::sleep_until(
             (start + Duration::from_nanos(self.position as u64 * 1_000_000_000 / 48_000)).into(),
         )
@@ -302,6 +299,22 @@ async fn real_speech_crosses_peer_transport_and_shared_observation_without_block
     assert!(
         session
             .observe(independent.cursor, false, &[], Duration::ZERO)
+            .await
+            .transcripts
+            .is_empty()
+    );
+    session.stop_transcription().await;
+    let idle = session.observe(0, false, &[], Duration::ZERO).await;
+    let waiting = Instant::now();
+    let quiet = session
+        .observe(idle.cursor, false, &[], Duration::from_millis(180))
+        .await;
+    assert!(waiting.elapsed() >= Duration::from_millis(150));
+    assert_eq!(quiet.cursor, idle.cursor);
+    assert!(quiet.audio[0].sequence > idle.audio[0].sequence);
+    assert!(
+        session
+            .observe(idle.cursor, false, &[], Duration::ZERO)
             .await
             .transcripts
             .is_empty()

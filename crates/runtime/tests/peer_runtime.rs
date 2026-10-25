@@ -376,3 +376,42 @@ async fn permission_changes_close_history_and_fresh_capture_reports_the_source_e
     session.stop().await.unwrap();
     provider.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn unchanged_heartbeats_refresh_metadata_without_ending_a_content_wait() {
+    let capture = capture();
+    capture.gate.add_permits(1);
+    let (session, provider) = pair(capture).await;
+    let mut selected = settings();
+    selected.images[0].interval_ms = 50;
+    session.configure(selected).await.unwrap();
+    let first = timeout(Duration::from_secs(1), async {
+        let mut cursor = 0;
+        loop {
+            let snapshot = session
+                .observe(cursor, false, &[], Duration::from_millis(100))
+                .await;
+            if !snapshot.images.is_empty() {
+                break snapshot;
+            }
+            cursor = snapshot.cursor;
+        }
+    })
+    .await
+    .unwrap();
+    let started = Instant::now();
+    let quiet = session
+        .observe(first.cursor, false, &[], Duration::from_millis(180))
+        .await;
+    assert!(started.elapsed() >= Duration::from_millis(150));
+    assert_eq!(quiet.cursor, first.cursor);
+    assert!(quiet.images[0].payload.is_none());
+    assert!(quiet.images[0].metadata.sequence > first.images[0].metadata.sequence);
+    assert!(
+        session.capture_now(vec![source()]).await.unwrap().images[0]
+            .payload
+            .is_some()
+    );
+    session.stop().await.unwrap();
+    provider.await.unwrap().unwrap();
+}

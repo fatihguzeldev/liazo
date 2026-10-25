@@ -172,8 +172,9 @@ impl ReceiverSession {
             let mut stream = peer.audio;
             loop {
                 let mut frame = tokio::select! { _ = audio.cancelled.cancelled() => return Ok(()), frame = Frame::read_from(&mut stream) => frame?.ok_or(RuntimeError::Closed)? };
-                let selected = audio.state.lock().unwrap_or_else(|e| e.into_inner()).audio(&mut frame).map_err(|_| RuntimeError::Protocol)?;
-                if selected { let _ = audio.audio.send(frame); audio.signal(); }
+                let (selected, significant) = audio.state.lock().unwrap_or_else(|e| e.into_inner()).audio(&mut frame).map_err(|_| RuntimeError::Protocol)?;
+                if selected { let _ = audio.audio.send(frame); }
+                if significant { audio.signal(); }
             }
         });
         let refresh = shared.clone();
@@ -500,7 +501,7 @@ impl ReceiverSession {
                 .unwrap_or_else(|e| e.into_inner())
                 .observe(after, include_current, selected, self.0.shared.now_ns());
             if snapshot.cursor > after
-                || wait.is_zero()
+                || Deadline::now() >= deadline
                 || matches!(
                     snapshot.connection,
                     ConnectionState::Disconnected | ConnectionState::Stopped
@@ -508,9 +509,7 @@ impl ReceiverSession {
             {
                 return snapshot;
             }
-            if timeout_at(deadline, changed).await.is_err() {
-                return snapshot;
-            }
+            let _ = timeout_at(deadline, changed).await;
         }
     }
 

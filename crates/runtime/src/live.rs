@@ -301,11 +301,11 @@ impl LiveState {
             now,
             Duration::from_millis(u64::from(interval_ms) * 3 + 1000),
         );
-        if self
+        let recovered = self
             .failures
             .get(&meta.source)
-            .is_some_and(|failure| failure.observed_ns <= meta.captured_ns)
-        {
+            .is_some_and(|failure| failure.observed_ns <= meta.captured_ns);
+        if recovered {
             self.failures.remove(&meta.source);
         }
         self.images.insert(
@@ -317,37 +317,54 @@ impl LiveState {
                 payload_id,
             },
         );
-        self.changed();
+        if !unchanged || skipped || recovered {
+            self.changed();
+        }
         Ok(())
     }
 
-    pub fn audio(&mut self, frame: &mut Frame) -> Result<bool, ()> {
+    pub fn audio(&mut self, frame: &mut Frame) -> Result<(bool, bool), ()> {
         let Header::Audio(meta) = &mut frame.header else {
             return Err(());
         };
         if !self.settings.audio.contains(&meta.source)
             && !self.expected_audio.contains(&meta.source)
         {
-            return Ok(false);
+            return Ok((false, false));
         }
+        let mut significant = false;
         if let Some(old) = self.audio.get(&meta.source) {
             if old.stream_id == meta.stream_id && meta.sequence <= old.sequence {
-                return Ok(false);
+                return Ok((false, false));
             }
-            if old.stream_id != meta.stream_id
+            if meta.discontinuity
+                || old.stream_id != meta.stream_id
+                || old.sample_rate != meta.sample_rate
+                || old.channels != meta.channels
                 || old.sequence.saturating_add(1) != meta.sequence
                 || old.sample_position + u64::from(old.frames) != meta.sample_position
             {
                 meta.discontinuity = true;
                 self.gaps += 1;
+                significant = true;
             }
         } else {
             meta.discontinuity = true;
+            significant = true;
         }
-        self.failures.remove(&meta.source);
+        if self
+            .failures
+            .get(&meta.source)
+            .is_some_and(|health| health.observed_ns <= meta.captured_ns)
+        {
+            self.failures.remove(&meta.source);
+            significant = true;
+        }
         self.audio.insert(meta.source.clone(), meta.clone());
-        self.changed();
-        Ok(true)
+        if significant {
+            self.changed();
+        }
+        Ok((true, significant))
     }
 
     pub fn event(&mut self, event: Event, now: u64) {
@@ -375,6 +392,13 @@ impl LiveState {
             {
                 return;
             }
+            let significant = match (self.failures.get(&source), failure.as_ref()) {
+                (None, None) => false,
+                (Some(old), Some(new)) => {
+                    old.failure.code != new.code || old.failure.message != new.message
+                }
+                _ => true,
+            };
             if let Some(failure) = failure {
                 let reason = if failure.code == liazo_core::control::FailureCode::PermissionRequired
                 {
@@ -393,7 +417,9 @@ impl LiveState {
             } else {
                 self.failures.remove(&source);
             }
-            self.changed();
+            if significant {
+                self.changed();
+            }
         }
     }
 
@@ -507,5 +533,63 @@ impl LiveState {
                 .collect(),
             gaps: self.gaps,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn audio_progress_is_current_but_only_lifecycle_and_gaps_advance_the_observation_cursor() {
+        let key = SourceKey {
+            id: "audio:fixture".into(),
+            generation: Uuid::new_v4(),
+        };
+        let mut state = LiveState::new(SessionBinding {
+            session: Uuid::new_v4(),
+            epoch: Uuid::new_v4(),
+        });
+        state.connection = ConnectionState::Connected;
+        state.applied(
+            1,
+            CaptureSettings {
+                images: vec![],
+                audio: vec![key.clone()],
+            },
+            0,
+        );
+        let mut meta = AudioMeta {
+            source: key,
+            stream_id: Uuid::new_v4(),
+            sequence: 1,
+            captured_ns: 0,
+            sample_position: 0,
+            sample_rate: 16000,
+            channels: 1,
+            frames: 160,
+            discontinuity: false,
+        };
+        let mut frame = Frame::new(Header::Audio(meta.clone()), Bytes::from(vec![0; 640])).unwrap();
+        assert_eq!(state.audio(&mut frame), Ok((true, true)));
+        let cursor = state.cursor;
+        for sequence in 2..=100 {
+            meta.sequence = sequence;
+            meta.sample_position = (sequence - 1) * 160;
+            meta.captured_ns = sequence * 10_000_000;
+            let mut frame =
+                Frame::new(Header::Audio(meta.clone()), Bytes::from(vec![0; 640])).unwrap();
+            assert_eq!(state.audio(&mut frame), Ok((true, false)));
+        }
+        assert_eq!(state.cursor, cursor);
+        assert_eq!(
+            state.observe(cursor, false, &[], 2_000_000_000).audio[0].sequence,
+            100
+        );
+        meta.sequence = 102;
+        meta.sample_position += 320;
+        let mut frame = Frame::new(Header::Audio(meta), Bytes::from(vec![0; 640])).unwrap();
+        assert_eq!(state.audio(&mut frame), Ok((true, true)));
+        assert!(state.cursor > cursor);
+        assert_eq!(state.gaps, 1);
     }
 }
