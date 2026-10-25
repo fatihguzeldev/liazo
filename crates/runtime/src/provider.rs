@@ -152,6 +152,7 @@ pub async fn serve(
     let mut catalog = timeout(Duration::from_secs(3), backend.discover())
         .await
         .map_err(|_| Failure::new(FailureCode::Timeout, "source discovery timed out"))??;
+    catalog.sources.sort_by(|a, b| a.key.id.cmp(&b.key.id));
     let (control_reader, mut control_writer) = tokio::io::split(peer.control);
     let (requests, mut incoming) = mpsc::channel::<ControlInput>(16);
     let (outgoing, mut control_output) = mpsc::channel::<Outgoing>(32);
@@ -235,13 +236,15 @@ pub async fn serve(
                 discoveries.spawn(async move { timeout(Duration::from_secs(3), backend.discover()).await });
             }
             discovered = discoveries.join_next(), if !discoveries.is_empty() => {
-                if let Some(Ok(Ok(Ok(mut current)))) = discovered
-                    && (current.sources != catalog.sources || !issues_equal(&current, &catalog)) {
+                if let Some(Ok(Ok(Ok(mut current)))) = discovered {
+                    current.sources.sort_by(|a, b| a.key.id.cmp(&b.key.id));
+                    if current.sources != catalog.sources || !issues_equal(&current, &catalog) {
                         current.revision = catalog.revision.saturating_add(1);
                         catalog = current;
                         if let Ok(frame) = Frame::new(Header::Event(Event::CatalogChanged { revision: catalog.revision }), Bytes::new()) {
                             let _ = outgoing.send(Outgoing { frame, flushed: None }).await;
                         }
+                    }
                 }
             }
             request = incoming.recv() => {

@@ -18,6 +18,7 @@ pub enum TranscriptionGapReason {
     InvalidAudio,
     Backpressure,
     EngineFailure,
+    Interrupted,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

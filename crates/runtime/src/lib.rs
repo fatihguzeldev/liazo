@@ -4,10 +4,15 @@ pub mod images;
 mod live;
 pub mod provider;
 pub mod receiver;
+mod speech;
+mod transcripts;
 pub use live::{AgeRange, ConnectionState, Freshness, Observation, ObservedImage};
+pub use transcripts::TranscriptionStatus;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
+    #[error(transparent)]
+    Transcription(#[from] liazo_transcription::TranscriptionError),
     #[error(transparent)]
     Wire(#[from] liazo_core::wire::WireError),
     #[error(transparent)]

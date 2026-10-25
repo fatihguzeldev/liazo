@@ -1,4 +1,6 @@
+use crate::transcripts::{TranscriptBuffer, TranscriptionStatus};
 use bytes::Bytes;
+use liazo_core::transcript::Transcript;
 use liazo_core::{
     catalog::SourceSnapshot,
     control::{Event, Failure},
@@ -87,6 +89,9 @@ pub struct Observation {
     pub source_revision: u64,
     pub images: Vec<ObservedImage>,
     pub audio: Vec<AudioMeta>,
+    pub transcripts: Vec<Transcript>,
+    pub transcription: TranscriptionStatus,
+    pub transcript_deltas_lost: bool,
     pub failures: Vec<(SourceKey, Failure)>,
     pub gaps: u64,
 }
@@ -102,6 +107,7 @@ struct Health {
 }
 
 pub(crate) struct LiveState {
+    pub transcripts: TranscriptBuffer,
     pub binding: SessionBinding,
     pub connection: ConnectionState,
     pub cursor: u64,
@@ -120,6 +126,7 @@ pub(crate) struct LiveState {
 impl LiveState {
     pub fn new(binding: SessionBinding) -> Self {
         Self {
+            transcripts: TranscriptBuffer::default(),
             binding,
             connection: ConnectionState::Connecting,
             cursor: 0,
@@ -397,6 +404,8 @@ impl LiveState {
                 }
             })
             .collect();
+        let (transcripts, transcript_deltas_lost) =
+            self.transcripts.snapshot(after, selected, now_ns);
         Observation {
             binding: self.binding,
             cursor: self.cursor,
@@ -405,6 +414,9 @@ impl LiveState {
             source_revision: self.sources.revision,
             images,
             audio: self.audio.values().cloned().collect(),
+            transcripts,
+            transcription: self.transcripts.status.clone(),
+            transcript_deltas_lost,
             failures: self
                 .failures
                 .iter()

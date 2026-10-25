@@ -32,23 +32,23 @@ struct Router {
     next_id: u64,
     pending: HashMap<u64, Pending>,
 }
-struct Shared {
-    state: Mutex<LiveState>,
+pub(crate) struct Shared {
+    pub(crate) state: Mutex<LiveState>,
     router: Mutex<Router>,
     sender: mpsc::Sender<Frame>,
     permits: Semaphore,
     changed: Notify,
     sources_dirty: Notify,
-    cancelled: CancellationToken,
+    pub(crate) cancelled: CancellationToken,
     clock: Instant,
-    audio: broadcast::Sender<Frame>,
+    pub(crate) audio: broadcast::Sender<Frame>,
 }
 
 impl Shared {
-    fn now_ns(&self) -> u64 {
+    pub(crate) fn now_ns(&self) -> u64 {
         self.clock.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
     }
-    fn signal(&self) {
+    pub(crate) fn signal(&self) {
         self.changed.notify_waiters();
     }
 }
@@ -69,6 +69,7 @@ impl Drop for PendingGuard {
 }
 
 struct Owner {
+    speech: tokio::sync::Mutex<Option<crate::speech::SpeechTask>>,
     shared: Arc<Shared>,
     supervisor: Mutex<Option<JoinHandle<()>>>,
     config: tokio::sync::Mutex<()>,
@@ -214,6 +215,7 @@ impl ReceiverSession {
             while tasks.join_next().await.is_some() {}
         });
         let receiver = Self(Arc::new(Owner {
+            speech: tokio::sync::Mutex::new(None),
             shared,
             supervisor: Mutex::new(Some(supervisor)),
             config: tokio::sync::Mutex::new(()),
@@ -275,6 +277,66 @@ impl ReceiverSession {
     }
     pub fn subscribe_audio(&self) -> broadcast::Receiver<Frame> {
         self.0.shared.audio.subscribe()
+    }
+
+    pub async fn start_transcription(
+        &self,
+        model: liazo_transcription::WhisperModel,
+        threads: u8,
+        sources: Vec<SourceKey>,
+        settings: liazo_transcription::streaming::StreamingSettings,
+    ) -> Result<(), RuntimeError> {
+        settings.validate()?;
+        if sources.is_empty() || sources.len() > 8 {
+            return Err(failure(
+                FailureCode::InvalidRequest,
+                "select between one and eight audio sources",
+            ));
+        }
+        let permit = self
+            .0
+            .operations
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| RuntimeError::Closed)?;
+        let receiver = self.clone();
+        let (reply, result) = oneshot::channel();
+        // Accepted operations finish even if their consumer disconnects.
+        tokio::spawn(async move {
+            let _permit = permit;
+            let result = async {
+                let mut speech = receiver.0.speech.lock().await;
+                let _configuration = receiver.0.config.lock().await;
+                crate::speech::validate_selection(&receiver.0.shared, &sources)?;
+                if let Some(previous) = speech.as_mut() {
+                    previous.stop().await;
+                }
+                speech.take();
+                *speech = Some(
+                    crate::speech::SpeechTask::start(
+                        receiver.0.shared.clone(),
+                        model,
+                        threads,
+                        sources,
+                        settings,
+                    )
+                    .await?,
+                );
+                Ok(())
+            }
+            .await;
+            let _ = reply.send(result);
+        });
+        result.await.map_err(|_| RuntimeError::Closed)?
+    }
+
+    pub async fn stop_transcription(&self) {
+        let mut speech = self.0.speech.lock().await;
+        if let Some(current) = speech.as_mut() {
+            current.stop().await;
+        }
+        speech.take();
     }
 
     pub async fn configure(&self, settings: CaptureSettings) -> Result<u64, RuntimeError> {
@@ -410,6 +472,7 @@ impl ReceiverSession {
             .connection
             == ConnectionState::Stopped
         {
+            self.stop_transcription().await;
             return Ok(());
         }
         rpc(&self.0.shared, Command::Stop).await?;
@@ -424,6 +487,7 @@ impl ReceiverSession {
         {
             self.0.shared.cancelled.cancel();
         }
+        self.stop_transcription().await;
         Ok(())
     }
 }
