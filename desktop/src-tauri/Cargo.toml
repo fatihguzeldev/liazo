@@ -18,3 +18,5 @@ reqwest = { version = "0.13", default-features = false, features = ["json"] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
+metal = ["liazo-host/metal"]
+vulkan = ["liazo-host/vulkan"]

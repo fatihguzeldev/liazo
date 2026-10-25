@@ -20,7 +20,7 @@ fn cancelling_real_inference_releases_callback_state_and_allows_reuse() {
         .samples::<i16>()
         .map(|sample| f32::from(sample.unwrap()) / 32768.0)
         .collect::<Vec<_>>();
-    let model = WhisperModel::load(&model).unwrap();
+    let model = WhisperModel::load_cpu(&model).unwrap();
     let mut decoder = model.decoder(4).unwrap();
     let cancelled = Arc::new(AtomicBool::new(false));
     let signal = cancelled.clone();

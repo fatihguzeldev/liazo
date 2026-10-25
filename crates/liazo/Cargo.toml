@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+metal = ["liazo-host/metal"]
+vulkan = ["liazo-host/vulkan"]
+
 [dependencies]
 liazo-core = { path = "../core" }
 liazo-runtime = { path = "../runtime" }

@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+metal = ["whisper-rs/metal", "whisper-rs/raw-api"]
+vulkan = ["whisper-rs/vulkan", "whisper-rs/raw-api"]
+
 [dependencies]
 liazo-core = { path = "../core" }
 serde.workspace = true

@@ -1,7 +1,7 @@
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -11,9 +11,12 @@ use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
 };
 
+mod acceleration;
 pub mod audio;
 pub mod streaming;
 pub mod worker;
+
+use acceleration::with_cpu_fallback;
 
 pub const SAMPLE_RATE: usize = 16_000;
 pub const MAX_WINDOW_SAMPLES: usize = 30 * SAMPLE_RATE;
@@ -43,31 +46,80 @@ pub struct RecognizedSegment {
 }
 
 #[derive(Clone)]
-pub struct WhisperModel(Arc<WhisperContext>);
+pub struct WhisperModel(Arc<Model>);
+
+struct Model {
+    path: PathBuf,
+    context: Mutex<LoadedContext>,
+}
+
+struct LoadedContext {
+    context: WhisperContext,
+    // This is a preference, not proof that native scheduling selected a GPU.
+    gpu_requested: bool,
+}
+
+fn load_context(path: &Path, gpu: Option<i32>) -> Result<WhisperContext, whisper_rs::WhisperError> {
+    let mut parameters = WhisperContextParameters::default();
+    parameters.use_gpu(gpu.is_some());
+    if let Some(device) = gpu {
+        parameters.gpu_device(device);
+    }
+    WhisperContext::new_with_params(path, parameters)
+}
 
 impl WhisperModel {
     pub fn load(path: &Path) -> Result<Self, TranscriptionError> {
+        let gpu = cfg!(all(target_os = "macos", feature = "metal"))
+            || cfg!(all(
+                any(target_os = "windows", target_os = "linux"),
+                feature = "vulkan"
+            ));
+        Self::load_with_gpu(path, gpu)
+    }
+
+    pub fn load_cpu(path: &Path) -> Result<Self, TranscriptionError> {
+        Self::load_with_gpu(path, false)
+    }
+
+    fn load_with_gpu(path: &Path, gpu: bool) -> Result<Self, TranscriptionError> {
         // Disable native logs, including debug token text. Results belong only in observations.
         whisper_rs::install_logging_hooks();
         let size = std::fs::metadata(path)?.len();
         if size == 0 || size > 2 * 1024 * 1024 * 1024 {
             return Err(TranscriptionError::InvalidInput);
         }
-        let mut parameters = WhisperContextParameters::default();
-        parameters.use_gpu(false);
-        Ok(Self(Arc::new(WhisperContext::new_with_params(
-            path, parameters,
-        )?)))
+        let device = gpu.then(acceleration::gpu_device).flatten();
+        let (context, gpu_requested) = with_cpu_fallback(device.is_some(), |gpu| {
+            load_context(path, if gpu { device } else { None })
+        })?;
+        Ok(Self(Arc::new(Model {
+            path: path.to_owned(),
+            context: Mutex::new(LoadedContext {
+                context,
+                gpu_requested,
+            }),
+        })))
     }
 
     pub fn decoder(&self, threads: u8) -> Result<WhisperDecoder, TranscriptionError> {
         if !(1..=16).contains(&threads) {
             return Err(TranscriptionError::InvalidInput);
         }
-        Ok(WhisperDecoder {
-            state: self.0.create_state()?,
-            threads,
-        })
+        let mut loaded = self
+            .0
+            .context
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let gpu = loaded.gpu_requested;
+        let (state, _) = with_cpu_fallback(gpu, |gpu| {
+            if loaded.gpu_requested && !gpu {
+                loaded.context = load_context(&self.0.path, None)?;
+                loaded.gpu_requested = false;
+            }
+            loaded.context.create_state()
+        })?;
+        Ok(WhisperDecoder { state, threads })
     }
 }
 
@@ -157,6 +209,34 @@ fn validate_input(samples: &[f32]) -> Result<(), TranscriptionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "vulkan")]
+    #[test]
+    #[ignore = "requires Vulkan with no available GPU and LIAZO_TEST_MODEL"]
+    fn native_no_gpu_initializes_cpu_context_and_state() {
+        whisper_rs::install_logging_hooks();
+        assert_eq!(acceleration::gpu_device(), None);
+        let path = PathBuf::from(std::env::var_os("LIAZO_TEST_MODEL").expect("model path"));
+        let model = WhisperModel::load(&path).unwrap();
+        assert!(!model.0.context.lock().unwrap().gpu_requested);
+        let _decoder = model.decoder(4).unwrap();
+        assert!(!model.0.context.lock().unwrap().gpu_requested);
+        eprintln!("native_gpu_unavailable cpu_context_and_state=true");
+    }
+
+    #[cfg(any(feature = "metal", feature = "vulkan"))]
+    #[test]
+    #[ignore = "requires a native GPU backend and LIAZO_TEST_MODEL"]
+    fn native_gpu_preference_survives_context_and_state_initialization() {
+        whisper_rs::install_logging_hooks();
+        let ordinal = acceleration::gpu_device().expect("a real native GPU must be available");
+        let path = PathBuf::from(std::env::var_os("LIAZO_TEST_MODEL").expect("model path"));
+        let model = WhisperModel::load(&path).unwrap();
+        assert!(model.0.context.lock().unwrap().gpu_requested);
+        let _decoder = model.decoder(4).unwrap();
+        assert!(model.0.context.lock().unwrap().gpu_requested);
+        eprintln!("native_gpu_preference ordinal={ordinal} wrapper_cpu_retry=false");
+    }
 
     #[test]
     fn malformed_audio_is_rejected_before_native_inference() {

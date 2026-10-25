@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+metal = ["liazo-transcription/metal"]
+vulkan = ["liazo-transcription/vulkan"]
+
 [dependencies]
 schemars = { version = "1", features = ["uuid1"] }
 liazo-core = { path = "../core" }
