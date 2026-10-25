@@ -5,9 +5,13 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+liazo-core = { path = "../core" }
 serde.workspace = true
 thiserror.workspace = true
 whisper-rs = "=0.16.0"
+rubato = { version = "=5.0.1", default-features = false }
+audioadapter-buffers = "5.1"
+uuid.workspace = true
 
 [dev-dependencies]
 hound = "3.5"

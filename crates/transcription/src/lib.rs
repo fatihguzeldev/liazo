@@ -11,6 +11,8 @@ use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperState,
 };
 
+pub mod audio;
+
 pub const SAMPLE_RATE: usize = 16_000;
 pub const MAX_WINDOW_SAMPLES: usize = 30 * SAMPLE_RATE;
 
@@ -18,6 +20,8 @@ pub const MAX_WINDOW_SAMPLES: usize = 30 * SAMPLE_RATE;
 pub enum TranscriptionError {
     #[error("invalid transcription settings or audio")]
     InvalidInput,
+    #[error("audio resampling failed")]
+    Resampling,
     #[error("transcription was cancelled")]
     Cancelled,
     #[error("speech model is unavailable: {0}")]
