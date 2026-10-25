@@ -536,10 +536,30 @@ async fn reconnect_preserves_settings_across_failed_attempt_and_keeps_closed_epo
     })
     .await
     .unwrap();
-    // The public archive API uses whole milliseconds; select an instant after the
-    // received frame instead of rounding its arrival into the preceding millisecond.
-    tokio::time::sleep(Duration::from_millis(5)).await;
-    let at_ms = old.elapsed().as_millis() as u64;
+    // Select a whole millisecond inside a confirmed image interval, after audio
+    // arrived. A wall-clock sample can legitimately fall inside a capture gap.
+    let after_audio_ms = old.elapsed().as_nanos().div_ceil(1_000_000) as u64;
+    let mut last_history = String::from("waiting for a confirmed image interval");
+    let at_ms = timeout(Duration::from_secs(4), async {
+        loop {
+            let history = old
+                .history_at(Duration::ZERO, &[image_key(Uuid::from_u128(1))])
+                .await
+                .unwrap();
+            last_history = serde_json::to_string(&history).unwrap();
+            let image = &history.images[0];
+            if let (Some(first), Some(last)) = (image.first_observed_ns, image.last_confirmed_ns) {
+                let at_ms = last / 1_000_000;
+                if image.payload.is_some() && at_ms >= after_audio_ms && at_ms * 1_000_000 >= first
+                {
+                    break at_ms;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("no confirmed image after {after_audio_ms} ms: {last_history}"));
     cancel.cancel();
     wait_disconnected(&fixture.host).await;
     let unused = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -600,8 +620,10 @@ async fn reconnect_preserves_settings_across_failed_attempt_and_keeps_closed_epo
         .await
         .unwrap();
     assert_eq!(
-        archived.images[0].payload.as_ref().unwrap().as_ref(),
-        b"fixture image"
+        archived.images[0].payload.as_deref(),
+        Some(b"fixture image".as_slice()),
+        "closed image at {at_ms} ms: {:?}",
+        archived.images[0].state
     );
     fixture.host.stop(current.binding).await.unwrap();
 }
