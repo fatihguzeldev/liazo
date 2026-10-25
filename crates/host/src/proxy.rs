@@ -21,6 +21,7 @@ pub enum ProxyError {
 
 struct Inner {
     client: RunningService<RoleClient, ClientConfig>,
+    controls: RunningService<RoleClient, ClientConfig>,
     info: ServerConfig,
     tools: Vec<Tool>,
 }
@@ -33,28 +34,16 @@ impl McpProxy {
             .validate()
             .map_err(|_| ProxyError::InvalidEndpoint)?;
         // This secret is only for the loopback host, regardless of system proxy settings.
-        let client = crate::http::client_builder()
+        let http = crate::http::client_builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(1))
             .build()
             .map_err(|_| ProxyError::Unavailable)?;
-        let transport = StreamableHttpClientTransport::with_client(
-            client,
-            StreamableHttpClientTransportConfig::with_uri(format!(
-                "http://{}/mcp",
-                endpoint.address
-            ))
-            .auth_header(&endpoint.token)
-            .max_concurrent_requests(6),
-        );
-        let client = tokio::time::timeout(
-            Duration::from_secs(5),
-            ClientConfig::default().serve(transport),
-        )
-        .await
-        .map_err(|_| ProxyError::Unavailable)?
-        .map_err(|_| ProxyError::Unavailable)?;
+        let (client, controls) = tokio::try_join!(
+            connect_client(endpoint, http.clone(), 6),
+            connect_client(endpoint, http, 2),
+        )?;
         let peer = client.peer_info().ok_or(ProxyError::Unavailable)?;
         let mut info = ServerConfig::new(peer.capabilities.clone())
             .with_protocol_version(peer.protocol_version.clone())
@@ -70,10 +59,31 @@ impl McpProxy {
             .map_err(|_| ProxyError::Unavailable)?;
         Ok(Self(Arc::new(Inner {
             client,
+            controls,
             info,
             tools,
         })))
     }
+}
+
+async fn connect_client(
+    endpoint: &Endpoint,
+    http: reqwest::Client,
+    capacity: usize,
+) -> Result<RunningService<RoleClient, ClientConfig>, ProxyError> {
+    let transport = StreamableHttpClientTransport::with_client(
+        http,
+        StreamableHttpClientTransportConfig::with_uri(format!("http://{}/mcp", endpoint.address))
+            .auth_header(&endpoint.token)
+            .max_concurrent_requests(capacity),
+    );
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        ClientConfig::default().serve(transport),
+    )
+    .await
+    .map_err(|_| ProxyError::Unavailable)?
+    .map_err(|_| ProxyError::Unavailable)
 }
 
 impl ServerHandler for McpProxy {
@@ -98,9 +108,17 @@ impl ServerHandler for McpProxy {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        let upstream = if matches!(
+            request.name.as_ref(),
+            "stop" | "transcription_stop" | "model_cancel"
+        ) {
+            &self.0.controls
+        } else {
+            &self.0.client
+        };
         tokio::select! {
             _ = context.ct.cancelled() => Err(ErrorData::internal_error("request cancelled", None)),
-            result = self.0.client.call_tool(request) => match result {
+            result = upstream.call_tool(request) => match result {
                 Ok(result) => Ok(result.into()),
                 Err(rmcp::ServiceError::McpError(error)) => Err(error),
                 Err(_) => Ok(CallToolResult::error(vec![ContentBlock::text("local host is unavailable")]).into()),

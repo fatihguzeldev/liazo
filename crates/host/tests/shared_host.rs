@@ -516,14 +516,123 @@ async fn authenticated_consumers_share_one_session_and_binary_media_without_a_gu
             .iter()
             .any(|content| content.as_image().is_some())
     );
-    consumer.cancel().await.unwrap();
-    proxy_server.await.unwrap();
+    let scope: liazo_transport::SessionBinding = serde_json::from_value(binding.clone()).unwrap();
+    let proxy_receiver = host.receiver(scope).await.unwrap();
+    let proxy_cursor = proxy_receiver
+        .observe(0, false, &[], Duration::ZERO)
+        .await
+        .cursor;
+    let mut proxy_waiters = vec![];
+    for _ in 0..6 {
+        let peer = consumer.peer().clone();
+        let args = json!({"binding":binding,"after":proxy_cursor,"wait_ms":5000});
+        proxy_waiters.push(tokio::spawn(async move {
+            peer.call_tool(
+                CallToolRequestParams::new("observe")
+                    .with_arguments(args.as_object().unwrap().clone()),
+            )
+            .await
+        }));
+    }
+    let mut direct_waiters = vec![];
+    for _ in 0..2 {
+        let (client, base, token, binding) =
+            (client.clone(), base.clone(), token.clone(), binding.clone());
+        direct_waiters.push(tokio::spawn(async move {
+            client
+                .post(format!("{base}/v1/observe"))
+                .bearer_auth(token)
+                .json(&json!({"binding":binding,"after":proxy_cursor,"wait_ms":5000}))
+                .send()
+                .await
+        }));
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let status = client
+                .get(format!("{base}/v1/status"))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap();
+            if status.status() == StatusCode::TOO_MANY_REQUESTS {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let ordinary_peer = consumer.peer().clone();
+    let ordinary = tokio::spawn(async move {
+        ordinary_peer
+            .call_tool(CallToolRequestParams::new("status"))
+            .await
+    });
+    for (name, args, expected_error) in [
+        ("model_cancel", json!({}), false),
+        ("transcription_stop", json!({"binding":binding}), false),
+        (
+            "stop",
+            json!({"binding":{"session":scope.session,"epoch":Uuid::new_v4()}}),
+            true,
+        ),
+    ] {
+        let control = tokio::time::timeout(
+            Duration::from_secs(2),
+            consumer.call_tool(
+                CallToolRequestParams::new(name).with_arguments(args.as_object().unwrap().clone()),
+            ),
+        )
+        .await
+        .expect("proxy control must bypass its six pending observations")
+        .unwrap();
+        assert_eq!(control.is_error, Some(expected_error));
+        if expected_error {
+            assert!(control.content.iter().any(|content| {
+                content
+                    .as_text()
+                    .is_some_and(|text| text.text == "no active session")
+            }));
+        }
+    }
+    assert!(
+        !ordinary.is_finished(),
+        "ordinary queries keep the six-request limit"
+    );
+    ordinary.abort();
+    let _ = ordinary.await;
+    proxy_receiver
+        .configure(proxy_receiver.settings())
+        .await
+        .unwrap();
+    for waiter in proxy_waiters {
+        assert_eq!(waiter.await.unwrap().unwrap().is_error, Some(false));
+    }
+    for waiter in direct_waiters {
+        waiter
+            .await
+            .unwrap()
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .bytes()
+            .await
+            .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(2), consumer.cancel())
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), proxy_server)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         host.current().await.unwrap().connection,
         liazo_runtime::ConnectionState::Connected,
         "closing an MCP consumer leaves shared capture running"
     );
-    let scope: liazo_transport::SessionBinding = serde_json::from_value(binding.clone()).unwrap();
     let held = host.receiver(scope).await.unwrap();
     let mut settings = held.settings();
     settings.audio = vec![audio_source()];
