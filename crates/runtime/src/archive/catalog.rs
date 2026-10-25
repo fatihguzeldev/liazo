@@ -36,6 +36,17 @@ pub struct ArchiveSources {
 }
 
 enum Command {
+    BudgetClaim {
+        root: PathBuf,
+        lease: Arc<super::budget::LeaseState>,
+        metadata: u64,
+        reply: mpsc::Sender<Result<(), ArchiveError>>,
+    },
+    BudgetAdmit {
+        token: Uuid,
+        bytes: u64,
+        reply: mpsc::Sender<Result<(), ArchiveError>>,
+    },
     List {
         offset: usize,
         reply: oneshot::Sender<Result<CatalogPage, ArchiveError>>,
@@ -89,9 +100,10 @@ impl ArchiveCatalog {
             .spawn(move || {
                 let mut deadline = Instant::now() + Duration::from_secs(10);
                 let mut maintenance_errors = 0;
+                let mut budget = super::budget::Manager::new(root.clone());
                 while !cancelled.load(Ordering::Acquire) {
                     if Instant::now() >= deadline {
-                        maintenance_errors = maintain(&root, wall_ms()).unwrap_or(1);
+                        maintenance_errors = budget.maintain(wall_ms()).unwrap_or(1);
                         deadline = Instant::now() + Duration::from_secs(10);
                     }
                     let command = match receiver
@@ -104,6 +116,21 @@ impl ArchiveCatalog {
                         Err(_) => break,
                     };
                     match command {
+                        Command::BudgetClaim {
+                            root,
+                            lease,
+                            metadata,
+                            reply,
+                        } => {
+                            let _ = reply.send(budget.claim(root, lease, metadata));
+                        }
+                        Command::BudgetAdmit {
+                            token,
+                            bytes,
+                            reply,
+                        } => {
+                            let _ = reply.send(budget.admit(token, bytes));
+                        }
                         Command::List { offset, reply } => {
                             if !reply.is_closed() {
                                 let _ = reply.send(scan(&root).map(
@@ -135,8 +162,7 @@ impl ArchiveCatalog {
                         } => {
                             if !reply.is_closed() {
                                 let _ = reply.send(
-                                    open(&root, binding)
-                                        .and_then(|index| index.retained_sources(after)),
+                                    budget.read(binding, |index| index.retained_sources(after)),
                                 );
                             }
                         }
@@ -147,9 +173,8 @@ impl ArchiveCatalog {
                             reply,
                         } => {
                             if !reply.is_closed() {
-                                let _ = reply.send(
-                                    open(&root, binding).and_then(|index| index.at(&source, at)),
-                                );
+                                let _ =
+                                    reply.send(budget.read(binding, |index| index.at(&source, at)));
                             }
                         }
                         Command::Transcripts {
@@ -160,7 +185,7 @@ impl ArchiveCatalog {
                             reply,
                         } => {
                             if !reply.is_closed() {
-                                let _ = reply.send(open(&root, binding).and_then(|index| {
+                                let _ = reply.send(budget.read(binding, |index| {
                                     index.transcripts_between(first, last, &sources)
                                 }));
                             }
@@ -173,10 +198,9 @@ impl ArchiveCatalog {
                             reply,
                         } => {
                             if !reply.is_closed() {
-                                let _ =
-                                    reply.send(open(&root, binding).and_then(|index| {
-                                        index.audio_between(first, last, &sources)
-                                    }));
+                                let _ = reply.send(budget.read(binding, |index| {
+                                    index.audio_between(first, last, &sources)
+                                }));
                             }
                         }
                         Command::Wake => {}
@@ -184,6 +208,48 @@ impl ArchiveCatalog {
                 }
             })?;
         Ok(Self(Arc::new(Owner { sender, closing })))
+    }
+    pub(super) fn claim_budget(
+        &self,
+        root: PathBuf,
+        lease: Arc<super::budget::LeaseState>,
+        metadata: u64,
+    ) -> Result<(), ArchiveError> {
+        self.blocking_request(|reply| Command::BudgetClaim {
+            root,
+            lease,
+            metadata,
+            reply,
+        })
+    }
+    pub(super) fn admit_budget(&self, token: Uuid, bytes: u64) -> Result<(), ArchiveError> {
+        self.blocking_request(|reply| Command::BudgetAdmit {
+            token,
+            bytes,
+            reply,
+        })
+    }
+    fn blocking_request(
+        &self,
+        command: impl FnOnce(mpsc::Sender<Result<(), ArchiveError>>) -> Command,
+    ) -> Result<(), ArchiveError> {
+        if self.0.closing.load(Ordering::Acquire) {
+            return Err(ArchiveError::Stopped);
+        }
+        let (reply, result) = mpsc::channel();
+        self.0
+            .sender
+            .try_send(command(reply))
+            .map_err(|error| match error {
+                mpsc::TrySendError::Full(_) => ArchiveError::Busy,
+                mpsc::TrySendError::Disconnected(_) => ArchiveError::Stopped,
+            })?;
+        result
+            .recv_timeout(Duration::from_secs(5))
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => ArchiveError::Busy,
+                mpsc::RecvTimeoutError::Disconnected => ArchiveError::Stopped,
+            })?
     }
     async fn request<T>(
         &self,
@@ -276,13 +342,13 @@ fn wall_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |time| time.as_millis().min(u128::from(u64::MAX)) as u64)
 }
-fn relative(info: &ArchiveInfo, now: u64) -> u64 {
+pub(super) fn relative(info: &ArchiveInfo, now: u64) -> u64 {
     now.saturating_sub(info.wall_anchor_unix_ms)
         .saturating_mul(1_000_000)
         .max(info.latest_ns)
         .min(i64::MAX as u64)
 }
-fn path(root: &Path, binding: SessionBinding) -> Result<PathBuf, ArchiveError> {
+pub(super) fn path(root: &Path, binding: SessionBinding) -> Result<PathBuf, ArchiveError> {
     if binding.session.is_nil() || binding.epoch.is_nil() {
         return Err(ArchiveError::InvalidPayload);
     }
@@ -302,7 +368,7 @@ fn path(root: &Path, binding: SessionBinding) -> Result<PathBuf, ArchiveError> {
     }
     Ok(epoch)
 }
-fn open(root: &Path, binding: SessionBinding) -> Result<ArchiveIndex, ArchiveError> {
+pub(super) fn open(root: &Path, binding: SessionBinding) -> Result<ArchiveIndex, ArchiveError> {
     let root = path(root, binding)?;
     let info = ArchiveInfo::read(&root)?;
     if info.binding != binding {
@@ -316,7 +382,13 @@ fn open(root: &Path, binding: SessionBinding) -> Result<ArchiveIndex, ArchiveErr
     index.enforce_limits(relative(&info, wall_ms()))?;
     Ok(index)
 }
-fn scan(root: &Path) -> Result<(Vec<ArchiveInfo>, usize, bool), ArchiveError> {
+pub(super) fn scan(root: &Path) -> Result<(Vec<ArchiveInfo>, usize, bool), ArchiveError> {
+    scan_except(root, None)
+}
+pub(super) fn scan_except(
+    root: &Path,
+    skip: Option<SessionBinding>,
+) -> Result<(Vec<ArchiveInfo>, usize, bool), ArchiveError> {
     if !root.exists() {
         return Ok((vec![], 0, false));
     }
@@ -339,6 +411,11 @@ fn scan(root: &Path) -> Result<(Vec<ArchiveInfo>, usize, bool), ArchiveError> {
                 continue;
             };
             if !epoch.file_type()?.is_dir() {
+                continue;
+            }
+            if skip
+                .is_some_and(|binding| binding.session == session_id && binding.epoch == epoch_id)
+            {
                 continue;
             }
             match ArchiveInfo::read(&epoch.path()) {
@@ -365,27 +442,6 @@ fn canonical(name: &std::ffi::OsStr) -> Option<Uuid> {
     let id = text.parse::<Uuid>().ok()?;
     (id.to_string() == text).then_some(id)
 }
-fn maintain(root: &Path, now: u64) -> Result<usize, ArchiveError> {
-    let (entries, _, _) = scan(root)?;
-    let mut failed = 0;
-    for info in entries {
-        let root = path(root, info.binding)?;
-        let result = (|| {
-            let mut index = ArchiveIndex::open_existing(&root)?;
-            if info.writer_active || info.closed_at_ns.is_none() {
-                index.begin()?;
-                index.finish(info.latest_ns)?;
-            }
-            index.enforce_limits(relative(&info, now))?;
-            Ok::<_, ArchiveError>(())
-        })();
-        if !matches!(result, Ok(()) | Err(ArchiveError::Busy)) {
-            failed += 1;
-        }
-    }
-    Ok(failed)
-}
-
 impl ArchiveIndex {
     pub fn retained_sources(
         &self,
@@ -442,7 +498,7 @@ mod tests {
     use crate::archive::{ArchiveIdentity, ArchiveLimits};
     use liazo_core::{protocol::ImageFormat, wire::ImageMeta};
     #[test]
-    fn maintenance_applies_the_saved_shorter_window_to_an_idle_closed_epoch() {
+    fn maintenance_removes_an_idle_closed_epoch_after_its_saved_duration() {
         let root = tempfile::tempdir().unwrap();
         let now = wall_ms();
         let binding = SessionBinding {
@@ -492,13 +548,13 @@ mod tests {
             .unwrap();
         index.finish(2_000_000).unwrap();
         drop(index);
-        assert_eq!(maintain(root.path(), now).unwrap(), 0);
-        let index = ArchiveIndex::open_existing(&path).unwrap();
-        assert_eq!(index.stats().unwrap().payloads, 0);
         assert_eq!(
-            index.at(&source, 1_000_000).unwrap().state,
-            crate::history::HistoryState::Expired
+            super::super::budget::Manager::new(root.path().to_owned())
+                .maintain(now)
+                .unwrap(),
+            0
         );
-        assert!(ArchiveInfo::read(&path).unwrap().retention_floor_ns > 2_000_000);
+        assert!(!path.exists());
+        assert!(!root.path().join(binding.session.to_string()).exists());
     }
 }

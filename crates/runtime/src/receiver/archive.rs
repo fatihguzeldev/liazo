@@ -2,8 +2,8 @@ use super::{ReceiverSession, failure};
 use crate::{
     RuntimeError,
     archive::{
-        ArchiveClient, ArchiveError, ArchiveLimits, ArchiveStatus, ArchiveWorker, AudioPage,
-        TranscriptPage,
+        ArchiveBudget, ArchiveClient, ArchiveError, ArchiveLimits, ArchiveStatus, ArchiveWorker,
+        AudioPage, TranscriptPage,
     },
     live::ConnectionState,
 };
@@ -17,7 +17,17 @@ impl ReceiverSession {
         root: PathBuf,
         limits: ArchiveLimits,
     ) -> Result<(), RuntimeError> {
+        self.start_archive_with_budget(root, limits, None).await
+    }
+
+    pub async fn start_archive_with_budget(
+        &self,
+        root: PathBuf,
+        limits: ArchiveLimits,
+        budget: impl Into<Option<ArchiveBudget>>,
+    ) -> Result<(), RuntimeError> {
         limits.validate()?;
+        let budget = budget.into();
         let permit = self
             .0
             .operations
@@ -29,7 +39,7 @@ impl ReceiverSession {
         let (reply, result) = oneshot::channel();
         tokio::spawn(async move {
             let _permit = permit;
-            let result = receiver.install_archive(root, limits).await;
+            let result = receiver.install_archive(root, limits, budget).await;
             let _ = reply.send(result);
         });
         result.await.map_err(|_| RuntimeError::Closed)?
@@ -39,6 +49,7 @@ impl ReceiverSession {
         &self,
         root: PathBuf,
         limits: ArchiveLimits,
+        budget: Option<ArchiveBudget>,
     ) -> Result<(), RuntimeError> {
         let mut owner = self.0.archive.lock().await;
         {
@@ -59,9 +70,14 @@ impl ReceiverSession {
             return Err(ArchiveError::Busy.into());
         }
         owner.take();
-        let worker =
-            ArchiveWorker::start(root, self.archive_identity(), limits, self.0.shared.clock)
-                .await?;
+        let worker = ArchiveWorker::start_with_budget(
+            root,
+            self.archive_identity(),
+            limits,
+            self.0.shared.clock,
+            budget,
+        )
+        .await?;
         let client = worker.client();
         *owner = Some(worker);
         let attached = {
@@ -192,6 +208,13 @@ impl ReceiverSession {
             return Err(ArchiveError::Busy.into());
         }
         owner.take();
+        self.0
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .archive = None;
+        self.0.shared.signal();
         Ok(())
     }
 

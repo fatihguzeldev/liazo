@@ -111,8 +111,17 @@ impl ArchiveIndex {
         tx.commit()?;
         self.remove_unused()?;
         for _ in 0..256 {
-            if self.stats()?.accounted_bytes + reserve <= self.limits.max_bytes {
-                return Ok(());
+            let accounted = self.stats()?.accounted_bytes;
+            if accounted + reserve <= self.limits.max_bytes {
+                match self
+                    .budget
+                    .as_ref()
+                    .map(|budget| budget.admit(accounted + reserve))
+                {
+                    None | Some(Ok(())) => return Ok(()),
+                    Some(Err(ArchiveError::Capacity)) => {}
+                    Some(Err(error)) => return Err(error),
+                }
             }
             let oldest: Option<(String, String, u64)> = self
                 .database

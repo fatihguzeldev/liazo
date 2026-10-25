@@ -14,6 +14,7 @@ pub struct ArchiveIndex {
     pub(super) database: Connection,
     pub(super) payloads: PayloadStore,
     pub(super) limits: ArchiveLimits,
+    pub(super) budget: Option<super::budget::BudgetLease>,
 }
 
 #[derive(Clone, Copy)]
@@ -51,9 +52,27 @@ impl ArchiveIndex {
         identity: ArchiveIdentity,
         limits: ArchiveLimits,
     ) -> Result<Self, ArchiveError> {
+        Self::open_with_budget(root, identity, limits, None)
+    }
+
+    pub fn open_with_budget(
+        root: &Path,
+        identity: ArchiveIdentity,
+        limits: ArchiveLimits,
+        budget: Option<super::ArchiveBudget>,
+    ) -> Result<Self, ArchiveError> {
         limits.validate()?;
         identity.validate()?;
+        let budget = budget
+            .map(|budget| budget.claim(root, identity.binding, limits.metadata_budget()))
+            .transpose()?;
         let payloads = PayloadStore::open(&root.join("payloads"))?;
+        // A cleanup owner commits this marker while holding the same writer lock.
+        // Reject reopening before touching SQLite, even if its directory rename
+        // has not completed yet (Windows requires releasing the lock first).
+        if root.join(".delete.json").try_exists()? {
+            return Err(ArchiveError::NotFound);
+        }
         let database = Connection::open(root.join("index.sqlite3"))?;
         let version: i64 = database.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version > 2 {
@@ -112,6 +131,7 @@ impl ArchiveIndex {
             database,
             payloads,
             limits,
+            budget,
         };
         archive.initialize_transcripts()?;
         archive.initialize_lifecycle()?;

@@ -509,6 +509,15 @@ impl ArchiveWorker {
         limits: ArchiveLimits,
         clock: Instant,
     ) -> Result<Self, ArchiveError> {
+        Self::start_with_budget(root, identity, limits, clock, None).await
+    }
+    pub async fn start_with_budget(
+        root: PathBuf,
+        identity: ArchiveIdentity,
+        limits: ArchiveLimits,
+        clock: Instant,
+        budget: Option<super::ArchiveBudget>,
+    ) -> Result<Self, ArchiveError> {
         let (sender, receiver) = mpsc::channel(QUEUE);
         let control = Arc::new(Control {
             raw_audio: RwLock::new(vec![]),
@@ -540,21 +549,23 @@ impl ArchiveWorker {
         let thread = std::thread::Builder::new()
             .name("liazo-archive".into())
             .spawn(move || {
-                let mut index =
-                    match ArchiveIndex::open(&root, identity, limits).and_then(|mut index| {
-                        index.begin()?;
-                        Ok(index)
-                    }) {
-                        Ok(index) => {
-                            let _ = started.send(Ok(()));
-                            index
-                        }
-                        Err(error) => {
-                            let _ = started.send(Err(error));
-                            let _ = completed.send(());
-                            return;
-                        }
-                    };
+                let mut index = match ArchiveIndex::open_with_budget(
+                    &root, identity, limits, budget,
+                )
+                .and_then(|mut index| {
+                    index.begin()?;
+                    Ok(index)
+                }) {
+                    Ok(index) => {
+                        let _ = started.send(Ok(()));
+                        index
+                    }
+                    Err(error) => {
+                        let _ = started.send(Err(error));
+                        let _ = completed.send(());
+                        return;
+                    }
+                };
                 run(&mut index, receiver, &worker_control, clock);
                 drop(index);
                 let _ = completed.send(());

@@ -223,15 +223,24 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await?;
             if !no_archive {
-                let binding = session.archive_identity().binding;
-                let root = profile
-                    .root
-                    .join("sessions")
-                    .join(binding.session.to_string())
-                    .join(binding.epoch.to_string());
-                session
-                    .start_archive(root, liazo_runtime::archive::ArchiveLimits::default())
-                    .await?;
+                let recording: Result<()> = async {
+                    let binding = session.archive_identity().binding;
+                    let sessions = profile.root.join("sessions");
+                    let limits = liazo_runtime::archive::ArchiveLimits::default();
+                    let catalog = liazo_runtime::archive::ArchiveCatalog::spawn(sessions.clone())?;
+                    let budget = catalog.budget(limits.max_bytes)?;
+                    let root = sessions
+                        .join(binding.session.to_string())
+                        .join(binding.epoch.to_string());
+                    session
+                        .start_archive_with_budget(root, limits, budget)
+                        .await?;
+                    Ok(())
+                }
+                .await;
+                if recording.is_err() {
+                    eprintln!("history recording is unavailable; live observation continues");
+                }
             }
             let sources = session.sources();
             let resolve = |id: &str| {
