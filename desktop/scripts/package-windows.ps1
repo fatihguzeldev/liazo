@@ -34,7 +34,11 @@ function Get-VerifiedDownload([string]$Uri, [string]$Path, [string]$Sha256) {
 $root = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 $target = 'x86_64-pc-windows-msvc'
 $variant = if ($Backend -eq 'cpu') { $Cpu } else { "$Cpu-$Backend" }
-$targetDir = Join-Path $root "target/packages/windows-$variant"
+# Vulkan's nested CMake compiler checks exceed MSVC's path limit with a descriptive build directory.
+$buildDirectory = if ($Backend -eq 'vulkan') {
+    if ($Cpu -eq 'baseline') { 'target/vb' } else { 'target/va' }
+} else { "target/packages/windows-$variant" }
+$targetDir = Join-Path $root $buildDirectory
 $output = Join-Path $root "target/distribution/$target-$variant"
 $stage = Join-Path $root 'desktop/src-tauri/binaries'
 $runtime = Join-Path $stage 'runtime'

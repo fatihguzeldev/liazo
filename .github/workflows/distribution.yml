@@ -89,7 +89,8 @@ jobs:
           if (!(Test-Path "$installed/liazo-desktop.exe")) { throw 'desktop executable was not installed' }
           if (!(Test-Path "$installed/liazo.exe")) { throw 'MCP companion was not installed' }
           $env:LIAZO_TEST_CLI = Join-Path $installed 'liazo.exe'
-          $env:CARGO_TARGET_DIR = Join-Path $PWD "target/packages/windows-$variant"
+          $buildDirectory = if ($env:LIAZO_PACKAGE_BACKEND -eq 'vulkan') { if ($env:LIAZO_PACKAGE_CPU -eq 'baseline') { 'target/vb' } else { 'target/va' } } else { "target/packages/windows-$variant" }
+          $env:CARGO_TARGET_DIR = Join-Path $PWD $buildDirectory
           & cargo test --locked --release --target x86_64-pc-windows-msvc -p liazo --test mcp_stdio @features
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $uninstaller = Get-ChildItem $installed -Filter '*uninstall*.exe' | Select-Object -First 1
@@ -103,7 +104,8 @@ jobs:
           LIAZO_PACKAGE_CPU: ${{ inputs.cpu || 'baseline' }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $env:CARGO_TARGET_DIR = Join-Path $PWD "target/packages/windows-$env:LIAZO_PACKAGE_CPU-vulkan"
+          $buildDirectory = if ($env:LIAZO_PACKAGE_CPU -eq 'baseline') { 'target/vb' } else { 'target/va' }
+          $env:CARGO_TARGET_DIR = Join-Path $PWD $buildDirectory
           $env:VK_DRIVER_FILES = Join-Path $env:RUNNER_TEMP 'liazo-no-driver.json'
           if (Test-Path -LiteralPath $env:VK_DRIVER_FILES) { throw 'expected a nonexistent test-only ICD path' }
           $env:LIAZO_TEST_MODEL = Join-Path $env:RUNNER_TEMP 'liazo-no-device-base.bin'
@@ -141,6 +143,6 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: liazo-native-diagnostics-${{ inputs.cpu || 'baseline' }}-${{ matrix.backend }}
-          path: target/packages/**/CMakeFiles/CMakeConfigureLog.yaml
+          path: target/**/CMakeFiles/CMakeConfigureLog.yaml
           if-no-files-found: ignore
           retention-days: 2
