@@ -1,12 +1,32 @@
 use crate::http::Endpoint;
 use std::{
+    ffi::OsStr,
     fs::{File, OpenOptions},
     io::Read,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     time::Duration,
 };
 use tokio::time::{Instant, sleep};
+
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+use windows::spawn_host;
+
+#[cfg(all(test, windows))]
+mod tests;
+
+#[cfg(not(windows))]
+fn spawn_host(executable: &Path, args: &[&OsStr]) -> std::io::Result<std::process::Child> {
+    use std::process::{Command, Stdio};
+    let mut command = Command::new(executable);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command.spawn()
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum LaunchError {
@@ -72,24 +92,16 @@ impl Launcher {
         if let Some(endpoint) = self.running(&client).await? {
             return Ok(endpoint);
         }
-        let mut command = Command::new(&self.executable);
-        command
-            .args([
-                "--profile",
-                &self.profile,
-                "host",
-                "--listen",
-                "127.0.0.1:0",
-            ])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            command.creation_flags(0x08000000);
-        }
-        let mut child = command.spawn()?;
+        let mut child = spawn_host(
+            &self.executable,
+            &[
+                OsStr::new("--profile"),
+                OsStr::new(&self.profile),
+                OsStr::new("host"),
+                OsStr::new("--listen"),
+                OsStr::new("127.0.0.1:0"),
+            ],
+        )?;
         loop {
             if let Some(endpoint) = self.running(&client).await? {
                 return Ok(endpoint);
