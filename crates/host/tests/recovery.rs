@@ -352,6 +352,13 @@ async fn reconnect_preserves_settings_across_failed_attempt_and_keeps_closed_epo
     drop(unused);
     assert!(fixture.host.connect(wrong, fixture.peer).await.is_err());
     assert_eq!(fixture.host.current().await.unwrap().binding, first);
+    timeout(Duration::from_secs(3), async {
+        while old.archive_status().is_some() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
     let closed_audio = fixture
         .host
         .archive_audio(liazo_host::requests::ArchiveRange {
@@ -651,4 +658,59 @@ async fn real_speech_reconnects_and_recovers_without_undoing_explicit_transcript
             .active
     );
     fixture.host.stop(after_stop.binding).await.unwrap();
+}
+
+#[tokio::test]
+async fn stalled_archive_uses_one_retirement_slot_while_multiple_live_epochs_continue() {
+    let root = tempfile::tempdir().unwrap();
+    let mut fixture = Fixture::new(root.path().to_owned()).await;
+    let (first, cancel) = fixture.connect().await;
+    let old = fixture.host.receiver(first).await.unwrap();
+    old.configure(settings()).await.unwrap();
+    old.configure_raw_audio(vec![audio_key()]).await.unwrap();
+    let hold = old.hold_archive().await.unwrap();
+    cancel.cancel();
+    let mut current = fixture.epoch_after(first).await;
+    for _ in 0..2 {
+        let receiver = fixture.host.receiver(current.binding).await.unwrap();
+        assert!(receiver.archive_status().is_none());
+        assert_eq!(receiver.settings(), settings());
+        let fresh = receiver
+            .capture_now(vec![image_key(Uuid::from_u128(1))])
+            .await
+            .unwrap();
+        assert_eq!(fresh.binding, current.binding);
+        assert!(fresh.images[0].payload.is_some());
+        fixture.accepted.recv().await.unwrap().cancel();
+        current = fixture.epoch_after(current.binding).await;
+    }
+    assert_eq!(current.binding.session, first.session);
+    assert!(old.archive_status().unwrap().queued_bytes <= 64 * 1024 * 1024);
+    let epochs = std::fs::read_dir(root.path().join(first.session.to_string()))
+        .unwrap()
+        .count();
+    assert_eq!(
+        epochs, 1,
+        "a held writer must not create another archive thread/index per retry"
+    );
+    drop(hold);
+    let receiver = fixture.host.receiver(current.binding).await.unwrap();
+    timeout(Duration::from_secs(8), async {
+        loop {
+            if receiver.archive_status().is_some()
+                && fixture.host.current().await.unwrap().recovery.is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(old.archive_status().is_none());
+    assert_eq!(
+        receiver.archive_status().unwrap().raw_audio_sources,
+        vec![audio_key()]
+    );
+    fixture.host.stop(current.binding).await.unwrap();
 }

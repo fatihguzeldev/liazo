@@ -194,6 +194,16 @@ struct Control {
     status: Mutex<ArchiveStatus>,
 }
 enum Command {
+    #[cfg(any(test, feature = "test-support"))]
+    DatabaseFull {
+        enabled: bool,
+        reply: oneshot::Sender<Result<(), ArchiveError>>,
+    },
+    #[cfg(any(test, feature = "test-support"))]
+    Hold {
+        release: std::sync::mpsc::Receiver<()>,
+        started: oneshot::Sender<()>,
+    },
     Sources {
         after: Option<SourceKey>,
         reply: oneshot::Sender<Result<ArchiveSources, ArchiveError>>,
@@ -247,7 +257,53 @@ pub struct ArchiveWorker {
     ticker: tokio::task::JoinHandle<()>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub struct ArchiveTestHold {
+    release: Option<std::sync::mpsc::Sender<()>>,
+}
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for ArchiveTestHold {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = release.send(());
+        }
+    }
+}
+
 impl ArchiveClient {
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn database_full(&self, enabled: bool) -> Result<(), ArchiveError> {
+        let (reply, result) = oneshot::channel();
+        self.sender
+            .try_send(Command::DatabaseFull { enabled, reply })
+            .map_err(|_| ArchiveError::Busy)?;
+        tokio::time::timeout(Duration::from_secs(5), result)
+            .await
+            .map_err(|_| ArchiveError::Busy)?
+            .map_err(|_| ArchiveError::Stopped)?
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn hold(&self) -> Result<ArchiveTestHold, ArchiveError> {
+        if self.control.closing.load(Ordering::Acquire) {
+            return Err(ArchiveError::Stopped);
+        }
+        let (release, blocked) = std::sync::mpsc::channel();
+        let guard = ArchiveTestHold {
+            release: Some(release),
+        };
+        let (started, ready) = oneshot::channel();
+        self.sender
+            .try_send(Command::Hold {
+                release: blocked,
+                started,
+            })
+            .map_err(|_| ArchiveError::Busy)?;
+        tokio::time::timeout(Duration::from_secs(3), ready)
+            .await
+            .map_err(|_| ArchiveError::Busy)?
+            .map_err(|_| ArchiveError::Stopped)?;
+        Ok(guard)
+    }
     pub async fn sources(&self, after: Option<SourceKey>) -> Result<ArchiveSources, ArchiveError> {
         if self.control.closing.load(Ordering::Acquire) {
             return Err(ArchiveError::Stopped);
@@ -727,6 +783,17 @@ fn run(
         let refresh_stats = matches!(&command, Command::Tick { .. } | Command::AudioPolicy { .. });
         let mut acknowledgement = None;
         let result = match command {
+            #[cfg(any(test, feature = "test-support"))]
+            Command::DatabaseFull { enabled, reply } => {
+                let _ = reply.send(database_full(index, enabled));
+                continue;
+            }
+            #[cfg(any(test, feature = "test-support"))]
+            Command::Hold { release, started } => {
+                let _ = started.send(());
+                let _ = release.recv();
+                continue;
+            }
             Command::Sources { after, reply } => {
                 if !reply.is_closed() {
                     let _ = reply.send(index.retained_sources(after));
@@ -897,6 +964,48 @@ fn run(
         .phase = ArchivePhase::Failed;
 }
 
+#[cfg(any(test, feature = "test-support"))]
+fn database_full(index: &mut ArchiveIndex, enabled: bool) -> Result<(), ArchiveError> {
+    if !enabled {
+        index
+            .database
+            .pragma_update(None, "max_page_count", index.limits.index_bytes() / 4096)?;
+        index
+            .database
+            .execute_batch("DROP TABLE IF EXISTS __liazo_test_fill;")?;
+        return Ok(());
+    }
+    let pages: u64 = index
+        .database
+        .pragma_query_value(None, "page_count", |row| row.get(0))?;
+    index
+        .database
+        .pragma_update(None, "max_page_count", pages)?;
+    let create = index
+        .database
+        .execute_batch("CREATE TABLE __liazo_test_fill (data BLOB);");
+    if let Err(error) = create {
+        return if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull) {
+            Ok(())
+        } else {
+            Err(error.into())
+        };
+    }
+    for _ in 0..=pages {
+        match index
+            .database
+            .execute("INSERT INTO __liazo_test_fill VALUES (zeroblob(8192))", [])
+        {
+            Ok(_) => {}
+            Err(error) if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull) => {
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(ArchiveError::Capacity)
+}
+
 fn write_audio(
     index: &mut ArchiveIndex,
     ready: Vec<Group>,
@@ -968,6 +1077,65 @@ mod tests {
     use crate::history::HistoryState;
     use liazo_core::protocol::ImageFormat;
     use liazo_transport::{Identity, SessionBinding};
+
+    #[test]
+    fn sqlite_full_control_uses_a_real_page_limit_and_can_restore_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let identity = ArchiveIdentity {
+            provider: Identity::generate().unwrap().fingerprint(),
+            binding: SessionBinding {
+                session: Uuid::new_v4(),
+                epoch: Uuid::new_v4(),
+            },
+            wall_anchor_unix_ms: 1_700_000_000_000,
+        };
+        let mut index = ArchiveIndex::open(
+            root.path(),
+            identity,
+            ArchiveLimits {
+                duration_ms: 60_000,
+                max_bytes: 4 * 1024 * 1024,
+            },
+        )
+        .unwrap();
+        database_full(&mut index, true).unwrap();
+        let mut full = false;
+        for sequence in 1..=200 {
+            let metadata = ImageMeta {
+                source: source(),
+                sequence,
+                configuration_revision: 1,
+                capture_started_ns: sequence,
+                captured_ns: sequence + 1,
+                width: 1,
+                height: 1,
+                format: ImageFormat::Png,
+                fingerprint: [sequence as u8; 32],
+            };
+            match index.record_image(
+                metadata,
+                Uuid::new_v4(),
+                Bytes::from_static(b"fixture"),
+                sequence,
+                1_000_000_000,
+            ) {
+                Ok(()) => {}
+                Err(ArchiveError::Database(error))
+                    if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull) =>
+                {
+                    full = true;
+                    break;
+                }
+                Err(error) => panic!("unexpected error: {error}"),
+            }
+        }
+        assert!(full, "the real archive connection must hit SQLITE_FULL");
+        database_full(&mut index, false).unwrap();
+        index
+            .record_gap(&source(), 1000, GapReason::ArchiveFailure)
+            .unwrap();
+        index.enforce_limits(1000).unwrap();
+    }
 
     fn source() -> SourceKey {
         SourceKey {

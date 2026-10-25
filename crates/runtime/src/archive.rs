@@ -28,6 +28,8 @@ pub use audio::{AudioClip, AudioPacket, AudioPage, AudioPolicyInterval, AudioSeg
 pub use info::ArchiveInfo;
 mod worker;
 pub(crate) use worker::ArchiveRecord;
+#[cfg(any(test, feature = "test-support"))]
+pub use worker::ArchiveTestHold;
 pub use worker::{ArchiveClient, ArchivePhase, ArchiveStatus, ArchiveWorker};
 
 #[derive(Debug, thiserror::Error)]

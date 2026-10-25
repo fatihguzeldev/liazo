@@ -93,6 +93,15 @@ struct Active {
     speech_revision: u64,
     recovery: Vec<RecoveryIssue>,
 }
+struct Retirement {
+    binding: SessionBinding,
+    task: tokio::task::JoinHandle<()>,
+}
+impl Drop for Retirement {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
 struct Inner {
     identity: Identity,
     peers: RwLock<Vec<StoredPeer>>,
@@ -110,6 +119,7 @@ struct Inner {
     revision: AtomicU64,
     transition: StdMutex<CancellationToken>,
     monitor: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    retirement: StdMutex<Option<Retirement>>,
 }
 
 impl Drop for Inner {
@@ -122,6 +132,10 @@ impl Drop for Inner {
         {
             task.abort();
         }
+        self.retirement
+            .get_mut()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
     }
 }
 
@@ -200,6 +214,7 @@ impl SessionHost {
             revision: AtomicU64::new(0),
             transition: StdMutex::new(CancellationToken::new()),
             monitor: StdMutex::new(None),
+            retirement: StdMutex::new(None),
         }))
     }
 
@@ -303,8 +318,7 @@ impl SessionHost {
             }
         };
         if let Some(receiver) = revoked {
-            let _ = receiver.disconnect().await;
-            let _ = receiver.retire_archive().await;
+            self.retire_previous(receiver).await?;
         }
         Ok(())
     }

@@ -1,5 +1,6 @@
 use super::{
-    Active, HostError, RecoveryIssue, RecoveryOperation, SessionHost, SessionSummary, SpeechIntent,
+    Active, HostError, RecoveryIssue, RecoveryOperation, Retirement, SessionHost, SessionSummary,
+    SpeechIntent,
 };
 use liazo_core::protocol::{CaptureSettings, SourceAvailability, SourceKey, SourceKind};
 use liazo_runtime::{
@@ -82,8 +83,7 @@ impl SessionHost {
                 session = previous.archive_identity().binding.session;
                 restore = Some((previous.settings(), raw_audio, speech));
             }
-            let _ = previous.disconnect().await;
-            previous.retire_archive().await?;
+            self.retire_previous(previous).await?;
         }
         // Keep the old active handle until a new authenticated epoch is ready. Failed attempts
         // retain the logical session and settings, and old epochs remain queryable.
@@ -106,8 +106,7 @@ impl SessionHost {
             ));
         }
         if transition.is_cancelled() {
-            let _ = receiver.disconnect().await;
-            let _ = receiver.retire_archive().await;
+            self.retire_previous(receiver).await?;
             return Err(HostError::Interrupted);
         }
         let mut raw_audio = vec![];
@@ -119,8 +118,7 @@ impl SessionHost {
                 recovery.push(issue(RecoveryOperation::Capture, None, &error.to_string()));
             }
             if transition.is_cancelled() {
-                let _ = receiver.disconnect().await;
-                let _ = receiver.retire_archive().await;
+                self.retire_previous(receiver).await?;
                 return Err(HostError::Interrupted);
             }
             raw_audio = desired_raw;
@@ -161,8 +159,7 @@ impl SessionHost {
         {
             drop(active);
             drop(trusted);
-            let _ = receiver.disconnect().await;
-            let _ = receiver.retire_archive().await;
+            self.retire_previous(receiver).await?;
             return Err(HostError::Interrupted);
         }
         *active = Some(Active {
@@ -237,7 +234,57 @@ impl SessionHost {
         }));
     }
 
+    pub(super) async fn retire_previous(&self, receiver: ReceiverSession) -> Result<(), HostError> {
+        receiver.interrupt();
+        // Inference has its own bounded cancellation and never waits for storage.
+        receiver.stop_transcription().await;
+        if receiver.archive_status().is_none() {
+            return Ok(());
+        }
+        let mut retirement = self.0.retirement.lock().unwrap_or_else(|e| e.into_inner());
+        if retirement
+            .as_ref()
+            .is_some_and(|task| task.task.is_finished())
+        {
+            retirement.take();
+        }
+        let binding = receiver.archive_identity().binding;
+        if let Some(retirement) = retirement.as_ref() {
+            return if retirement.binding == binding {
+                Ok(())
+            } else {
+                Err(HostError::Busy)
+            };
+        }
+        *retirement = Some(Retirement {
+            binding,
+            task: tokio::spawn(async move {
+                loop {
+                    if receiver.retire_archive().await.is_ok() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }),
+        });
+        Ok(())
+    }
+
+    fn archive_retiring(&self) -> bool {
+        let mut retirement = self.0.retirement.lock().unwrap_or_else(|e| e.into_inner());
+        if retirement
+            .as_ref()
+            .is_some_and(|task| task.task.is_finished())
+        {
+            retirement.take();
+        }
+        retirement.is_some()
+    }
+
     async fn initialize_archive(&self, receiver: &ReceiverSession) -> Result<(), HostError> {
+        if self.archive_retiring() {
+            return Err(HostError::Busy);
+        }
         let binding = receiver.archive_identity().binding;
         let limits = ArchiveLimits::default();
         let budget = self.catalog()?.budget(limits.max_bytes)?;

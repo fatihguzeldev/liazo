@@ -28,6 +28,7 @@ sha2 = "0.10"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 [dev-dependencies]
+liazo-runtime = { path = "../runtime", features = ["test-support"] }
 hound = "3.5"
 async-trait = "0.1"
 tempfile = "3"

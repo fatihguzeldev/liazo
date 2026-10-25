@@ -713,8 +713,7 @@ impl ReceiverSession {
         Ok(())
     }
 
-    pub async fn disconnect(&self) -> Result<(), RuntimeError> {
-        let _stopping = self.0.stop.lock().await;
+    pub fn interrupt(&self) {
         self.0.shared.cancelled.cancel();
         {
             let mut state = self
@@ -730,6 +729,11 @@ impl ReceiverSession {
             }
         }
         self.0.shared.signal();
+    }
+
+    pub async fn disconnect(&self) -> Result<(), RuntimeError> {
+        let _stopping = self.0.stop.lock().await;
+        self.interrupt();
         self.stop_transcription().await;
         self.seal_archive().await
     }

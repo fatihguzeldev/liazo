@@ -12,6 +12,20 @@ use std::{path::PathBuf, time::Duration};
 use tokio::sync::oneshot;
 
 impl ReceiverSession {
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn set_archive_database_full(&self, enabled: bool) -> Result<(), RuntimeError> {
+        let archive = self
+            .archive_client()
+            .ok_or_else(|| failure(FailureCode::Unavailable, "disk archive is not enabled"))?;
+        Ok(archive.database_full(enabled).await?)
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn hold_archive(&self) -> Result<crate::archive::ArchiveTestHold, RuntimeError> {
+        let archive = self
+            .archive_client()
+            .ok_or_else(|| failure(FailureCode::Unavailable, "disk archive is not enabled"))?;
+        Ok(archive.hold().await?)
+    }
     pub async fn start_archive(
         &self,
         root: PathBuf,
