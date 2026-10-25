@@ -886,6 +886,48 @@ fn write_audio(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct PayloadOutage(std::path::PathBuf);
+    impl PayloadOutage {
+        fn new(path: std::path::PathBuf) -> Self {
+            let outage = Self(path);
+            #[cfg(not(windows))]
+            {
+                std::fs::rename(&outage.0, outage.0.with_file_name("payloads-backup")).unwrap();
+                std::fs::write(&outage.0, b"not a directory").unwrap();
+            }
+            // An open lock prevents renaming its containing directory on Windows.
+            // Deny new files on this temporary directory without changing that lock.
+            #[cfg(windows)]
+            assert!(
+                std::process::Command::new("icacls")
+                    .arg(&outage.0)
+                    .args(["/deny", "*S-1-1-0:(WD,AD)", "/q"])
+                    .output()
+                    .unwrap()
+                    .status
+                    .success()
+            );
+            outage
+        }
+    }
+    impl Drop for PayloadOutage {
+        fn drop(&mut self) {
+            #[cfg(not(windows))]
+            {
+                let _ = std::fs::remove_file(&self.0);
+                let _ = std::fs::rename(self.0.with_file_name("payloads-backup"), &self.0);
+            }
+            #[cfg(windows)]
+            {
+                let result = std::process::Command::new("icacls")
+                    .arg(&self.0)
+                    .args(["/remove:d", "*S-1-1-0", "/q"])
+                    .output();
+                assert!(result.is_ok_and(|output| output.status.success()));
+            }
+        }
+    }
     use crate::history::HistoryState;
     use liazo_core::protocol::ImageFormat;
     use liazo_transport::{Identity, SessionBinding};
@@ -1008,17 +1050,14 @@ mod tests {
             range: None,
         };
         let payloads = root.path().join("payloads");
-        let backup = root.path().join("payloads-backup");
-        std::fs::rename(&payloads, &backup).unwrap();
-        std::fs::write(&payloads, b"not a directory").unwrap();
+        let outage = PayloadOutage::new(payloads);
         client.submit(packet(1));
         assert!(client.flush().await.is_err());
         assert_eq!(client.status().phase, ArchivePhase::Failed);
         assert_eq!(client.status().dropped_records, 1);
         assert_eq!(client.status().queued_bytes, 0);
         assert_eq!(client.status().buffered_audio_bytes, 0);
-        std::fs::remove_file(&payloads).unwrap();
-        std::fs::rename(&backup, &payloads).unwrap();
+        drop(outage);
         client.submit(packet(2));
         client.flush().await.unwrap();
         let page = client
