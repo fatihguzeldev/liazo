@@ -33,6 +33,7 @@ export type GapReason =
   | "no_data"
   | "skipped_frames"
   | "capacity";
+export type ModelPhase = "missing" | "downloading" | "ready" | "failed";
 export type ArchivePhase = "recording" | "failed" | "stopping" | "stopped";
 export type ConnectionState =
   "connecting" | "connected" | "stopped" | "disconnected";
@@ -75,6 +76,8 @@ export interface DesktopApi {
   history: HistoryResponse;
   history_request: History;
   limits_request: Limits;
+  model_install_request: ModelInstall;
+  models: ModelStatus[];
   observation: ObservationResponse;
   observe_request: Observe;
   pair_request: Pair;
@@ -219,6 +222,18 @@ export interface Limits {
 export interface HistoryLimits {
   duration_ms: number;
   max_bytes: number;
+}
+export interface ModelInstall {
+  id: string;
+}
+export interface ModelStatus {
+  bytes: number;
+  error: string | null;
+  id: string;
+  path: string | null;
+  phase: ModelPhase;
+  received_bytes: number;
+  sha256: string;
 }
 export interface ObservationResponse {
   media: MediaRef[];

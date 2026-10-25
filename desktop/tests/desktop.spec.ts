@@ -28,6 +28,8 @@ test.beforeEach(async ({ page }) => {
         ? ([] as [string, string][])
         : ([["a".repeat(64), "fixture mac"]] as [string, string][]),
       approved: false,
+      modelPhase: "missing",
+      modelReady: false,
       denied: false,
       lastDenied: false,
       stopped: false,
@@ -156,6 +158,29 @@ test.beforeEach(async ({ page }) => {
             : null;
         }
         if (name === "peers") return state.peers;
+        if (name === "models")
+          return [
+            {
+              id: "base",
+              bytes: 147951465,
+              sha256: "fixture-hash",
+              phase: state.modelReady ? "ready" : state.modelPhase,
+              received_bytes: state.modelReady ? 147951465 : 0,
+              path: state.modelReady
+                ? "C:\\liazo\\models\\ggml-base.bin"
+                : null,
+              error: null,
+            },
+          ];
+        if (name === "model-install") {
+          state.modelPhase = "downloading";
+          return { accepted: true };
+        }
+        if (name === "model-cancel") {
+          state.modelPhase = "missing";
+          return { cancelled: true };
+        }
+        if (name === "transcribe") return { started: true };
         if (name === "discover")
           return [
             {
@@ -374,6 +399,50 @@ test("source removal, permission errors and partial-to-final speech use the shar
     page.getByRole("button", { name: "capture now" }),
   ).toBeDisabled();
   await expect(page.getByText("choose a display or window")).toBeVisible();
+});
+
+test("speech waits for model verification and a download can be cancelled", async ({
+  page,
+}) => {
+  await page.goto("/");
+  const speech = page
+    .locator("details")
+    .filter({ has: page.locator("summary", { hasText: /^speech$/ }) });
+  await speech.locator("summary").click();
+  await speech
+    .getByRole("checkbox", { name: "fixture audio", exact: true })
+    .check();
+  await expect(
+    speech.getByRole("button", { name: "start", exact: true }),
+  ).toBeDisabled();
+  await speech
+    .getByRole("button", { name: "download base", exact: true })
+    .click();
+  await expect(speech.getByText("base · 0%", { exact: true })).toBeVisible();
+  await speech.getByRole("button", { name: "cancel download" }).click();
+  await expect(
+    speech.getByRole("button", { name: "download base", exact: true }),
+  ).toBeEnabled();
+  await speech
+    .getByRole("button", { name: "download base", exact: true })
+    .click();
+  await page.evaluate(() => {
+    (window as any).fixture.modelReady = true;
+  });
+  await expect(
+    speech.getByRole("button", { name: "start", exact: true }),
+  ).toBeEnabled();
+  await speech.getByRole("button", { name: "start", exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as any).fixture.calls.find(
+            (call: any) => call.name === "transcribe",
+          )?.args.model,
+      ),
+    )
+    .toBe("C:\\liazo\\models\\ggml-base.bin");
 });
 
 test("returning live cancels late history presentation and the layout stays within the window", async ({

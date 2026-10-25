@@ -36,7 +36,7 @@ impl Bridge {
                 root,
             },
             endpoint: Mutex::new(None),
-            client: Client::builder()
+            client: liazo_host::http::client_builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(1))
@@ -130,10 +130,10 @@ pub async fn operation(
     args: Value,
 ) -> Result<Value, String> {
     let method = match name.as_str() {
-        "status" | "peers" | "discover" => Method::GET,
+        "status" | "peers" | "discover" | "models" => Method::GET,
         "connect" | "pair" | "forget" | "sources" | "observe" | "configure" | "capture"
         | "history" | "transcripts" | "history-limits" | "transcribe" | "transcription-stop"
-        | "stop" => Method::POST,
+        | "stop" | "model-install" | "model-cancel" => Method::POST,
         _ => return Err("unknown operation".into()),
     };
     let body = (method == Method::POST).then_some(args);
