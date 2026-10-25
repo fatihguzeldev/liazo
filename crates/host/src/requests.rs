@@ -19,6 +19,20 @@ pub struct Connect {
     pub address: SocketAddr,
     pub peer: String,
 }
+
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Pair {
+    pub code: String,
+    pub name: String,
+    pub label: String,
+}
+
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Forget {
+    pub peer: String,
+}
 #[derive(Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Observe {

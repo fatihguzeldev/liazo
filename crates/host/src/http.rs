@@ -117,6 +117,9 @@ pub async fn serve(
         )
         .route("/v1/status", get(status))
         .route("/v1/peers", get(peers))
+        .route("/v1/discover", get(discover))
+        .route("/v1/pair", post(pair))
+        .route("/v1/forget", post(forget))
         .route("/v1/connect", post(connect))
         .route("/v1/sources", post(sources))
         .route("/v1/observe", post(observe))
@@ -209,7 +212,7 @@ impl IntoResponse for HostError {
             Self::NoSession => StatusCode::NOT_FOUND,
             Self::Invalid => StatusCode::BAD_REQUEST,
             Self::Unpaired => StatusCode::FORBIDDEN,
-            Self::ActiveSession | Self::Interrupted => StatusCode::CONFLICT,
+            Self::ActiveSession | Self::Interrupted | Self::Busy => StatusCode::CONFLICT,
             _ => StatusCode::UNPROCESSABLE_ENTITY,
         };
         (code, Json(serde_json::json!({"error":self.to_string()}))).into_response()
@@ -251,6 +254,27 @@ async fn status(State(state): State<HttpState>) -> Json<Option<crate::SessionSum
 }
 async fn peers(State(state): State<HttpState>) -> Json<Vec<(String, String)>> {
     Json(state.host.peers().await)
+}
+async fn discover(
+    State(state): State<HttpState>,
+) -> Result<Json<Vec<liazo_transport::discovery::DiscoveredProvider>>, HostError> {
+    Ok(Json(state.host.discover().await?))
+}
+async fn pair(
+    State(state): State<HttpState>,
+    Json(args): Json<Pair>,
+) -> Result<Json<(String, String)>, HostError> {
+    Ok(Json(
+        state.host.pair(args.code, args.name, args.label).await?,
+    ))
+}
+async fn forget(
+    State(state): State<HttpState>,
+    Json(args): Json<Forget>,
+) -> Result<Json<serde_json::Value>, HostError> {
+    Ok(Json(
+        serde_json::json!({"removed":state.host.forget(args.peer.parse()?).await?}),
+    ))
 }
 async fn connect(
     State(state): State<HttpState>,

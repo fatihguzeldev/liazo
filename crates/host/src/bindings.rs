@@ -11,6 +11,9 @@ use schemars::JsonSchema;
 #[derive(JsonSchema)]
 struct DesktopApi {
     session: Option<SessionSummary>,
+    discovery: Vec<liazo_transport::discovery::DiscoveredProvider>,
+    pair_request: requests::Pair,
+    forget_request: requests::Forget,
     sources: SourceSnapshot,
     observation: ObservationResponse,
     history: HistoryResponse,

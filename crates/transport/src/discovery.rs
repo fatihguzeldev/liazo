@@ -48,7 +48,7 @@ impl Drop for Advertisement {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, schemars::JsonSchema)]
 pub struct DiscoveredProvider {
     pub name: String,
     pub addresses: Vec<SocketAddr>,
