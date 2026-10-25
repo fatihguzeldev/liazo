@@ -383,6 +383,21 @@ footer {
   color: var(--error);
   border-bottom: 1px solid var(--line);
 }
+.recovery-banner {
+  display: flex;
+  justify-content: space-between;
+  align-items: start;
+  gap: 1rem;
+  padding: 0.75rem 1.5rem;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+}
+.recovery-banner ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+}
 @media (max-width: 800px) {
   .workspace {
     grid-template-columns: 210px minmax(0, 1fr);

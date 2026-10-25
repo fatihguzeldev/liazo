@@ -56,6 +56,11 @@ test.beforeEach(async ({ page }) => {
       audioExpired: false,
       archiveExpired: false,
       archiveDelay: false,
+      recovery: [] as {
+        operation: string;
+        source: { id: string; generation: string } | null;
+        message: string;
+      }[],
       modelPhase: new URL(location.href).searchParams.has("verifying")
         ? "verifying"
         : "missing",
@@ -63,6 +68,7 @@ test.beforeEach(async ({ page }) => {
       denied: false,
       lastDenied: false,
       stopped: false,
+      disconnected: false,
       cursor: 2,
       revision: 1,
       calls: [] as { name: string; args: any }[],
@@ -115,7 +121,11 @@ test.beforeEach(async ({ page }) => {
         settings: state.settings,
         binding,
         cursor: state.cursor,
-        connection: state.stopped ? "stopped" : "connected",
+        connection: state.stopped
+          ? "stopped"
+          : state.disconnected
+            ? "disconnected"
+            : "connected",
         configuration_revision: state.revision,
         source_revision: state.denied ? 2 : 1,
         images: state.settings.images.map(() => ({
@@ -179,13 +189,22 @@ test.beforeEach(async ({ page }) => {
         const input = args.args;
         state.calls.push({ name, args: input });
         if (name === "status" || name === "connect") {
-          if (name === "connect") state.connected = true;
+          if (name === "connect") {
+            state.connected = true;
+            state.disconnected = false;
+            state.stopped = false;
+          }
           return state.connected
             ? {
                 binding,
+                recovery: state.recovery,
                 provider: "a".repeat(64),
                 address: "127.0.0.1:45810",
-                connection: state.stopped ? "stopped" : "connected",
+                connection: state.stopped
+                  ? "stopped"
+                  : state.disconnected
+                    ? "disconnected"
+                    : "connected",
               }
             : null;
         }
@@ -789,4 +808,64 @@ test("a pending recording read cannot replace a later epoch selection", async ({
   await expect(
     page.getByText("previous connection", { exact: true }),
   ).not.toBeVisible();
+});
+
+test("a disconnected session can reconnect its pinned address or be explicitly stopped", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await expect(
+    page.getByRole("img", { name: "fixture display", exact: true }),
+  ).toBeVisible();
+  await page.evaluate(() => {
+    const state = (window as any).fixture;
+    state.disconnected = true;
+    state.cursor++;
+  });
+  await page.getByRole("button", { name: "reconnect", exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as any).fixture.calls
+            .filter((call: any) => call.name === "connect")
+            .at(-1)?.args,
+      ),
+    )
+    .toEqual({ address: "127.0.0.1:45810", peer: "a".repeat(64) });
+  await expect(page.locator(".connection-state")).toHaveText("connected");
+  await page.evaluate(() => {
+    const state = (window as any).fixture;
+    state.disconnected = true;
+    state.cursor++;
+  });
+  await expect(page.locator(".connection-state")).toHaveText("disconnected");
+  await page.getByRole("button", { name: "stop", exact: true }).click();
+  await expect(page.locator(".connection-state")).toHaveText("stopped");
+});
+
+test("recovery failures remain visible in a live session and can be dismissed", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await expect(
+    page.getByRole("img", { name: "fixture display", exact: true }),
+  ).toBeVisible();
+  await page.evaluate(() => {
+    (window as any).fixture.recovery = [
+      {
+        operation: "archive",
+        source: null,
+        message: "archive storage is unavailable",
+      },
+    ];
+  });
+  await expect(page.getByRole("status")).toContainText(
+    "archive storage is unavailable",
+  );
+  await expect(
+    page.getByRole("img", { name: "fixture display", exact: true }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "dismiss", exact: true }).click();
+  await expect(page.getByRole("status")).not.toBeVisible();
 });

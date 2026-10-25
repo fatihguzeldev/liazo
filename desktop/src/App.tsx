@@ -1,7 +1,7 @@
 import { Transcripts } from "./Transcripts";
 import { useEffect, useState } from "react";
 import { call, key, message, release } from "./api";
-import type { Api } from "./api";
+import type { Api, Session } from "./api";
 import { Connection } from "./Connection";
 import { Controls } from "./Controls";
 import { History } from "./History";
@@ -15,6 +15,8 @@ export function App() {
   const { session, ready } = host;
   const [connecting, setConnecting] = useState(false);
   const [recordings, setRecordings] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
+  const [dismissedRecovery, setDismissedRecovery] = useState("");
   const [preview, setPreview] = useState("");
   const [past, setPast] = useState<Past | null>(null);
   const [error, setError] = useState("");
@@ -78,7 +80,26 @@ export function App() {
           </button>
           {session && (
             <>
+              {status === "disconnected" && (
+                <button
+                  disabled={reconnecting || stopping}
+                  onClick={() => {
+                    setReconnecting(true);
+                    setError("");
+                    void call<Session>("connect", {
+                      address: session.address,
+                      peer: session.provider,
+                    })
+                      .then(host.connected)
+                      .catch((error) => setError(message(error)))
+                      .finally(() => setReconnecting(false));
+                  }}
+                >
+                  {reconnecting ? "reconnecting…" : "reconnect"}
+                </button>
+              )}
               <button
+                disabled={reconnecting || stopping}
                 onClick={() => {
                   setRecordings(false);
                   setConnecting((old) => !old);
@@ -87,7 +108,7 @@ export function App() {
                 {connecting ? "back" : "connect"}
               </button>
               <button
-                disabled={stopping || status !== "connected"}
+                disabled={stopping || status === "stopped"}
                 title="stop the shared capture session"
                 onClick={() => {
                   setStopping(true);
@@ -111,6 +132,30 @@ export function App() {
           </button>
         </div>
       )}
+      {!!session?.recovery?.length &&
+        dismissedRecovery !== session.binding.epoch && (
+          <div className="recovery-banner" role="status">
+            <ul>
+              {session.recovery.map((issue, index) => (
+                <li key={index}>
+                  {issue.operation === "raw_audio"
+                    ? "audio archive"
+                    : issue.operation === "transcription"
+                      ? "speech"
+                      : issue.operation}
+                  {issue.source
+                    ? ` · ${live.sources?.sources.find((source) => key(source.key) === key(issue.source!))?.label ?? issue.source.id}`
+                    : ""}
+                  {" · "}
+                  {issue.message}
+                </li>
+              ))}
+            </ul>
+            <button onClick={() => setDismissedRecovery(session.binding.epoch)}>
+              dismiss
+            </button>
+          </div>
+        )}
       {!ready ? (
         <main className="empty" aria-busy="true">
           opening local session…

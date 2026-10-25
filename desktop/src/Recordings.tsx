@@ -7,6 +7,10 @@ import type { Past } from "./History";
 import { Transcripts } from "./Transcripts";
 
 type Epoch = Api["archives"]["entries"][number];
+function recordingError(error: unknown): string {
+  const text = message(error);
+  return text === "archive not found" ? "recording expired or removed" : text;
+}
 export function Recordings() {
   const [page, setPage] = useState<Api["archives"] | null>(null);
   const [offset, setOffset] = useState(0);
@@ -26,7 +30,7 @@ export function Recordings() {
         }
       })
       .catch((error) => {
-        if (current) setError(message(error));
+        if (current) setError(recordingError(error));
       });
     return () => {
       current = false;
@@ -119,7 +123,7 @@ function Recording({ epoch }: { epoch: Epoch }) {
         if (!after) setSource(next.entries.find((entry) => entry.image)?.key);
       })
       .catch((error) => {
-        if (version === sourcePage.current) setError(message(error));
+        if (version === sourcePage.current) setError(recordingError(error));
       });
   };
   useEffect(() => {
@@ -221,13 +225,13 @@ function Recording({ epoch }: { epoch: Epoch }) {
         transcripts: text.status === "fulfilled" ? text.value.entries : [],
         truncated: text.status === "fulfilled" && text.value.truncated,
       });
-      if (text.status === "rejected") setError(message(text.reason));
+      if (text.status === "rejected") setError(recordingError(text.reason));
       else if (target.to_ms * 1_000_000 < text.value.retention_floor_ns)
         setTextState("transcripts expired");
       else if (target.from_ms * 1_000_000 < text.value.retention_floor_ns)
         setTextState("part of this transcript range has expired");
     } catch (error) {
-      if (version === request.current) setError(message(error));
+      if (version === request.current) setError(recordingError(error));
     } finally {
       if (version === request.current) setBusy(false);
     }
@@ -255,7 +259,7 @@ function Recording({ epoch }: { epoch: Epoch }) {
         setAudioState(audioHistoryMessage(response, created.length));
       } else for (const clip of created) URL.revokeObjectURL(clip.url);
     } catch (error) {
-      if (version === audioRequest.current) setError(message(error));
+      if (version === audioRequest.current) setError(recordingError(error));
     } finally {
       if (version === audioRequest.current) setLoadingAudio(false);
     }
