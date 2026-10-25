@@ -14,6 +14,8 @@ struct DesktopApi {
     discovery: Vec<liazo_transport::discovery::DiscoveredProvider>,
     pair_request: requests::Pair,
     forget_request: requests::Forget,
+    models: Vec<crate::models::ModelStatus>,
+    model_install_request: requests::ModelInstall,
     sources: SourceSnapshot,
     observation: ObservationResponse,
     history: HistoryResponse,

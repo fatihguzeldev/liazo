@@ -46,7 +46,13 @@ pub async fn run(
         profile: profile.clone(),
         credentials: Arc::new(credentials),
     });
-    let host = SessionHost::with_trust_store(identity, peers, profile.root.join("sessions"), store);
+    let host = SessionHost::with_trust_store(
+        identity,
+        peers,
+        profile.root.join("sessions"),
+        profile.root.join("models"),
+        store,
+    );
     let listener = TcpListener::bind(listen).await?;
     let endpoint = Endpoint::new(listener.local_addr()?)?;
     let descriptor = profile.root.join("host.json");
@@ -100,6 +106,7 @@ pub async fn run(
             }
         }
     };
+    host.models().cancel().await;
     if let Some(current) = host.current().await {
         let receiver = host.receiver(current.binding).await?;
         if receiver.stop().await.is_err() {

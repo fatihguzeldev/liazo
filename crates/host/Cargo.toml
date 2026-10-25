@@ -23,7 +23,9 @@ getrandom = "0.4"
 subtle = "2"
 futures-util = "0.3"
 rmcp = { version = "=3.7.0", default-features = false, features = ["server", "client", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client-reqwest"] }
-reqwest = { version = "0.13", default-features = false, features = ["json"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider"] }
+sha2 = "0.10"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 [dev-dependencies]
 async-trait = "0.1"

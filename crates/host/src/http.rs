@@ -27,6 +27,14 @@ use uuid::Uuid;
 
 const MAX_REQUEST: usize = 64 * 1024;
 
+pub fn client_builder() -> reqwest::ClientBuilder {
+    static CRYPTO: std::sync::Once = std::sync::Once::new();
+    CRYPTO.call_once(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+    reqwest::Client::builder()
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Endpoint {
@@ -120,6 +128,9 @@ pub async fn serve(
         .route("/v1/discover", get(discover))
         .route("/v1/pair", post(pair))
         .route("/v1/forget", post(forget))
+        .route("/v1/models", get(models))
+        .route("/v1/model-install", post(model_install))
+        .route("/v1/model-cancel", post(model_cancel))
         .route("/v1/connect", post(connect))
         .route("/v1/sources", post(sources))
         .route("/v1/observe", post(observe))
@@ -254,6 +265,22 @@ async fn status(State(state): State<HttpState>) -> Json<Option<crate::SessionSum
 }
 async fn peers(State(state): State<HttpState>) -> Json<Vec<(String, String)>> {
     Json(state.host.peers().await)
+}
+async fn models(
+    State(state): State<HttpState>,
+) -> Result<Json<Vec<crate::models::ModelStatus>>, HostError> {
+    Ok(Json(state.host.models().status().await?))
+}
+async fn model_install(
+    State(state): State<HttpState>,
+    Json(args): Json<ModelInstall>,
+) -> Result<Json<serde_json::Value>, HostError> {
+    state.host.models().install(&args.id).await?;
+    Ok(Json(serde_json::json!({"accepted":true})))
+}
+async fn model_cancel(State(state): State<HttpState>) -> Json<serde_json::Value> {
+    state.host.models().cancel().await;
+    Json(serde_json::json!({"requested":true}))
 }
 async fn discover(
     State(state): State<HttpState>,

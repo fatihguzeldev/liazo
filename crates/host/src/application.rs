@@ -30,6 +30,8 @@ pub enum HostError {
     #[error(transparent)]
     Credential(#[from] CredentialError),
     #[error(transparent)]
+    Model(#[from] crate::models::ModelError),
+    #[error(transparent)]
     Runtime(#[from] RuntimeError),
     #[error(transparent)]
     Transport(#[from] liazo_transport::TransportError),
@@ -61,6 +63,7 @@ struct Inner {
     trust_ops: Mutex<()>,
     trust: Option<Arc<dyn crate::TrustStore>>,
     archive_root: PathBuf,
+    models: crate::models::ModelStore,
 }
 
 #[derive(Clone)]
@@ -98,20 +101,23 @@ impl SessionHost {
             .await?)
     }
     pub fn new(identity: Identity, peers: Vec<StoredPeer>, archive_root: PathBuf) -> Self {
-        Self::compose(identity, peers, archive_root, None)
+        let models = archive_root.join("models");
+        Self::compose(identity, peers, archive_root, models, None)
     }
     pub fn with_trust_store(
         identity: Identity,
         peers: Vec<StoredPeer>,
         archive_root: PathBuf,
+        model_root: PathBuf,
         trust: Arc<dyn crate::TrustStore>,
     ) -> Self {
-        Self::compose(identity, peers, archive_root, Some(trust))
+        Self::compose(identity, peers, archive_root, model_root, Some(trust))
     }
     fn compose(
         identity: Identity,
         peers: Vec<StoredPeer>,
         archive_root: PathBuf,
+        model_root: PathBuf,
         trust: Option<Arc<dyn crate::TrustStore>>,
     ) -> Self {
         Self(Arc::new(Inner {
@@ -125,6 +131,7 @@ impl SessionHost {
             trust_ops: Mutex::new(()),
             trust,
             archive_root,
+            models: crate::models::ModelStore::new(model_root),
         }))
     }
 
@@ -136,6 +143,9 @@ impl SessionHost {
             .iter()
             .map(|peer| (peer.fingerprint().to_string(), peer.label.clone()))
             .collect()
+    }
+    pub fn models(&self) -> &crate::models::ModelStore {
+        &self.0.models
     }
     pub async fn discover(
         &self,

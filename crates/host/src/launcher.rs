@@ -35,7 +35,7 @@ impl Launcher {
         {
             return Err(LaunchError::Endpoint);
         }
-        let client = reqwest::Client::builder()
+        let client = crate::http::client_builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_millis(250))

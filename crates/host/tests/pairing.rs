@@ -43,6 +43,7 @@ async fn approved_pairing_persists_after_its_consumer_leaves_and_forgetting_remo
         Identity::generate().unwrap(),
         vec![],
         root.path().to_owned(),
+        root.path().join("models"),
         store.clone(),
     );
     let provider = Identity::generate().unwrap();
@@ -100,6 +101,7 @@ async fn a_persistence_failure_cannot_be_reported_as_a_paired_computer() {
         Identity::generate().unwrap(),
         vec![],
         root.path().to_owned(),
+        root.path().join("models"),
         store.clone(),
     );
     let provider = Identity::generate().unwrap();

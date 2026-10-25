@@ -33,7 +33,7 @@ impl McpProxy {
             .validate()
             .map_err(|_| ProxyError::InvalidEndpoint)?;
         // This secret is only for the loopback host, regardless of system proxy settings.
-        let client = reqwest::Client::builder()
+        let client = crate::http::client_builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(1))

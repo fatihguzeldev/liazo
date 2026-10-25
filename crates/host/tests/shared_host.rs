@@ -19,7 +19,7 @@ use liazo_runtime::{
     provider,
 };
 use liazo_transport::{Identity, PeerServer, PeerSession, SessionServer, StoredPeer};
-use reqwest::{Client, StatusCode};
+use reqwest::StatusCode;
 use rmcp::{
     ServiceExt,
     model::{CallToolRequestParams, ClientConfig},
@@ -169,7 +169,7 @@ async fn authenticated_consumers_share_one_session_and_binary_media_without_a_gu
         endpoint.clone(),
         cancel.clone(),
     ));
-    let client = Client::builder()
+    let client = liazo_host::http::client_builder()
         .timeout(Duration::from_secs(4))
         .build()
         .unwrap();

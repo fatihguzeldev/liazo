@@ -35,6 +35,11 @@ pub struct Forget {
 }
 #[derive(Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct ModelInstall {
+    pub id: String,
+}
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Observe {
     pub binding: SessionBinding,
     #[serde(default)]

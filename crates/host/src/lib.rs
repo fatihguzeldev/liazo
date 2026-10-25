@@ -4,6 +4,7 @@ pub mod http;
 pub mod launcher;
 mod mcp;
 mod media;
+pub mod models;
 pub mod proxy;
 mod trust;
 pub use trust::TrustStore;
