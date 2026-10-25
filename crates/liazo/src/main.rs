@@ -29,6 +29,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     Mcp,
+    Permissions {
+        #[arg(long)]
+        request_screen: bool,
+        #[arg(long)]
+        request_microphone: bool,
+    },
     Host {
         #[arg(long, default_value = "127.0.0.1:45811")]
         listen: SocketAddr,
@@ -81,7 +87,10 @@ enum Command {
 fn main() {
     let cli = Cli::parse();
     #[cfg(target_os = "macos")]
-    if matches!(cli.command, Command::Provide { .. }) {
+    if matches!(
+        cli.command,
+        Command::Provide { .. } | Command::Permissions { .. }
+    ) {
         let worker = std::thread::spawn(move || {
             struct Stop;
             impl Drop for Stop {
@@ -130,6 +139,13 @@ fn execute(cli: Cli) -> Result<()> {
 }
 
 async fn run(cli: Cli) -> Result<()> {
+    if let Command::Permissions {
+        request_screen,
+        request_microphone,
+    } = &cli.command
+    {
+        return capture_permissions(*request_screen, *request_microphone).await;
+    }
     let profile = profile::Profile::open(cli.profile)?;
     if matches!(cli.command, Command::Mcp) {
         let endpoint = liazo_host::launcher::Launcher {
@@ -144,7 +160,7 @@ async fn run(cli: Cli) -> Result<()> {
     }
     let credentials = profile.credentials()?;
     match cli.command {
-        Command::Mcp => unreachable!(),
+        Command::Mcp | Command::Permissions { .. } => unreachable!(),
         Command::Host { listen } => host::run(profile, credentials, listen).await,
         Command::Unlock => {
             let _ = profile.identity(&credentials)?;
@@ -317,4 +333,16 @@ async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+async fn capture_permissions(request_screen: bool, request_microphone: bool) -> Result<()> {
+    let status = liazo_macos::permissions(request_screen, request_microphone).await?;
+    println!("{}", serde_json::to_string(&status)?);
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn capture_permissions(_request_screen: bool, _request_microphone: bool) -> Result<()> {
+    Err("capture permissions require macos".into())
 }

@@ -1,6 +1,7 @@
 import AppKit
 import AVFoundation
 import CLiazoCapture
+import CoreGraphics
 import Foundation
 
 @_cdecl("liazo_native_clock_ns")
@@ -40,7 +41,43 @@ private final class Reply: @unchecked Sendable {
     let screen = ScreenCapture()
     var imagesInFlight = Set<String>()
     var sourcesInFlight = false
+    var permissionsInFlight = false
     var audio: [UInt64: AudioCapture] = [:]
+}
+
+@_cdecl("liazo_native_permissions")
+public func nativePermissions(_ id: UInt64, _ requestScreen: UInt8, _ requestMicrophone: UInt8,
+                              _ callback: LiazoCallback?, _ user: UnsafeMutableRawPointer?) {
+    guard let callback else { return }
+    let reply = Reply(id, callback, user)
+    guard requestScreen <= 1, requestMicrophone <= 1 else {
+        reply.fail(CaptureError.invalidRequest); return
+    }
+    DispatchQueue.main.async {
+        Task { @MainActor in
+            let state = BridgeState.shared
+            guard !state.permissionsInFlight else {
+                reply.json(["error": "permission request is in progress"], status: 1); return
+            }
+            state.permissionsInFlight = true
+            defer { state.permissionsInFlight = false }
+            if requestScreen == 1 && !ScreenCapture.hasPermission {
+                _ = CGRequestScreenCaptureAccess()
+            }
+            if requestMicrophone == 1 && AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined {
+                _ = await AVCaptureDevice.requestAccess(for: .audio)
+            }
+            let microphone: String
+            switch AVCaptureDevice.authorizationStatus(for: .audio) {
+            case .notDetermined: microphone = "not_determined"
+            case .restricted: microphone = "restricted"
+            case .denied: microphone = "denied"
+            case .authorized: microphone = "allowed"
+            @unknown default: microphone = "unknown"
+            }
+            reply.json(["screen": ScreenCapture.hasPermission, "microphone": microphone])
+        }
+    }
 }
 
 @_cdecl("liazo_native_sources")

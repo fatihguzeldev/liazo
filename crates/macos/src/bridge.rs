@@ -102,6 +102,41 @@ fn reply() -> (
     (Box::into_raw(Box::new(sender)).cast(), receiver)
 }
 
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MicrophonePermission {
+    NotDetermined,
+    Restricted,
+    Denied,
+    Allowed,
+    Unknown,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapturePermissions {
+    pub screen: bool,
+    pub microphone: MicrophonePermission,
+}
+
+pub async fn permissions(
+    request_screen: bool,
+    request_microphone: bool,
+) -> Result<CapturePermissions, NativeError> {
+    let (user, receiver) = reply();
+    unsafe {
+        ffi::liazo_native_permissions(
+            NEXT_REQUEST.fetch_add(1, Ordering::Relaxed),
+            u8::from(request_screen),
+            u8::from(request_microphone),
+            Some(once),
+            user,
+        )
+    };
+    let packet = receiver.await.map_err(|_| NativeError::Cancelled)??;
+    serde_json::from_value(packet.metadata).map_err(|_| failure("invalid permission status"))
+}
+
 pub async fn sources() -> Result<Value, NativeError> {
     let (user, receiver) = reply();
     unsafe {

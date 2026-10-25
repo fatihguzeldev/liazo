@@ -20,6 +20,8 @@ typedef void (*LiazoCallback)(void *user, uint64_t request_id, int32_t status,
     const uint8_t *metadata, size_t metadata_len, const uint8_t *payload, size_t payload_len);
 
 void liazo_native_sources(uint64_t request_id, LiazoCallback callback, void *user);
+void liazo_native_permissions(uint64_t request_id, uint8_t request_screen,
+    uint8_t request_microphone, LiazoCallback callback, void *user);
 void liazo_native_image(uint64_t request_id, const char *source, const LiazoImageOptions *options,
     LiazoCallback callback, void *user);
 void liazo_native_audio_start(uint64_t stream_id, const char *source, LiazoCallback callback, void *user);
