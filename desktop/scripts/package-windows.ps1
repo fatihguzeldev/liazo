@@ -89,7 +89,7 @@ try {
     $previousCli = $env:LIAZO_TEST_CLI
     $env:LIAZO_TEST_CLI = Join-Path $portable 'liazo.exe'
     try {
-        & cargo test --locked --target $target -p liazo --test mcp_stdio
+        & cargo test --locked --release --target $target -p liazo --test mcp_stdio
         if ($LASTEXITCODE -ne 0) { throw 'packaged MCP smoke test failed' }
     } finally { $env:LIAZO_TEST_CLI = $previousCli }
 
