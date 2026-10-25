@@ -133,7 +133,7 @@ pub async fn operation(
         "status" | "peers" | "discover" | "models" => Method::GET,
         "connect" | "pair" | "forget" | "sources" | "observe" | "configure" | "capture"
         | "history" | "transcripts" | "history-limits" | "transcribe" | "transcription-stop"
-        | "stop" | "model-install" | "model-cancel" => Method::POST,
+        | "stop" | "model-install" | "model-cancel" | "raw-audio" | "audio-history" => Method::POST,
         _ => return Err("unknown operation".into()),
     };
     let body = (method == Method::POST).then_some(args);

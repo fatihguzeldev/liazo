@@ -1,3 +1,10 @@
+.audio-download {
+  display: block;
+  margin-top: 0.7rem;
+  color: var(--accent);
+  font-size: 0.8rem;
+}
+
 :root {
   color-scheme: dark;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -340,10 +347,23 @@ footer {
 .connect-pane .error {
   margin-top: 1rem;
 }
-.nearby { display: flex; flex-direction: column; gap: .5rem; margin-bottom: 1rem; }
-.nearby-computer { text-align: left; white-space: normal; overflow-wrap: anywhere; }
-.forget { margin-top: .75rem; }
-.connection-main { overflow-y: auto; }
+.nearby {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  margin-bottom: 1rem;
+}
+.nearby-computer {
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.forget {
+  margin-top: 0.75rem;
+}
+.connection-main {
+  overflow-y: auto;
+}
 .error-banner {
   display: flex;
   justify-content: space-between;

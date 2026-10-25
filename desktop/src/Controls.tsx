@@ -1,5 +1,6 @@
 import { CaptureOptions } from "./CaptureOptions";
 import { Speech } from "./Speech";
+import { AudioArchive } from "./AudioArchive";
 import { useEffect, useState } from "react";
 import { call, key, message } from "./api";
 import type { Api, Session, Settings, Source } from "./api";
@@ -137,6 +138,13 @@ export function Controls({
         settings={settings}
         sources={sources}
         disabled={dirty || busy}
+      />
+      <AudioArchive
+        session={session}
+        settings={settings}
+        sources={sources}
+        archive={observed.archive}
+        disabled={dirty || busy || observed.connection !== "connected"}
       />
       {error && (
         <p className="error" role="alert">

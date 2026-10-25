@@ -22,12 +22,38 @@ test.beforeEach(async ({ page }) => {
       atob(canvas.toDataURL("image/png").split(",")[1]),
       (character) => character.charCodeAt(0),
     ).buffer;
+    const wav = new ArrayBuffer(698);
+    const wave = new DataView(wav);
+    const tag = (offset: number, text: string) =>
+      [...text].forEach((char, index) =>
+        wave.setUint8(offset + index, char.charCodeAt(0)),
+      );
+    tag(0, "RIFF");
+    wave.setUint32(4, 690, true);
+    tag(8, "WAVEfmt ");
+    wave.setUint32(16, 18, true);
+    wave.setUint16(20, 3, true);
+    wave.setUint16(22, 1, true);
+    wave.setUint32(24, 16000, true);
+    wave.setUint32(28, 64000, true);
+    wave.setUint16(32, 4, true);
+    wave.setUint16(34, 32, true);
+    tag(38, "fact");
+    wave.setUint32(42, 4, true);
+    wave.setUint32(46, 160, true);
+    tag(50, "data");
+    wave.setUint32(54, 640, true);
+    for (let index = 58; index < wav.byteLength; index += 4)
+      wave.setFloat32(index, 0.25, true);
     const state = {
       connected: !new URL(location.href).searchParams.has("unpaired"),
       peers: new URL(location.href).searchParams.has("unpaired")
         ? ([] as [string, string][])
         : ([["a".repeat(64), "fixture mac"]] as [string, string][]),
       approved: false,
+      rawAudio: [] as (typeof audio)[],
+      retainedAudio: false,
+      audioExpired: false,
       modelPhase: new URL(location.href).searchParams.has("verifying")
         ? "verifying"
         : "missing",
@@ -126,6 +152,8 @@ test.beforeEach(async ({ page }) => {
           queued_bytes: 0,
           dropped_records: 0,
           stats: null,
+          raw_audio_sources: state.rawAudio,
+          buffered_audio_bytes: 0,
         },
       },
       media:
@@ -143,7 +171,7 @@ test.beforeEach(async ({ page }) => {
     host.fixture = state;
     host.__TAURI_INTERNALS__ = {
       invoke: async (command, args) => {
-        if (command === "media") return png;
+        if (command === "media") return args.id === id(10) ? wav : png;
         if (command === "release_media") return;
         const name = args.name;
         const input = args.args;
@@ -160,6 +188,68 @@ test.beforeEach(async ({ page }) => {
             : null;
         }
         if (name === "peers") return state.peers;
+        if (name === "raw-audio") {
+          state.rawAudio = input.sources;
+          state.retainedAudio ||= input.sources.length > 0;
+          state.cursor++;
+          return { applied: true };
+        }
+        if (name === "audio-history")
+          return {
+            audio: {
+              first_ns: 0,
+              last_ns: 3_600_000_000_000,
+              retention_floor_ns: state.audioExpired ? 4_000_000_000_000 : 0,
+              capacity_before_ns: null,
+              truncated: false,
+              gaps: [],
+              policy:
+                state.retainedAudio && !state.audioExpired
+                  ? [{ source: audio, first_ns: 0, end_ns: null }]
+                  : [],
+              clips:
+                state.retainedAudio && !state.audioExpired
+                  ? [
+                      {
+                        segment: {
+                          id: id(9),
+                          source: audio,
+                          stream_id: id(6),
+                          sample_rate: 16000,
+                          channels: 1,
+                          packets: [
+                            {
+                              sequence: 1,
+                              sample_position: 0,
+                              frames: 160,
+                              captured_ns: 1_000_000,
+                              received_ns: 2_000_000,
+                              receiver_range: null,
+                              discontinuity: true,
+                            },
+                          ],
+                        },
+                      },
+                    ]
+                  : [],
+            },
+            media:
+              state.retainedAudio && !state.audioExpired
+                ? [
+                    {
+                      segment: id(9),
+                      reference: {
+                        id: id(10),
+                        source: audio,
+                        sequence: 1,
+                        content_type: "audio/wav",
+                        length: wav.byteLength,
+                      },
+                    },
+                  ]
+                : [],
+            media_omitted: 0,
+          };
         if (name === "models")
           return [
             {
@@ -454,6 +544,45 @@ test("speech waits for model verification and a download can be cancelled", asyn
       ),
     )
     .toBe("C:\\liazo\\models\\ggml-base.bin");
+});
+
+test("raw audio is opt in, downloads a WAV and distinguishes expiry from recording being off", async ({
+  page,
+}) => {
+  await page.goto("/");
+  const archive = page
+    .locator("details")
+    .filter({ has: page.locator("summary", { hasText: /^audio archive$/ }) });
+  await archive.locator("summary").click();
+  await expect(
+    archive.getByRole("checkbox", { name: "keep fixture audio" }),
+  ).not.toBeChecked();
+  await archive.getByRole("button", { name: "load audio" }).click();
+  await expect(
+    archive.getByText("raw recording was off in this range"),
+  ).toBeVisible();
+  await archive.getByRole("checkbox", { name: "keep fixture audio" }).check();
+  await expect(
+    archive.getByRole("checkbox", { name: "keep fixture audio" }),
+  ).toBeChecked();
+  await archive.getByRole("button", { name: "load audio" }).click();
+  const ready = page.waitForEvent("download");
+  await archive.getByRole("link", { name: "fixture audio · 0.01 s" }).click();
+  const stream = await (await ready).createReadStream();
+  const chunks = [];
+  for await (const chunk of stream!) chunks.push(chunk);
+  const bytes = Buffer.concat(chunks);
+  expect(bytes.subarray(0, 4).toString()).toBe("RIFF");
+  expect(bytes.readUInt16LE(20)).toBe(3);
+  expect(bytes.length).toBe(698);
+  await page.evaluate(() => {
+    (window as any).fixture.audioExpired = true;
+  });
+  await archive.getByRole("button", { name: "load audio" }).click();
+  await expect(
+    archive.getByText("audio expired", { exact: true }),
+  ).toBeVisible();
+  await expect(archive.getByRole("link")).toHaveCount(0);
 });
 
 test("returning live cancels late history presentation and the layout stays within the window", async ({
