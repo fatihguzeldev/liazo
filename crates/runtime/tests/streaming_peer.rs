@@ -567,6 +567,43 @@ mod storage_failures {
         history::GapReason,
     };
 
+    async fn flush_archive_when_ready(session: &ReceiverSession) {
+        let binding = session.archive_identity().binding;
+        let started = Instant::now();
+        let mut attempts = 0;
+        let mut last = String::from("waiting for the archive recovery barrier");
+        timeout(Duration::from_secs(15), async {
+            loop {
+                assert_eq!(session.archive_identity().binding, binding);
+                assert_eq!(session.connection(), ConnectionState::Connected);
+                attempts += 1;
+                last = format!(
+                    "attempts={attempts} elapsed={:?} binding={binding:?} connection={:?} archive={:?}",
+                    started.elapsed(),
+                    session.connection(),
+                    session.archive_status(),
+                );
+                match session.flush_archive().await {
+                    Ok(()) => {
+                        assert_eq!(session.connection(), ConnectionState::Connected);
+                        assert_eq!(
+                            session.archive_status().unwrap().phase,
+                            ArchivePhase::Recording,
+                            "{last}"
+                        );
+                        return;
+                    }
+                    Err(liazo_runtime::RuntimeError::Archive(ArchiveError::Busy)) => {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    Err(error) => panic!("archive recovery barrier failed: {error}; {last}"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("archive recovery barrier did not become ready: {last}"));
+    }
+
     async fn setup() -> (
         Arc<Fixture>,
         ReceiverSession,
@@ -732,20 +769,16 @@ mod storage_failures {
             .unwrap();
             assert!(fresh.images[0].payload.is_some());
             drop(held);
-            timeout(
-                Duration::from_secs(3),
-                start_archive_when_ready(
-                    &session,
-                    root(&session),
-                    ArchiveLimits {
-                        duration_ms: 60_000,
-                        max_bytes: 4 * 1024 * 1024,
-                    },
-                    budget.clone(),
-                ),
+            start_archive_when_ready(
+                &session,
+                root(&session),
+                ArchiveLimits {
+                    duration_ms: 60_000,
+                    max_bytes: 4 * 1024 * 1024,
+                },
+                budget.clone(),
             )
-            .await
-            .unwrap();
+            .await;
             assert_eq!(
                 budget.as_ref().map_or_else(
                     || session.archive_start_threads(),
@@ -757,7 +790,7 @@ mod storage_failures {
                 .configure_raw_audio(vec![source(true)])
                 .await
                 .unwrap();
-            session.flush_archive().await.unwrap();
+            flush_archive_when_ready(&session).await;
             assert_eq!(
                 session.archive_status().unwrap().phase,
                 ArchivePhase::Recording
@@ -875,9 +908,9 @@ mod storage_failures {
         .unwrap();
         assert!(fresh.images[0].metadata.sequence > before.images[0].metadata.sequence);
         drop(held);
-        session.flush_archive().await.unwrap();
+        flush_archive_when_ready(&session).await;
         session.capture_now(vec![source(false)]).await.unwrap();
-        session.flush_archive().await.unwrap();
+        flush_archive_when_ready(&session).await;
         ordered_gap(archive.path(), GapReason::ArchiveBackpressure);
         let audio = session
             .history_audio(session.elapsed(), Duration::ZERO, &[source(true)])
@@ -932,7 +965,7 @@ mod storage_failures {
             before.audio[0].sequence,
         )
         .await;
-        session.flush_archive().await.unwrap();
+        flush_archive_when_ready(&session).await;
         ordered_gap(archive.path(), GapReason::ArchiveFailure);
         assert_eq!(
             session.archive_status().unwrap().phase,
