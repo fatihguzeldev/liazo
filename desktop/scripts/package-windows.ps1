@@ -110,8 +110,8 @@ try {
             $changedEnvironment['PATH'] = [Environment]::GetEnvironmentVariable('PATH', 'Process')
         }
         [Environment]::SetEnvironmentVariable('PATH', "$compilerDirectory;$env:PATH", 'Process')
-        $compiler = Get-Command cl.exe -CommandType Application -ErrorAction Stop
-        $linker = Get-Command link.exe -CommandType Application -ErrorAction Stop
+        $compiler = Get-Command cl.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        $linker = Get-Command link.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1
         $tools = (Resolve-Path (Join-Path $visualStudio 'VC/Tools/MSVC')).Path
         $compilerMatches = [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($compiler.Source), $compilerPath)
         $linkerMatches = [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($linker.Source), $linkerPath)
