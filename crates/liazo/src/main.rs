@@ -55,6 +55,12 @@ enum Command {
         seconds: Option<u64>,
         #[arg(long)]
         image_out: Option<PathBuf>,
+        #[arg(long, requires = "model")]
+        transcribe: Vec<String>,
+        #[arg(long, requires = "transcribe")]
+        model: Option<PathBuf>,
+        #[arg(long, default_value_t = 4)]
+        threads: u8,
     },
     Peers,
     Discover,
@@ -177,6 +183,9 @@ async fn run(cli: Cli) -> Result<()> {
             width,
             seconds,
             image_out,
+            transcribe,
+            model,
+            threads,
         } => {
             let _owner = profile.lock("receiver")?;
             let identity = profile.identity(&credentials)?;
@@ -221,6 +230,24 @@ async fn run(cli: Cli) -> Result<()> {
                     .collect::<std::result::Result<_, _>>()?,
             };
             session.configure(settings).await?;
+            if let Some(path) = model {
+                let selected = transcribe
+                    .iter()
+                    .map(|id| resolve(id))
+                    .collect::<std::result::Result<_, _>>()?;
+                let model = tokio::task::spawn_blocking(move || {
+                    liazo_transcription::WhisperModel::load(&path)
+                })
+                .await??;
+                session
+                    .start_transcription(
+                        model,
+                        threads,
+                        selected,
+                        liazo_transcription::streaming::StreamingSettings::default(),
+                    )
+                    .await?;
+            }
             println!(
                 "{}",
                 serde_json::json!({"event":"connected", "sources":sources.sources.len(), "issues":sources.issues})
@@ -238,7 +265,8 @@ async fn run(cli: Cli) -> Result<()> {
                         cursor = observation.cursor;
                         if let Some(path) = &image_out && let Some(bytes) = observation.images.first().and_then(|image| image.payload.as_ref()) { std::fs::write(path, bytes)?; }
                         println!("{}", serde_json::json!({"event":"observation", "cursor":cursor, "connection":observation.connection,
-                            "images":observation.images.len(), "audio":observation.audio.len(), "gaps":observation.gaps}));
+                            "images":observation.images.len(), "audio":observation.audio.len(), "gaps":observation.gaps,
+                            "transcript_updates":observation.transcripts.len(), "transcription":observation.transcription}));
                         if matches!(observation.connection, liazo_runtime::ConnectionState::Disconnected) { return Err("provider disconnected".into()); }
                     }
                 }

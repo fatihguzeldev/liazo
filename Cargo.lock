@@ -628,6 +628,7 @@ dependencies = [
  "liazo-core",
  "liazo-macos",
  "liazo-runtime",
+ "liazo-transcription",
  "liazo-transport",
  "security-framework",
  "serde_json",

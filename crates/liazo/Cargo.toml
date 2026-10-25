@@ -8,6 +8,7 @@ rust-version.workspace = true
 liazo-core = { path = "../core" }
 liazo-runtime = { path = "../runtime" }
 liazo-transport = { path = "../transport" }
+liazo-transcription = { path = "../transcription" }
 tokio = { workspace = true, features = ["signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 uuid.workspace = true
