@@ -1,32 +1,81 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { call, message } from "./api";
 import type { Api, Session } from "./api";
 import { Pairing } from "./Pairing";
+import {
+  forgetAddress,
+  rememberAddress,
+  rememberedAddress,
+  rememberedProvider,
+} from "./routing";
 
 export function Connection({
   connected,
+  session,
 }: {
   connected: (session: Session) => void;
+  session?: Session | null;
 }) {
   const [peers, setPeers] = useState<[string, string][]>([]);
-  const [peer, setPeer] = useState("");
-  const [address, setAddress] = useState("");
+  const [{ peer, address }, setTarget] = useState({
+    peer: "",
+    address: "",
+    edited: false,
+  });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [discovery, setDiscovery] = useState<Api["discovery"]>([]);
   const [searching, setSearching] = useState(false);
   const [searched, setSearched] = useState(false);
   const [pairOpen, setPairOpen] = useState(false);
+  const searchRevision = useRef(0);
   const route = (id: string, found = discovery) =>
     found.find((provider) => provider.advertised_fingerprint === id)
       ?.addresses[0] ?? "";
+  const knownAddress = (id: string) =>
+    !id
+      ? ""
+      : session?.provider === id && !session.pending
+        ? session.address
+        : rememberedAddress(id);
+  const discover = () => {
+    const revision = ++searchRevision.current;
+    setSearching(true);
+    setError("");
+    void call<Api["discovery"]>("discover")
+      .then((found) => {
+        if (revision !== searchRevision.current) return;
+        setDiscovery(found);
+        setSearched(true);
+        setTarget((target) =>
+          target.peer && !target.address && !target.edited
+            ? { ...target, address: route(target.peer, found) }
+            : target,
+        );
+      })
+      .catch((error) => {
+        if (revision === searchRevision.current) setError(message(error));
+      })
+      .finally(() => {
+        if (revision === searchRevision.current) setSearching(false);
+      });
+  };
+  const selectPeer = (id: string, selectedAddress?: string) => {
+    const address = selectedAddress ?? (knownAddress(id) || route(id));
+    setTarget({ peer: id, address, edited: false });
+    if (id && !address) discover();
+  };
   useEffect(() => {
     let alive = true;
     void call<[string, string][]>("peers")
       .then((peers) => {
         if (alive) {
           setPeers(peers);
-          setPeer(peers[0]?.[0] ?? "");
+          const preferred = session?.provider ?? rememberedProvider();
+          const initial = peers.some(([id]) => id === preferred)
+            ? preferred
+            : (peers[0]?.[0] ?? "");
+          selectPeer(initial);
           setPairOpen(peers.length === 0);
         }
       })
@@ -35,27 +84,14 @@ export function Connection({
       });
     return () => {
       alive = false;
+      searchRevision.current++;
     };
   }, []);
   return (
     <section className="connect-pane" aria-labelledby="connect-title">
       <h2 id="connect-title">connect a computer</h2>
       <div className="nearby">
-        <button
-          disabled={searching || busy}
-          onClick={() => {
-            setSearching(true);
-            setError("");
-            void call<Api["discovery"]>("discover")
-              .then((found) => {
-                setDiscovery(found);
-                setSearched(true);
-                if (peer && !address) setAddress(route(peer, found));
-              })
-              .catch((error) => setError(message(error)))
-              .finally(() => setSearching(false));
-          }}
-        >
+        <button disabled={searching || busy} onClick={discover}>
           {searching ? "searching…" : "find nearby"}
         </button>
         {searched && !discovery.length && (
@@ -72,8 +108,7 @@ export function Connection({
                 key={`${provider.advertised_fingerprint}/${address}`}
                 title={provider.advertised_fingerprint}
                 onClick={() => {
-                  setPeer(known?.[0] ?? "");
-                  setAddress(known ? address : "");
+                  selectPeer(known?.[0] ?? "", known ? address : "");
                   if (!known) setPairOpen(true);
                 }}
               >
@@ -89,7 +124,10 @@ export function Connection({
           setBusy(true);
           setError("");
           void call<Session>("connect", { peer, address })
-            .then(connected)
+            .then((session) => {
+              rememberAddress(session.provider, session.address);
+              connected(session);
+            })
             .catch((error) => setError(message(error)))
             .finally(() => setBusy(false));
         }}
@@ -98,10 +136,7 @@ export function Connection({
           computer
           <select
             value={peer}
-            onChange={(event) => {
-              setPeer(event.target.value);
-              setAddress(route(event.target.value));
-            }}
+            onChange={(event) => selectPeer(event.target.value)}
             disabled={busy}
           >
             <option value="" disabled>
@@ -118,12 +153,19 @@ export function Connection({
           address
           <input
             value={address}
-            onChange={(event) => setAddress(event.target.value)}
-            placeholder="192.168.1.10:45810"
+            onChange={(event) => {
+              const address = event.target.value;
+              setTarget((target) => ({
+                ...target,
+                address,
+                edited: true,
+              }));
+            }}
+            placeholder="ip:port"
             required
             autoCapitalize="none"
             spellCheck={false}
-            disabled={busy}
+            disabled={busy || !peer}
           />
         </label>
         <button className="primary" disabled={busy || !peer}>
@@ -139,9 +181,9 @@ export function Connection({
             setError("");
             void call("forget", { peer })
               .then(() => {
+                forgetAddress(peer);
                 setPeers((old) => old.filter(([id]) => id !== peer));
-                setPeer("");
-                setAddress("");
+                setTarget({ peer: "", address: "", edited: false });
                 setPairOpen(true);
               })
               .catch((error) => setError(message(error)))
@@ -162,8 +204,7 @@ export function Connection({
               ...old.filter(([id]) => id !== entry[0]),
               entry,
             ]);
-            setPeer(entry[0]);
-            setAddress(route(entry[0]));
+            selectPeer(entry[0]);
             setPairOpen(false);
           }}
         />

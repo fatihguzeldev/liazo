@@ -64,14 +64,7 @@ export function Pairing({
           disabled={busy}
         />
       </label>
-      <button disabled={busy}>
-        {busy ? "waiting for approval…" : "request pairing"}
-      </button>
-      {busy && (
-        <p className="muted" role="status">
-          approve on the other computer
-        </p>
-      )}
+      <button disabled={busy}>{busy ? "pairing…" : "pair"}</button>
       {error && (
         <p className="error" role="alert">
           {error}

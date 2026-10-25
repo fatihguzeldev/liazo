@@ -46,11 +46,32 @@ test.beforeEach(async ({ page }) => {
     for (let index = 58; index < wav.byteLength; index += 4)
       wave.setFloat32(index, 0.25, true);
     const state = {
-      connected: !new URL(location.href).searchParams.has("unpaired"),
+      connected:
+        !new URL(location.href).searchParams.has("unpaired") &&
+        !new URL(location.href).searchParams.has("idle"),
       peers: new URL(location.href).searchParams.has("unpaired")
         ? ([] as [string, string][])
-        : ([["a".repeat(64), "fixture mac"]] as [string, string][]),
+        : ([
+            ["a".repeat(64), "fixture mac"],
+            ...(new URL(location.href).searchParams.has("multi")
+              ? [["b".repeat(64), "second mac"]]
+              : []),
+          ] as [string, string][]),
+      provider: "a".repeat(64),
+      address: "127.0.0.1:45810",
+      failConnect: false,
+      discoveryHeld: false,
+      discovery: new URL(location.href).searchParams.has("nearby-empty")
+        ? []
+        : [
+            {
+              name: "untrusted name",
+              addresses: ["192.168.1.10:45810"],
+              advertised_fingerprint: "b".repeat(64),
+            },
+          ],
       approved: false,
+      pairFingerprint: "b".repeat(64),
       rawAudio: [] as (typeof audio)[],
       retainedAudio: false,
       audioExpired: false,
@@ -67,7 +88,7 @@ test.beforeEach(async ({ page }) => {
       modelReady: false,
       denied: false,
       lastDenied: false,
-      stopped: false,
+      stopped: new URL(location.href).searchParams.has("stopped"),
       disconnected: new URL(location.href).searchParams.has("pending"),
       pending: new URL(location.href).searchParams.has("pending"),
       cursor: 2,
@@ -191,7 +212,10 @@ test.beforeEach(async ({ page }) => {
         state.calls.push({ name, args: input });
         if (name === "status" || name === "connect") {
           if (name === "connect") {
+            if (state.failConnect) throw new Error("fixture connection failed");
             state.connected = true;
+            state.provider = input.peer;
+            state.address = input.address;
             state.disconnected = false;
             state.pending = false;
             state.stopped = false;
@@ -201,8 +225,8 @@ test.beforeEach(async ({ page }) => {
                 binding,
                 pending: state.pending,
                 recovery: state.recovery,
-                provider: "a".repeat(64),
-                address: "127.0.0.1:45810",
+                provider: state.provider,
+                address: state.address,
                 connection: state.stopped
                   ? "stopped"
                   : state.disconnected
@@ -371,23 +395,21 @@ test.beforeEach(async ({ page }) => {
           return { cancelled: true };
         }
         if (name === "transcribe") return { started: true };
-        if (name === "discover")
-          return [
-            {
-              name: "untrusted name",
-              addresses: ["192.168.1.10:45810"],
-              advertised_fingerprint: "b".repeat(64),
-            },
-          ];
+        if (name === "discover") {
+          while (state.discoveryHeld)
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          return state.discovery;
+        }
         if (name === "pair") {
           while (!state.approved)
             await new Promise((resolve) => setTimeout(resolve, 10));
-          const entry: [string, string] = ["b".repeat(64), input.label];
+          const entry: [string, string] = [state.pairFingerprint, input.label];
           state.peers.push(entry);
           return entry;
         }
         if (name === "forget") {
           state.peers = state.peers.filter(([peer]) => peer !== input.peer);
+          if (state.provider === input.peer) state.connected = false;
           return { removed: true };
         }
         if (name === "sources")
@@ -499,7 +521,327 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
-test("an unpaired computer is discovered, approved, connected and forgotten", async ({
+test("connection routes: a stopped session restores its computer and address", async ({
+  page,
+}) => {
+  await page.goto("/?stopped");
+  await expect(
+    page.getByRole("button", { name: "stop", exact: true }),
+  ).toBeDisabled();
+  await page.getByRole("button", { name: "connect", exact: true }).click();
+  await expect(
+    page.getByRole("combobox", { name: "computer", exact: true }),
+  ).toHaveValue("a".repeat(64));
+  await expect(page.getByLabel("address", { exact: true })).toHaveValue(
+    "127.0.0.1:45810",
+  );
+});
+
+test("connection routes: successful addresses survive pane remount and page reload", async ({
+  page,
+}) => {
+  await page.goto("/?idle");
+  await expect(
+    page.getByRole("combobox", { name: "computer", exact: true }),
+  ).toHaveValue("a".repeat(64));
+  await page.getByLabel("address", { exact: true }).fill("100.64.0.10:45810");
+  await page
+    .locator(".connect-pane")
+    .getByRole("button", { name: "connect", exact: true })
+    .click();
+  await expect(
+    page.getByRole("img", { name: "fixture display" }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "connect", exact: true }).click();
+  await expect(page.getByLabel("address", { exact: true })).toHaveValue(
+    "100.64.0.10:45810",
+  );
+  await page.getByRole("button", { name: "back", exact: true }).click();
+  await page.reload();
+  await expect(page.getByLabel("address", { exact: true })).toHaveValue(
+    "100.64.0.10:45810",
+  );
+});
+
+test("connection routes: a failed manual address does not replace the last successful address", async ({
+  page,
+}) => {
+  await page.goto("/?idle");
+  await expect(
+    page.getByRole("combobox", { name: "computer", exact: true }),
+  ).toHaveValue("a".repeat(64));
+  await page.getByLabel("address", { exact: true }).fill("100.64.0.10:45810");
+  await page
+    .locator(".connect-pane")
+    .getByRole("button", { name: "connect", exact: true })
+    .click();
+  await expect(
+    page.getByRole("img", { name: "fixture display" }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "connect", exact: true }).click();
+  await page.evaluate(() => {
+    (window as any).fixture.failConnect = true;
+  });
+  await page.getByLabel("address", { exact: true }).fill("100.64.0.99:45810");
+  await page
+    .locator(".connect-pane")
+    .getByRole("button", { name: "connect", exact: true })
+    .click();
+  await expect(page.getByRole("alert")).toHaveText("fixture connection failed");
+  await page.reload();
+  await expect(page.getByLabel("address", { exact: true })).toHaveValue(
+    "100.64.0.10:45810",
+  );
+});
+
+test("connection routes: addresses stay with their peer and forgetting removes the saved route", async ({
+  page,
+}) => {
+  await page.goto("/?idle&multi&nearby-empty");
+  const computer = page.getByRole("combobox", {
+    name: "computer",
+    exact: true,
+  });
+  const address = page.getByLabel("address", { exact: true });
+  await expect(computer).toHaveValue("a".repeat(64));
+  await address.fill("100.64.0.10:45810");
+  await page
+    .locator(".connect-pane")
+    .getByRole("button", { name: "connect", exact: true })
+    .click();
+  await expect(
+    page.getByRole("img", { name: "fixture display" }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "connect", exact: true }).click();
+  await computer.selectOption("b".repeat(64));
+  await expect(address).toHaveValue("");
+  await address.fill("100.64.0.20:45810");
+  await page
+    .locator(".connect-pane")
+    .getByRole("button", { name: "connect", exact: true })
+    .click();
+  await expect(
+    page.getByRole("img", { name: "fixture display" }),
+  ).toBeVisible();
+  await page.reload();
+  await expect(computer).toHaveValue("b".repeat(64));
+  await expect(address).toHaveValue("100.64.0.20:45810");
+  await computer.selectOption("a".repeat(64));
+  await expect(address).toHaveValue("100.64.0.10:45810");
+  await computer.selectOption("b".repeat(64));
+  await page.getByRole("button", { name: "forget this computer" }).click();
+  await expect(
+    page.getByRole("button", { name: "stop", exact: true }),
+  ).toHaveCount(0);
+  await page.evaluate(() => {
+    (window as any).fixture.approved = true;
+  });
+  await page
+    .getByLabel("pair code", { exact: true })
+    .fill("fixture-invitation");
+  await page.getByRole("button", { name: "pair", exact: true }).click();
+  await expect(computer).toHaveValue("b".repeat(64));
+  await expect(address).toHaveValue("");
+});
+
+test("connection routes: corrupt stored routes are ignored", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    localStorage.setItem(`liazo.address.${"a".repeat(64)}`, "not an endpoint");
+    localStorage.setItem("liazo.last-provider", "unpaired-fingerprint");
+  });
+  await page.goto("/?idle");
+  await expect(
+    page.getByRole("combobox", { name: "computer", exact: true }),
+  ).toHaveValue("a".repeat(64));
+  await expect(page.getByLabel("address", { exact: true })).toHaveValue("");
+  await page.getByLabel("address", { exact: true }).fill("100.64.0.10:45810");
+  await page
+    .locator(".connect-pane")
+    .getByRole("button", { name: "connect", exact: true })
+    .click();
+  await expect(
+    page.getByRole("img", { name: "fixture display" }),
+  ).toBeVisible();
+});
+
+test("connection routes: unavailable storage does not prevent connecting", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    Object.defineProperty(window, "localStorage", {
+      get() {
+        throw new DOMException("storage denied", "SecurityError");
+      },
+    });
+  });
+  await page.goto("/?idle");
+  await expect(
+    page.getByRole("combobox", { name: "computer", exact: true }),
+  ).toHaveValue("a".repeat(64));
+  await page.getByLabel("address", { exact: true }).fill("100.64.0.10:45810");
+  await page
+    .locator(".connect-pane")
+    .getByRole("button", { name: "connect", exact: true })
+    .click();
+  await expect(
+    page.getByRole("img", { name: "fixture display" }),
+  ).toBeVisible();
+});
+
+test("connection routes: quota failures keep the latest successful address in the current window", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    localStorage.setItem(
+      `liazo.address.${"a".repeat(64)}`,
+      "100.64.0.10:45810",
+    );
+    localStorage.setItem("liazo.last-provider", "a".repeat(64));
+    Storage.prototype.setItem = () => {
+      throw new DOMException("full", "QuotaExceededError");
+    };
+  });
+  await page.goto("/?idle&multi&nearby-empty");
+  const computer = page.getByRole("combobox", {
+    name: "computer",
+    exact: true,
+  });
+  const address = page.getByLabel("address", { exact: true });
+  await expect(address).toHaveValue("100.64.0.10:45810");
+  await address.fill("100.64.0.11:45810");
+  await page
+    .locator(".connect-pane")
+    .getByRole("button", { name: "connect", exact: true })
+    .click();
+  await expect(
+    page.getByRole("img", { name: "fixture display" }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "connect", exact: true }).click();
+  await computer.selectOption("b".repeat(64));
+  await address.fill("100.64.0.20:45810");
+  await page
+    .locator(".connect-pane")
+    .getByRole("button", { name: "connect", exact: true })
+    .click();
+  await expect(
+    page.getByRole("img", { name: "fixture display" }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "connect", exact: true }).click();
+  await computer.selectOption("a".repeat(64));
+  await expect(address).toHaveValue("100.64.0.11:45810");
+});
+
+test("connection routes: failed storage removal does not resurrect a forgotten address", async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    localStorage.setItem(
+      `liazo.address.${"a".repeat(64)}`,
+      "100.64.0.10:45810",
+    );
+    localStorage.setItem("liazo.last-provider", "a".repeat(64));
+    Storage.prototype.removeItem = () => {
+      throw new DOMException("storage denied", "SecurityError");
+    };
+  });
+  await page.goto("/?idle&nearby-empty");
+  await expect(page.getByLabel("address", { exact: true })).toHaveValue(
+    "100.64.0.10:45810",
+  );
+  await page.getByRole("button", { name: "forget this computer" }).click();
+  await page.evaluate(() => {
+    const fixture = (window as any).fixture;
+    fixture.pairFingerprint = "a".repeat(64);
+    fixture.approved = true;
+  });
+  await page
+    .getByLabel("pair code", { exact: true })
+    .fill("fixture-invitation");
+  await page.getByRole("button", { name: "pair", exact: true }).click();
+  await expect(
+    page.getByRole("combobox", { name: "computer", exact: true }),
+  ).toHaveValue("a".repeat(64));
+  await expect(page.getByLabel("address", { exact: true })).toHaveValue("");
+});
+
+test("connection routes: late discovery preserves edits and the currently selected peer", async ({
+  page,
+}) => {
+  await page.goto("/?idle&multi&nearby-empty");
+  const computer = page.getByRole("combobox", {
+    name: "computer",
+    exact: true,
+  });
+  const address = page.getByLabel("address", { exact: true });
+  await expect(computer).toHaveValue("a".repeat(64));
+  await page.evaluate(() => {
+    const fixture = (window as any).fixture;
+    fixture.discoveryHeld = true;
+    fixture.discovery = [
+      {
+        name: "fixture mac",
+        addresses: ["192.168.1.10:45810"],
+        advertised_fingerprint: "a".repeat(64),
+      },
+    ];
+  });
+  await page.getByRole("button", { name: "find nearby" }).click();
+  await address.fill("100.64.0.10:45810");
+  await page.evaluate(() => {
+    (window as any).fixture.discoveryHeld = false;
+  });
+  await expect(page.getByRole("button", { name: "find nearby" })).toBeEnabled();
+  await expect(address).toHaveValue("100.64.0.10:45810");
+  await computer.selectOption("a".repeat(64));
+  await address.fill("");
+  await page.evaluate(() => {
+    (window as any).fixture.discoveryHeld = true;
+  });
+  await page.getByRole("button", { name: "find nearby" }).click();
+  await computer.selectOption("b".repeat(64));
+  await page.evaluate(() => {
+    (window as any).fixture.discoveryHeld = false;
+  });
+  await expect(page.getByRole("button", { name: "find nearby" })).toBeEnabled();
+  await expect(computer).toHaveValue("b".repeat(64));
+  await expect(address).toHaveValue("");
+});
+
+test("connection routes: pairing uses a matched media route and never the invitation port", async ({
+  page,
+}) => {
+  await page.goto("/?unpaired");
+  await page.getByRole("button", { name: "find nearby" }).click();
+  await expect(
+    page.getByRole("button", { name: "new computer · 192.168.1.10:45810" }),
+  ).toBeVisible();
+  const invitation = `liazo1.${Buffer.from(JSON.stringify({ version: 1, address: "192.168.1.10:49999", certificate: "fixture", token: "fixture" })).toString("base64url")}`;
+  await page.getByLabel("pair code", { exact: true }).fill(invitation);
+  await page.evaluate(() => {
+    (window as any).fixture.approved = true;
+  });
+  await page.getByRole("button", { name: "pair", exact: true }).click();
+  await expect(
+    page.getByRole("combobox", { name: "computer", exact: true }),
+  ).toHaveValue("b".repeat(64));
+  await expect(page.getByLabel("address", { exact: true })).toHaveValue(
+    "192.168.1.10:45810",
+  );
+  await page.goto("/?unpaired&nearby-empty");
+  await page.getByLabel("pair code", { exact: true }).fill(invitation);
+  await page.evaluate(() => {
+    (window as any).fixture.approved = true;
+  });
+  await page.getByRole("button", { name: "pair", exact: true }).click();
+  await expect(
+    page.getByRole("combobox", { name: "computer", exact: true }),
+  ).toHaveValue("b".repeat(64));
+  await expect(page.getByLabel("address", { exact: true })).toHaveValue("");
+});
+
+test("an unpaired computer is discovered, paired, connected and forgotten", async ({
   page,
 }) => {
   await page.goto("/?unpaired");
@@ -510,8 +852,9 @@ test("an unpaired computer is discovered, approved, connected and forgotten", as
   await page
     .getByLabel("pair code", { exact: true })
     .fill("fixture-invitation");
-  await page.getByRole("button", { name: "request pairing" }).click();
-  await expect(page.getByText("approve on the other computer")).toBeVisible();
+  await page.getByRole("button", { name: "pair", exact: true }).click();
+  await expect(page.getByLabel("pair code", { exact: true })).toBeDisabled();
+  await expect(page.getByText("approve on the other computer")).toHaveCount(0);
   await expect(
     page.getByRole("button", { name: "connect", exact: true }),
   ).toBeDisabled();
@@ -534,7 +877,7 @@ test("an unpaired computer is discovered, approved, connected and forgotten", as
     page.getByRole("combobox", { name: "computer", exact: true }),
   ).toHaveValue("");
   await expect(
-    page.getByRole("button", { name: "request pairing" }),
+    page.getByRole("button", { name: "pair", exact: true }),
   ).toBeVisible();
 });
 

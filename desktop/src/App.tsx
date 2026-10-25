@@ -9,6 +9,7 @@ import type { Past } from "./History";
 import { useSession } from "./useSession";
 import { useHost } from "./useHost";
 import { Recordings } from "./Recordings";
+import { rememberAddress } from "./routing";
 
 export function App() {
   const host = useHost();
@@ -21,6 +22,11 @@ export function App() {
   const [past, setPast] = useState<Past | null>(null);
   const [error, setError] = useState("");
   const [stopping, setStopping] = useState(false);
+  useEffect(() => {
+    if (session && !session.pending) {
+      rememberAddress(session.provider, session.address);
+    }
+  }, [session?.provider, session?.address, session?.pending]);
   const live = useSession(
     session?.pending ? null : session,
     preview,
@@ -175,6 +181,7 @@ export function App() {
       ) : !session || connecting ? (
         <main className="connection-main">
           <Connection
+            session={session}
             connected={(next) => {
               host.connected(next);
               setConnecting(false);
