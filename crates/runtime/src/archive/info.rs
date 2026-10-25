@@ -11,6 +11,7 @@ pub struct ArchiveInfo {
     pub provider: String,
     pub wall_anchor_unix_ms: u64,
     pub latest_ns: u64,
+    pub retention_floor_ns: u64,
     pub closed_at_ns: Option<u64>,
     pub writer_active: bool,
     pub limits: ArchiveLimits,
@@ -134,6 +135,11 @@ impl ArchiveInfo {
             provider: binding.provider,
             wall_anchor_unix_ms: binding.wall_anchor_unix_ms,
             latest_ns,
+            retention_floor_ns: meta("retention_floor")?
+                .map(|value| value.parse::<u64>())
+                .transpose()
+                .map_err(|_| ArchiveError::InvalidPayload)?
+                .unwrap_or(0),
             closed_at_ns,
             writer_active: meta("writer_active")?.is_some_and(|value| value == "1"),
             limits,
