@@ -104,6 +104,8 @@ pub enum Event {
         source: SourceKey,
         revision: u64,
         observed_ns: u64,
+        #[serde(default)]
+        capture_started_ns: Option<u64>,
         failure: Option<Failure>,
     },
 }
@@ -187,10 +189,17 @@ impl Reply {
 impl Event {
     pub fn validate(&self) -> Result<(), ProtocolError> {
         if let Self::SourceStatus {
-            source, failure, ..
+            source,
+            failure,
+            observed_ns,
+            capture_started_ns,
+            ..
         } = self
         {
             source.validate()?;
+            if capture_started_ns.is_some_and(|started| started > *observed_ns) {
+                return Err(ProtocolError("invalid capture failure timing"));
+            }
             if let Some(failure) = failure {
                 failure.validate()?;
             }

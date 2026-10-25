@@ -124,6 +124,7 @@ struct Image {
 }
 struct Health {
     observed_ns: u64,
+    capture_started_ns: Option<u64>,
     failure: Failure,
 }
 
@@ -280,7 +281,11 @@ impl LiveState {
         sources
             .iter()
             .filter_map(|source| self.failures.get(source))
-            .find(|health| health.observed_ns >= not_before)
+            .find(|health| {
+                health
+                    .capture_started_ns
+                    .is_some_and(|started| started >= not_before)
+            })
             .map(|health| health.failure.clone())
     }
     fn prune(&mut self) {
@@ -457,6 +462,7 @@ impl LiveState {
             source,
             revision,
             observed_ns,
+            capture_started_ns,
             failure,
         } = event
         {
@@ -496,6 +502,7 @@ impl LiveState {
                     source,
                     Health {
                         observed_ns,
+                        capture_started_ns,
                         failure,
                     },
                 );
@@ -644,6 +651,66 @@ impl LiveState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_late_failure_from_an_earlier_capture_cannot_fail_a_new_fresh_request() {
+        let source = SourceKey {
+            id: "display:fixture".into(),
+            generation: Uuid::new_v4(),
+        };
+        let mut state = LiveState::new(SessionBinding {
+            session: Uuid::new_v4(),
+            epoch: Uuid::new_v4(),
+        });
+        state.applied(
+            1,
+            CaptureSettings {
+                images: vec![liazo_core::protocol::ImageSubscription {
+                    source: source.clone(),
+                    interval_ms: 500,
+                    max_width: None,
+                    crop: None,
+                    format: liazo_core::protocol::ImageFormat::Png,
+                    quality: 90,
+                    include_cursor: false,
+                }],
+                audio: vec![],
+            },
+            0,
+        );
+        let error = Failure::new(
+            liazo_core::control::FailureCode::Unavailable,
+            "capture failed",
+        );
+        state.event(
+            Event::SourceStatus {
+                source: source.clone(),
+                revision: 1,
+                observed_ns: 200,
+                capture_started_ns: Some(50),
+                failure: Some(error.clone()),
+            },
+            200,
+        );
+        // Still visible as source health, but it predates the fresh request at 100.
+        assert_eq!(state.observe(0, false, &[], 200).failures.len(), 1);
+        assert!(
+            state
+                .capture_failure(std::slice::from_ref(&source), 100)
+                .is_none()
+        );
+        state.event(
+            Event::SourceStatus {
+                source: source.clone(),
+                revision: 1,
+                observed_ns: 300,
+                capture_started_ns: Some(250),
+                failure: Some(error),
+            },
+            300,
+        );
+        assert!(state.capture_failure(&[source], 100).is_some());
+    }
     #[test]
     fn source_timestamps_keep_clock_uncertainty_when_projected_and_aged() {
         let clock = ClockMap::new(10_000_000, 20_000_000, 1_002_000_000, 1_004_000_000).unwrap();

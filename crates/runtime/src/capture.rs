@@ -40,11 +40,18 @@ pub(crate) struct CaptureOutput {
 }
 
 impl CaptureOutput {
-    fn status(&self, source: SourceKey, revision: u64, failure: Option<Failure>) {
+    fn status(
+        &self,
+        source: SourceKey,
+        revision: u64,
+        capture_started_ns: Option<u64>,
+        failure: Option<Failure>,
+    ) {
         let event = Event::SourceStatus {
             source,
             revision,
             observed_ns: self.backend.clock_ns(),
+            capture_started_ns,
             failure,
         };
         if let Ok(frame) = Frame::new(Header::Event(event), Default::default()) {
@@ -97,6 +104,7 @@ impl CaptureOutput {
                 previous = None;
             }
             sequence += 1;
+            let capture_started_ns = self.backend.clock_ns();
             let captured = tokio::select! {
                 _ = cancel.cancelled() => break,
                 result = timeout(Duration::from_secs(3), self.backend.image(&current.image, previous, sequence, current.revision)) => {
@@ -119,13 +127,17 @@ impl CaptureOutput {
                             Err(error) => self.status(
                                 current.image.source.clone(),
                                 current.revision,
+                                Some(capture_started_ns),
                                 Some(error),
                             ),
                         }
                     }
-                    Err(error) => {
-                        self.status(current.image.source.clone(), current.revision, Some(error))
-                    }
+                    Err(error) => self.status(
+                        current.image.source.clone(),
+                        current.revision,
+                        Some(capture_started_ns),
+                        Some(error),
+                    ),
                 }
             }
             deadline = (started + Duration::from_millis(u64::from(current.image.interval_ms)))
@@ -177,7 +189,7 @@ impl CaptureOutput {
                         "audio start timed out",
                     ),
                 };
-                self.status(source.clone(), revision, Some(failure));
+                self.status(source.clone(), revision, None, Some(failure));
                 return;
             }
         };
@@ -200,7 +212,7 @@ impl CaptureOutput {
                 }
                 Ok(None) => break,
                 Err(error) => {
-                    self.status(source.clone(), revision, Some(error));
+                    self.status(source.clone(), revision, None, Some(error));
                     break;
                 }
             }
