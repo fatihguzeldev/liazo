@@ -28,7 +28,9 @@ test.beforeEach(async ({ page }) => {
         ? ([] as [string, string][])
         : ([["a".repeat(64), "fixture mac"]] as [string, string][]),
       approved: false,
-      modelPhase: "missing",
+      modelPhase: new URL(location.href).searchParams.has("verifying")
+        ? "verifying"
+        : "missing",
       modelReady: false,
       denied: false,
       lastDenied: false,
@@ -404,11 +406,20 @@ test("source removal, permission errors and partial-to-final speech use the shar
 test("speech waits for model verification and a download can be cancelled", async ({
   page,
 }) => {
-  await page.goto("/");
+  await page.goto("/?verifying");
   const speech = page
     .locator("details")
     .filter({ has: page.locator("summary", { hasText: /^speech$/ }) });
   await speech.locator("summary").click();
+  await expect(
+    speech.getByRole("button", { name: "download base", exact: true }),
+  ).toBeDisabled();
+  await page.evaluate(() => {
+    (window as any).fixture.modelPhase = "missing";
+  });
+  await expect(
+    speech.getByRole("button", { name: "download base", exact: true }),
+  ).toBeEnabled();
   await speech
     .getByRole("checkbox", { name: "fixture audio", exact: true })
     .check();

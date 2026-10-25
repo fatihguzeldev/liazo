@@ -165,7 +165,7 @@ impl Mcp {
             }
             "models" => {
                 let _: Empty = parse(arguments)?;
-                result(self.0.models().status().await.map_err(HostError::from)?)
+                result(self.0.models().status().await)
             }
             "model_install" => {
                 let args: ModelInstall = parse(arguments)?;

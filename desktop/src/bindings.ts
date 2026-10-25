@@ -33,7 +33,8 @@ export type GapReason =
   | "no_data"
   | "skipped_frames"
   | "capacity";
-export type ModelPhase = "missing" | "downloading" | "ready" | "failed";
+export type ModelPhase =
+  "verifying" | "missing" | "downloading" | "ready" | "failed";
 export type ArchivePhase = "recording" | "failed" | "stopping" | "stopped";
 export type ConnectionState =
   "connecting" | "connected" | "stopped" | "disconnected";

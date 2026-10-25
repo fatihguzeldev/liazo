@@ -3,13 +3,10 @@ use sha2::{Digest, Sha256};
 use std::{
     io::Read,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Once},
     time::Duration,
 };
-use tokio::{
-    io::AsyncWriteExt,
-    sync::{Mutex, OnceCell},
-};
+use tokio::{io::AsyncWriteExt, sync::Mutex};
 use tokio_util::sync::CancellationToken;
 
 const REVISION: &str = "5359861c739e955e79d9a303bcbc70fb988958b1";
@@ -37,6 +34,7 @@ const MODELS: [Definition; 2] = [
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelPhase {
+    Verifying,
     Missing,
     Downloading,
     Ready,
@@ -58,6 +56,8 @@ pub enum ModelError {
     Unknown,
     #[error("a model download is already running")]
     Busy,
+    #[error("speech models are still being verified")]
+    Verifying,
     #[error("model download failed; check the connection and retry")]
     Network,
     #[error("model verification failed")]
@@ -75,7 +75,7 @@ struct State {
 }
 struct Inner {
     root: PathBuf,
-    initialized: OnceCell<()>,
+    initialized: Once,
     state: Mutex<State>,
 }
 #[derive(Clone)]
@@ -85,19 +85,30 @@ impl ModelStore {
     pub fn new(root: PathBuf) -> Self {
         Self(Arc::new(Inner {
             root,
-            initialized: OnceCell::new(),
+            initialized: Once::new(),
             state: Mutex::new(State {
-                rows: vec![],
+                rows: MODELS
+                    .iter()
+                    .map(|model| ModelStatus {
+                        id: model.id.into(),
+                        bytes: model.bytes,
+                        sha256: model.sha256.into(),
+                        phase: ModelPhase::Verifying,
+                        received_bytes: 0,
+                        path: None,
+                        error: None,
+                    })
+                    .collect(),
                 active: None,
             }),
         }))
     }
-    async fn initialize(&self) -> Result<(), ModelError> {
-        self.0
-            .initialized
-            .get_or_try_init(|| async {
-                let root = self.0.root.clone();
-                let rows = tokio::task::spawn_blocking(move || {
+    fn initialize(&self) {
+        self.0.initialized.call_once(|| {
+            let store = self.clone();
+            tokio::spawn(async move {
+                let root = store.0.root.clone();
+                let result = tokio::task::spawn_blocking(move || {
                     std::fs::create_dir_all(&root)?;
                     for entry in std::fs::read_dir(&root)? {
                         let entry = entry?;
@@ -137,25 +148,36 @@ impl ModelStore {
                     )
                 })
                 .await
-                .map_err(|_| ModelError::Interrupted)??;
-                self.0.state.lock().await.rows = rows;
-                Ok(())
-            })
-            .await
-            .map(|_| ())
+                .map_err(|_| ModelError::Interrupted)
+                .and_then(|result| result);
+                let mut state = store.0.state.lock().await;
+                match result {
+                    Ok(rows) => state.rows = rows,
+                    Err(error) => {
+                        for row in &mut state.rows {
+                            row.phase = ModelPhase::Failed;
+                            row.error = Some(error.to_string());
+                        }
+                    }
+                }
+            });
+        });
     }
-    pub async fn status(&self) -> Result<Vec<ModelStatus>, ModelError> {
-        self.initialize().await?;
-        Ok(self.0.state.lock().await.rows.clone())
+    pub async fn status(&self) -> Vec<ModelStatus> {
+        self.initialize();
+        self.0.state.lock().await.rows.clone()
     }
     pub async fn install(&self, id: &str) -> Result<(), ModelError> {
         let model = MODELS
             .iter()
             .find(|model| model.id == id)
             .ok_or(ModelError::Unknown)?;
-        self.initialize().await?;
+        self.initialize();
         let mut state = self.0.state.lock().await;
         let index = MODELS.iter().position(|entry| entry.id == id).unwrap();
+        if state.rows[index].phase == ModelPhase::Verifying {
+            return Err(ModelError::Verifying);
+        }
         if state.rows[index].phase == ModelPhase::Ready {
             return Ok(());
         }
@@ -235,6 +257,7 @@ impl ModelStore {
         {
             return Err(ModelError::Verification);
         }
+        tokio::fs::create_dir_all(&self.0.root).await?;
         let temporary = Temporary(
             self.0
                 .root
@@ -337,6 +360,41 @@ mod tests {
         sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
     };
 
+    async fn initialized(store: &ModelStore) -> Vec<ModelStatus> {
+        tokio::time::timeout(Duration::from_secs(120), async {
+            loop {
+                let rows = store.status().await;
+                if rows.iter().all(|row| row.phase != ModelPhase::Verifying) {
+                    return rows;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+    #[tokio::test]
+    async fn status_returns_while_initial_verification_is_pending() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(root.path().to_owned());
+        assert!(
+            store
+                .status()
+                .await
+                .iter()
+                .all(|row| row.phase == ModelPhase::Verifying)
+        );
+        assert!(matches!(
+            store.install("base").await,
+            Err(ModelError::Verifying)
+        ));
+        assert!(
+            initialized(&store)
+                .await
+                .iter()
+                .all(|row| row.phase == ModelPhase::Missing)
+        );
+    }
     async fn response(body: Body) -> (reqwest::Response, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -364,7 +422,7 @@ mod tests {
     async fn only_complete_verified_bytes_replace_a_model_and_failed_parts_are_removed() {
         let root = tempfile::tempdir().unwrap();
         let store = ModelStore::new(root.path().to_owned());
-        store.initialize().await.unwrap();
+        initialized(&store).await;
         let (body, server) = response(Body::from("abc")).await;
         store
             .receive(&FIXTURE, body, &CancellationToken::new())
@@ -397,7 +455,7 @@ mod tests {
     async fn cancelling_a_stalled_body_releases_its_file_and_preserves_existing_models() {
         let root = tempfile::tempdir().unwrap();
         let store = ModelStore::new(root.path().to_owned());
-        store.initialize().await.unwrap();
+        initialized(&store).await;
         std::fs::write(root.path().join(FIXTURE.file), b"abc").unwrap();
         let body = Body::from_stream(
             stream::once(async { Ok::<_, std::io::Error>(Bytes::from_static(b"a")) })
@@ -409,7 +467,7 @@ mod tests {
         let downloading = store.clone();
         let task = tokio::spawn(async move { downloading.receive(&FIXTURE, body, &token).await });
         tokio::time::timeout(Duration::from_secs(2), async {
-            while store.status().await.unwrap()[0].received_bytes != 1 {
+            while store.status().await[0].received_bytes != 1 {
                 tokio::task::yield_now().await;
             }
         })
@@ -433,7 +491,7 @@ mod tests {
         std::fs::write(root.path().join(MODELS[0].file), b"not a model").unwrap();
         std::fs::write(root.path().join("download-interrupted.part"), b"partial").unwrap();
         let store = ModelStore::new(root.path().to_owned());
-        let rows = store.status().await.unwrap();
+        let rows = initialized(&store).await;
         assert!(rows[0].phase == ModelPhase::Failed && rows[0].path.is_none());
         assert!(rows[1].phase == ModelPhase::Missing);
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
@@ -446,11 +504,15 @@ mod tests {
     #[ignore = "downloads the actual 148 MB pinned base model over HTTPS"]
     async fn pinned_upstream_download_produces_a_verified_model_after_restart() {
         let root = tempfile::tempdir().unwrap();
-        let store = ModelStore::new(root.path().to_owned());
+        let path = std::env::var_os("LIAZO_TEST_MODEL_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| root.path().join("şö語"));
+        let store = ModelStore::new(path.clone());
+        initialized(&store).await;
         store.install("base").await.unwrap();
         tokio::time::timeout(Duration::from_secs(610), async {
             loop {
-                let rows = store.status().await.unwrap();
+                let rows = store.status().await;
                 if rows[0].phase != ModelPhase::Downloading {
                     assert!(rows[0].phase == ModelPhase::Ready, "{:?}", rows[0].error);
                     break;
@@ -460,7 +522,7 @@ mod tests {
         })
         .await
         .unwrap();
-        let restarted = ModelStore::new(root.path().to_owned());
-        assert!(restarted.status().await.unwrap()[0].phase == ModelPhase::Ready);
+        let restarted = ModelStore::new(path);
+        assert!(initialized(&restarted).await[0].phase == ModelPhase::Ready);
     }
 }

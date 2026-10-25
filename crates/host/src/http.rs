@@ -269,7 +269,7 @@ async fn peers(State(state): State<HttpState>) -> Json<Vec<(String, String)>> {
 async fn models(
     State(state): State<HttpState>,
 ) -> Result<Json<Vec<crate::models::ModelStatus>>, HostError> {
-    Ok(Json(state.host.models().status().await?))
+    Ok(Json(state.host.models().status().await))
 }
 async fn model_install(
     State(state): State<HttpState>,

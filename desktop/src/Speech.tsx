@@ -28,7 +28,12 @@ export function Speech({
           const rows = await call<Api["models"]>("models");
           if (!alive) break;
           setModels(rows);
-          if (!rows.some((row) => row.phase === "downloading")) break;
+          if (
+            !rows.some(
+              (row) => row.phase === "downloading" || row.phase === "verifying",
+            )
+          )
+            break;
         } catch (error) {
           if (alive) setError(message(error));
           break;
@@ -100,7 +105,11 @@ export function Speech({
               {models.map((model) => (
                 <option value={model.id} key={model.id}>
                   {model.id} · {Math.ceil(model.bytes / 1_000_000)} mb
-                  {model.phase === "ready" ? " · ready" : ""}
+                  {model.phase === "ready"
+                    ? " · ready"
+                    : model.phase === "verifying"
+                      ? " · verifying…"
+                      : ""}
                 </option>
               ))}
               {!models.length && <option value="base">loading…</option>}
@@ -122,7 +131,9 @@ export function Speech({
               {selected && selected.phase !== "ready" && (
                 <button
                   type="button"
-                  disabled={busy || !!downloading}
+                  disabled={
+                    busy || !!downloading || selected.phase === "verifying"
+                  }
                   onClick={() =>
                     void action("model-install", {
                       id: choice,
