@@ -70,11 +70,14 @@ export interface DesktopApi {
   capture_request: Capture;
   configure_request: Configure;
   connect_request: Connect;
+  discovery: DiscoveredProvider[];
+  forget_request: Forget;
   history: HistoryResponse;
   history_request: History;
   limits_request: Limits;
   observation: ObservationResponse;
   observe_request: Observe;
+  pair_request: Pair;
   scope: Scope;
   session: SessionSummary | null;
   sources: SourceSnapshot;
@@ -119,6 +122,14 @@ export interface CropPixels {
 }
 export interface Connect {
   address: string;
+  peer: string;
+}
+export interface DiscoveredProvider {
+  addresses: string[];
+  advertised_fingerprint: string;
+  name: string;
+}
+export interface Forget {
   peer: string;
 }
 export interface HistoryResponse {
@@ -181,7 +192,7 @@ export interface ImageMeta {
     number,
     number,
     number,
-    number,
+    number
   ];
   format: ImageFormat;
   height: number;
@@ -294,6 +305,11 @@ export interface Observe {
   current: boolean;
   sources: SourceKey[];
   wait_ms: number;
+}
+export interface Pair {
+  code: string;
+  label: string;
+  name: string;
 }
 export interface Scope {
   binding: SessionBinding;

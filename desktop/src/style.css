@@ -340,6 +340,10 @@ footer {
 .connect-pane .error {
   margin-top: 1rem;
 }
+.nearby { display: flex; flex-direction: column; gap: .5rem; margin-bottom: 1rem; }
+.nearby-computer { text-align: left; white-space: normal; overflow-wrap: anywhere; }
+.forget { margin-top: .75rem; }
+.connection-main { overflow-y: auto; }
 .error-banner {
   display: flex;
   justify-content: space-between;

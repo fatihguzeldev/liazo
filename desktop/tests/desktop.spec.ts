@@ -23,6 +23,11 @@ test.beforeEach(async ({ page }) => {
       (character) => character.charCodeAt(0),
     ).buffer;
     const state = {
+      connected: !new URL(location.href).searchParams.has("unpaired"),
+      peers: new URL(location.href).searchParams.has("unpaired")
+        ? ([] as [string, string][])
+        : ([["a".repeat(64), "fixture mac"]] as [string, string][]),
+      approved: false,
       denied: false,
       lastDenied: false,
       stopped: false,
@@ -139,14 +144,37 @@ test.beforeEach(async ({ page }) => {
         const name = args.name;
         const input = args.args;
         state.calls.push({ name, args: input });
-        if (name === "status")
-          return {
-            binding,
-            provider: "a".repeat(64),
-            address: "127.0.0.1:45810",
-            connection: state.stopped ? "stopped" : "connected",
-          };
-        if (name === "peers") return [["a".repeat(64), "fixture mac"]];
+        if (name === "status" || name === "connect") {
+          if (name === "connect") state.connected = true;
+          return state.connected
+            ? {
+                binding,
+                provider: "a".repeat(64),
+                address: "127.0.0.1:45810",
+                connection: state.stopped ? "stopped" : "connected",
+              }
+            : null;
+        }
+        if (name === "peers") return state.peers;
+        if (name === "discover")
+          return [
+            {
+              name: "untrusted name",
+              addresses: ["192.168.1.10:45810"],
+              advertised_fingerprint: "b".repeat(64),
+            },
+          ];
+        if (name === "pair") {
+          while (!state.approved)
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          const entry: [string, string] = ["b".repeat(64), input.label];
+          state.peers.push(entry);
+          return entry;
+        }
+        if (name === "forget") {
+          state.peers = state.peers.filter(([peer]) => peer !== input.peer);
+          return { removed: true };
+        }
         if (name === "sources")
           return {
             revision: state.denied ? 2 : 1,
@@ -250,6 +278,68 @@ test.beforeEach(async ({ page }) => {
       },
     };
   });
+});
+
+test("an unpaired computer is discovered, approved, connected and forgotten", async ({
+  page,
+}) => {
+  await page.goto("/?unpaired");
+  await page.getByRole("button", { name: "find nearby" }).click();
+  await page
+    .getByRole("button", { name: "new computer · 192.168.1.10:45810" })
+    .click();
+  await page
+    .getByLabel("pair code", { exact: true })
+    .fill("fixture-invitation");
+  await page.getByRole("button", { name: "request pairing" }).click();
+  await expect(page.getByText("approve on the other computer")).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "connect", exact: true }),
+  ).toBeDisabled();
+  await page.evaluate(() => {
+    (window as any).fixture.approved = true;
+  });
+  await expect(
+    page.getByRole("combobox", { name: "computer", exact: true }),
+  ).toHaveValue("b".repeat(64));
+  await expect(page.getByLabel("address", { exact: true })).toHaveValue(
+    "192.168.1.10:45810",
+  );
+  await page.getByRole("button", { name: "connect", exact: true }).click();
+  await expect(
+    page.getByRole("img", { name: "fixture display" }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "connect", exact: true }).click();
+  await page.getByRole("button", { name: "forget this computer" }).click();
+  await expect(
+    page.getByRole("combobox", { name: "computer", exact: true }),
+  ).toHaveValue("");
+  await expect(
+    page.getByRole("button", { name: "request pairing" }),
+  ).toBeVisible();
+});
+
+test("an untrusted discovery cannot keep a previously selected paired identity", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "connect", exact: true }).click();
+  await expect(
+    page.getByRole("combobox", { name: "computer", exact: true }),
+  ).toHaveValue("a".repeat(64));
+  await page.getByRole("button", { name: "find nearby" }).click();
+  await page
+    .getByRole("button", { name: "new computer · 192.168.1.10:45810" })
+    .click();
+  await expect(
+    page.getByRole("combobox", { name: "computer", exact: true }),
+  ).toHaveValue("");
+  await expect(page.getByLabel("address", { exact: true })).toHaveValue("");
+  await expect(
+    page
+      .locator(".connect-pane")
+      .getByRole("button", { name: "connect", exact: true }),
+  ).toBeDisabled();
 });
 
 test("source removal, permission errors and partial-to-final speech use the shared operations", async ({

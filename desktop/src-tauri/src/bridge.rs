@@ -67,6 +67,9 @@ impl Bridge {
             .client
             .request(method, format!("http://{}/v1/{path}", endpoint.address))
             .bearer_auth(endpoint.token);
+        if path == "pair" {
+            request = request.timeout(Duration::from_secs(125));
+        }
         if let Some(args) = args {
             let bytes = serde_json::to_vec(&args).map_err(|_| "invalid request")?;
             if bytes.len() > 64 * 1024 {
@@ -127,9 +130,10 @@ pub async fn operation(
     args: Value,
 ) -> Result<Value, String> {
     let method = match name.as_str() {
-        "status" | "peers" => Method::GET,
-        "connect" | "sources" | "observe" | "configure" | "capture" | "history" | "transcripts"
-        | "history-limits" | "transcribe" | "transcription-stop" | "stop" => Method::POST,
+        "status" | "peers" | "discover" => Method::GET,
+        "connect" | "pair" | "forget" | "sources" | "observe" | "configure" | "capture"
+        | "history" | "transcripts" | "history-limits" | "transcribe" | "transcription-stop"
+        | "stop" => Method::POST,
         _ => return Err("unknown operation".into()),
     };
     let body = (method == Method::POST).then_some(args);
