@@ -13,6 +13,7 @@ use whisper_rs::{
 
 pub mod audio;
 pub mod streaming;
+pub mod worker;
 
 pub const SAMPLE_RATE: usize = 16_000;
 pub const MAX_WINDOW_SAMPLES: usize = 30 * SAMPLE_RATE;
@@ -23,6 +24,8 @@ pub enum TranscriptionError {
     InvalidInput,
     #[error("audio resampling failed")]
     Resampling,
+    #[error("speech worker stopped")]
+    WorkerStopped,
     #[error("transcription was cancelled")]
     Cancelled,
     #[error("speech model is unavailable: {0}")]

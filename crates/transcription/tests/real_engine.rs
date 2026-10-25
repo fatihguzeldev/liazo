@@ -40,3 +40,80 @@ fn cancelling_real_inference_releases_callback_state_and_allows_reuse() {
     assert!(!recovered.is_empty());
     assert!(recovered.iter().any(|segment| !segment.text.is_empty()));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires LIAZO_TEST_MODEL and a 16 khz mono LIAZO_TEST_SPEECH fixture"]
+async fn real_streaming_inference_publishes_revisable_partials_and_attributed_finals() {
+    use liazo_core::{protocol::SourceKey, transcript::EndReason};
+    use liazo_transcription::{
+        audio::NormalizedAudio,
+        streaming::{Segmenter, StreamingSettings},
+        worker::{InferenceWorker, RecognitionUpdate},
+    };
+    use uuid::Uuid;
+    let model = WhisperModel::load(&PathBuf::from(
+        std::env::var_os("LIAZO_TEST_MODEL").expect("model path"),
+    ))
+    .unwrap();
+    let mut reader =
+        hound::WavReader::open(std::env::var_os("LIAZO_TEST_SPEECH").expect("fixture path"))
+            .unwrap();
+    assert_eq!(
+        (reader.spec().sample_rate, reader.spec().channels),
+        (16_000, 1)
+    );
+    let samples: Vec<_> = reader
+        .samples::<i16>()
+        .map(|sample| f32::from(sample.unwrap()) / 32768.0)
+        .collect();
+    let source = SourceKey {
+        id: "audio:fixture".into(),
+        generation: Uuid::new_v4(),
+    };
+    let stream = Uuid::new_v4();
+    let mut segmenter = Segmenter::new(source.clone(), StreamingSettings::default()).unwrap();
+    let mut worker = InferenceWorker::start(model, 4).await.unwrap();
+    for (index, chunk) in samples.chunks(320).enumerate() {
+        for window in segmenter
+            .push(NormalizedAudio {
+                stream_id: stream,
+                start_ns: 1_000_000_000 + index as u64 * 20_000_000,
+                samples: chunk.to_vec(),
+                discontinuity: false,
+            })
+            .unwrap()
+        {
+            assert!(worker.submit(window).unwrap().is_empty());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    if let Some(window) = segmenter.finish(EndReason::Stopped) {
+        worker.submit(window).unwrap();
+    }
+    worker.finish();
+    let mut transcripts = Vec::new();
+    while let Some(update) = tokio::time::timeout(Duration::from_secs(10), worker.next())
+        .await
+        .unwrap()
+    {
+        match update {
+            RecognitionUpdate::Transcript(transcript) => {
+                transcript.validate().unwrap();
+                transcripts.push(transcript);
+            }
+            RecognitionUpdate::Gap(_) => panic!("real engine dropped a speech window"),
+        }
+    }
+    worker.join().await.unwrap();
+    assert!(
+        transcripts
+            .iter()
+            .all(|transcript| transcript.source == source && transcript.stream_id == stream)
+    );
+    assert!(transcripts.iter().any(|partial| partial.ending.is_none()
+        && !partial.text.is_empty()
+        && transcripts.iter().any(|final_| final_.id == partial.id
+            && final_.ending.is_some()
+            && final_.revision > partial.revision
+            && final_.text.split_whitespace().count() >= 3)));
+}

@@ -11,6 +11,22 @@ pub enum EndReason {
     Gap,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptionGapReason {
+    AudioDiscontinuity,
+    InvalidAudio,
+    Backpressure,
+    EngineFailure,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TranscriptionGap {
+    pub source: SourceKey,
+    pub utterance: Option<Uuid>,
+    pub reason: TranscriptionGapReason,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Transcript {
     pub id: Uuid,
