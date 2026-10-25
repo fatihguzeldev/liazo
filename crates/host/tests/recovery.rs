@@ -517,6 +517,7 @@ async fn reconnect_preserves_settings_across_failed_attempt_and_keeps_closed_epo
     let (first, cancel) = fixture.connect().await;
     let old = fixture.host.receiver(first).await.unwrap();
     old.configure(settings()).await.unwrap();
+    fixture.archive_ready(first).await;
     old.configure_raw_audio(vec![audio_key()]).await.unwrap();
     let observed = old
         .capture_now(vec![image_key(Uuid::from_u128(1))])
@@ -724,23 +725,42 @@ async fn archive_initialization_failure_does_not_prevent_live_capture() {
     );
     assert!(receiver.archive_status().is_none());
     std::fs::remove_file(&fixture.root).unwrap();
-    timeout(Duration::from_secs(5), async {
-        while receiver.archive_status().is_none() {
+    let mut last = String::from("waiting for repaired archive storage");
+    let repaired = timeout(Duration::from_secs(15), async {
+        loop {
+            let current = fixture.host.current().await.unwrap();
+            let archive = receiver.archive_status();
+            last = serde_json::json!({"session":&current,"archive":&archive}).to_string();
+            assert_eq!(current.binding, binding, "epoch changed: {last}");
+            assert_eq!(current.connection, ConnectionState::Connected, "{last}");
+            if archive.is_some_and(|status| {
+                status.phase == liazo_runtime::archive::ArchivePhase::Recording
+            }) && current
+                .recovery
+                .iter()
+                .all(|issue| !matches!(issue.operation, liazo_host::RecoveryOperation::Archive))
+            {
+                break current;
+            }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .unwrap();
-    assert!(
-        fixture
-            .host
-            .current()
-            .await
-            .unwrap()
-            .recovery
-            .iter()
-            .all(|issue| !matches!(issue.operation, liazo_host::RecoveryOperation::Archive))
-    );
+    .unwrap_or_else(|_| panic!("archive storage did not recover: {last}"));
+    // The intentionally invalid application-data root also prevented preference
+    // persistence. Archive recovery must not erase that independent failure.
+    if summary
+        .recovery
+        .iter()
+        .any(|issue| matches!(issue.operation, liazo_host::RecoveryOperation::Settings))
+    {
+        assert!(
+            repaired
+                .recovery
+                .iter()
+                .any(|issue| matches!(issue.operation, liazo_host::RecoveryOperation::Settings))
+        );
+    }
     fixture.host.stop(binding).await.unwrap();
 }
 
@@ -887,6 +907,7 @@ async fn stalled_archive_uses_one_retirement_slot_while_multiple_live_epochs_con
     let (first, cancel) = fixture.connect().await;
     let old = fixture.host.receiver(first).await.unwrap();
     old.configure(settings()).await.unwrap();
+    fixture.archive_ready(first).await;
     old.configure_raw_audio(vec![audio_key()]).await.unwrap();
     old.capture_now(vec![image_key(Uuid::from_u128(1))])
         .await
@@ -996,6 +1017,7 @@ async fn restart_restores_private_intent_and_explicit_stop_disables_future_resta
     let mut fixture = Fixture::new(root.path().to_owned()).await;
     let (first, _) = fixture.connect().await;
     fixture.host.configure(first, settings()).await.unwrap();
+    fixture.archive_ready(first).await;
     fixture
         .host
         .configure_raw_audio(first, vec![audio_key()])
@@ -1007,13 +1029,7 @@ async fn restart_restores_private_intent_and_explicit_stop_disables_future_resta
     assert!(!next.pending);
     let receiver = fixture.host.receiver(next.binding).await.unwrap();
     assert_eq!(receiver.settings(), settings());
-    timeout(Duration::from_secs(5), async {
-        while receiver.archive_status().is_none() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
+    fixture.archive_ready(next.binding).await;
     assert_eq!(
         receiver.archive_status().unwrap().raw_audio_sources,
         vec![audio_key()]
