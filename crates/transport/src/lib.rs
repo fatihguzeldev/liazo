@@ -1,4 +1,5 @@
 mod credentials;
+pub mod discovery;
 mod identity;
 mod pairing;
 mod peer;
@@ -34,4 +35,6 @@ pub enum TransportError {
     PairingClosed,
     #[error("pairing was denied")]
     PairingDenied,
+    #[error("local discovery failed: {0}")]
+    Discovery(String),
 }

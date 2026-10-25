@@ -1,0 +1,22 @@
+[package]
+name = "liazo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+liazo-core = { path = "../core" }
+liazo-runtime = { path = "../runtime" }
+liazo-transport = { path = "../transport" }
+tokio = { workspace = true, features = ["signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+uuid.workspace = true
+serde_json.workspace = true
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
+directories = "6"
+if-addrs = "0.15"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+liazo-macos = { path = "../macos" }
+security-framework = "3.7"
