@@ -186,6 +186,9 @@ struct Fixture {
     address: std::net::SocketAddr,
     accepted: mpsc::Receiver<CancellationToken>,
     root: std::path::PathBuf,
+    receiver_certificate: Vec<u8>,
+    receiver_secret: Vec<u8>,
+    stored_peer: StoredPeer,
     task: JoinHandle<()>,
 }
 impl Fixture {
@@ -194,16 +197,18 @@ impl Fixture {
         let receiver_identity = Identity::generate().unwrap();
         let peer = provider_identity.fingerprint();
         let receiver_certificate = receiver_identity.certificate().clone();
-        let host = SessionHost::new(
-            receiver_identity,
-            vec![StoredPeer {
-                label: "fixture".into(),
-                certificate: provider_identity.certificate().clone(),
-            }],
-            root.clone(),
-        );
+        let receiver_secret = receiver_identity.secret_key_der().to_vec();
+        let stored_peer = StoredPeer {
+            label: "fixture".into(),
+            certificate: provider_identity.certificate().clone(),
+        };
+        let host = SessionHost::new(receiver_identity, vec![stored_peer.clone()], root.clone());
         let server = SessionServer::new(
-            PeerServer::new(&provider_identity, &[receiver_certificate]).unwrap(),
+            PeerServer::new(
+                &provider_identity,
+                std::slice::from_ref(&receiver_certificate),
+            )
+            .unwrap(),
         );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -260,8 +265,23 @@ impl Fixture {
             address,
             accepted,
             root,
+            receiver_certificate: receiver_certificate.to_vec(),
+            receiver_secret,
+            stored_peer,
             task,
         }
+    }
+    fn restart(&mut self) {
+        self.host = SessionHost::new(
+            Identity::from_der(
+                self.receiver_certificate.clone(),
+                self.receiver_secret.clone(),
+            )
+            .unwrap(),
+            vec![self.stored_peer.clone()],
+            self.root.clone(),
+        );
+        self.host.resume();
     }
     async fn connect(&mut self) -> (SessionBinding, CancellationToken) {
         let current = self.host.connect(self.address, self.peer).await.unwrap();
@@ -271,8 +291,10 @@ impl Fixture {
     async fn epoch_after(&self, previous: SessionBinding) -> liazo_host::SessionSummary {
         timeout(Duration::from_secs(8), async {
             loop {
-                let current = self.host.current().await.unwrap();
-                if current.binding != previous && current.connection == ConnectionState::Connected {
+                if let Some(current) = self.host.current().await
+                    && current.binding != previous
+                    && current.connection == ConnectionState::Connected
+                {
                     break current;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -632,6 +654,37 @@ async fn real_speech_reconnects_and_recovers_without_undoing_explicit_transcript
     })
     .await
     .unwrap();
+    // A host restart reloads the model path/settings, rather than serializing a model or requiring the GUI.
+    fixture.accepted.recv().await.unwrap();
+    drop(receiver);
+    drop(first_receiver);
+    fixture.restart();
+    let current = fixture.epoch_after(current.binding).await;
+    let receiver = fixture.host.receiver(current.binding).await.unwrap();
+    timeout(Duration::from_secs(30), async {
+        while !receiver.transcription_status().active {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    fixture.capture.gate.add_permits(1);
+    timeout(Duration::from_secs(35), async {
+        loop {
+            if receiver
+                .observe(0, false, &[], Duration::ZERO)
+                .await
+                .transcripts
+                .iter()
+                .any(|text| text.ending.is_some() && text.text.to_lowercase().contains("country"))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
     // Stop while a retry has already copied speech intent; it cannot install that intent.
     fixture.capture.blocked.store(true, Ordering::Release);
     fixture.accepted.recv().await.unwrap().cancel();
@@ -668,9 +721,50 @@ async fn stalled_archive_uses_one_retirement_slot_while_multiple_live_epochs_con
     let old = fixture.host.receiver(first).await.unwrap();
     old.configure(settings()).await.unwrap();
     old.configure_raw_audio(vec![audio_key()]).await.unwrap();
+    old.capture_now(vec![image_key(Uuid::from_u128(1))])
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let at_ms = old.elapsed().as_millis() as u64;
     let hold = old.hold_archive().await.unwrap();
     cancel.cancel();
+    wait_disconnected(&fixture.host).await;
+    let unused = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let wrong = unused.local_addr().unwrap();
+    drop(unused);
+    assert!(fixture.host.connect(wrong, fixture.peer).await.is_err());
+    assert_eq!(fixture.host.current().await.unwrap().binding, first);
+    match fixture
+        .host
+        .archive_images(liazo_host::requests::ArchiveImages {
+            binding: first,
+            at_ms,
+            sources: vec![image_key(Uuid::from_u128(1))],
+        })
+        .await
+    {
+        Ok(history) => assert_eq!(
+            history.images[0].payload.as_ref().unwrap().as_ref(),
+            b"fixture image"
+        ),
+        Err(HostError::Archive(liazo_runtime::archive::ArchiveError::Busy)) => {}
+        _ => panic!("retained data must remain historical or report the held archive as busy"),
+    }
     let mut current = fixture.epoch_after(first).await;
+    assert!(matches!(
+        fixture
+            .host
+            .archive_images(liazo_host::requests::ArchiveImages {
+                binding: first,
+                at_ms: 0,
+                sources: vec![image_key(Uuid::from_u128(1))],
+            })
+            .await,
+        Err(HostError::Archive(
+            liazo_runtime::archive::ArchiveError::Busy
+        ))
+    ));
+
     for _ in 0..2 {
         let receiver = fixture.host.receiver(current.binding).await.unwrap();
         assert!(receiver.archive_status().is_none());
@@ -712,5 +806,185 @@ async fn stalled_archive_uses_one_retirement_slot_while_multiple_live_epochs_con
         receiver.archive_status().unwrap().raw_audio_sources,
         vec![audio_key()]
     );
+    let retained = fixture
+        .host
+        .archive_images(liazo_host::requests::ArchiveImages {
+            binding: first,
+            at_ms,
+            sources: vec![image_key(Uuid::from_u128(1))],
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        retained.images[0].payload.as_ref().unwrap().as_ref(),
+        b"fixture image"
+    );
     fixture.host.stop(current.binding).await.unwrap();
+}
+
+#[tokio::test]
+async fn restart_restores_private_intent_and_explicit_stop_disables_future_restarts() {
+    let root = tempfile::tempdir().unwrap();
+    let mut fixture = Fixture::new(root.path().to_owned()).await;
+    let (first, _) = fixture.connect().await;
+    fixture.host.configure(first, settings()).await.unwrap();
+    fixture
+        .host
+        .configure_raw_audio(first, vec![audio_key()])
+        .await
+        .unwrap();
+    fixture.restart();
+    let next = fixture.epoch_after(first).await;
+    assert_eq!(next.binding.session, first.session);
+    assert!(!next.pending);
+    let receiver = fixture.host.receiver(next.binding).await.unwrap();
+    assert_eq!(receiver.settings(), settings());
+    timeout(Duration::from_secs(5), async {
+        while receiver.archive_status().is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        receiver.archive_status().unwrap().raw_audio_sources,
+        vec![audio_key()]
+    );
+    fixture.host.stop(next.binding).await.unwrap();
+    assert!(
+        !receiver.archive_retiring(),
+        "a sealed archive still serves readers before retirement"
+    );
+    fixture
+        .host
+        .archive_audio(liazo_host::requests::ArchiveRange {
+            binding: next.binding,
+            from_ms: 0,
+            to_ms: receiver.elapsed().as_millis() as u64,
+            sources: vec![audio_key()],
+        })
+        .await
+        .unwrap();
+    assert!(!root.path().join("resume.json").exists());
+    fixture.restart();
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+    assert!(fixture.host.current().await.is_none());
+}
+
+#[tokio::test]
+async fn pending_startup_stop_and_revocation_are_durable_before_a_receiver_exists() {
+    let root = tempfile::tempdir().unwrap();
+    let mut fixture = Fixture::new(root.path().to_owned()).await;
+    let (first, _) = fixture.connect().await;
+    fixture.host.configure(first, settings()).await.unwrap();
+    fixture.capture.blocked.store(true, Ordering::Release);
+    fixture.restart();
+    timeout(Duration::from_secs(3), async {
+        loop {
+            if fixture
+                .host
+                .current()
+                .await
+                .is_some_and(|current| current.pending)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    timeout(Duration::from_secs(4), fixture.capture.entered.notified())
+        .await
+        .unwrap();
+    fixture.host.stop(first).await.unwrap();
+    fixture.capture.blocked.store(false, Ordering::Release);
+    fixture.capture.release.notify_waiters();
+    fixture.restart();
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+    assert!(fixture.host.current().await.is_none());
+    let restarted = fixture
+        .host
+        .connect(fixture.address, fixture.peer)
+        .await
+        .unwrap();
+    fixture
+        .host
+        .configure(restarted.binding, settings())
+        .await
+        .unwrap();
+    fixture.restart();
+    timeout(Duration::from_secs(3), async {
+        while fixture.host.current().await.is_none() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    fixture.host.replace_peers(vec![]).await.unwrap();
+    fixture.restart();
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+    assert!(fixture.host.current().await.is_none());
+}
+
+#[tokio::test]
+async fn revocation_before_startup_load_cannot_resurrect_when_the_peer_is_paired_again() {
+    let root = tempfile::tempdir().unwrap();
+    let mut fixture = Fixture::new(root.path().to_owned()).await;
+    let (first, _) = fixture.connect().await;
+    fixture.host.configure(first, settings()).await.unwrap();
+    fixture.restart();
+    fixture.host.replace_peers(vec![]).await.unwrap();
+    assert!(!root.path().join("resume.json").exists());
+    fixture.restart();
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+    assert!(fixture.host.current().await.is_none());
+}
+
+#[tokio::test]
+async fn startup_retains_exact_source_generation_and_rejects_a_foreign_owner_record() {
+    let root = tempfile::tempdir().unwrap();
+    let mut fixture = Fixture::new(root.path().to_owned()).await;
+    let (first, _) = fixture.connect().await;
+    fixture.host.configure(first, settings()).await.unwrap();
+    *fixture.capture.generation.write().unwrap() = Uuid::new_v4();
+    fixture.restart();
+    let current = fixture.epoch_after(first).await;
+    let receiver = fixture.host.receiver(current.binding).await.unwrap();
+    assert!(receiver.settings().images.is_empty());
+    assert_eq!(receiver.settings().audio, vec![audio_key()]);
+    assert!(
+        current
+            .recovery
+            .iter()
+            .any(|issue| issue.source.as_ref() == Some(&image_key(Uuid::from_u128(1))))
+    );
+    let path = root.path().join("resume.json");
+    // current media becomes ready before the asynchronous durable publication ends.
+    // Corrupt the completed record, rather than racing a legitimate queued write.
+    timeout(Duration::from_secs(3), async {
+        loop {
+            if std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .is_some_and(|saved| saved["binding"] == serde_json::json!(current.binding))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    saved["owner"] =
+        serde_json::Value::String(Identity::generate().unwrap().fingerprint().to_string());
+    std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    drop(receiver);
+    let before = fixture.capture.calls.load(Ordering::Acquire);
+    fixture.restart();
+    tokio::time::sleep(Duration::from_millis(1400)).await;
+    assert!(fixture.host.current().await.is_none());
+    assert_eq!(fixture.capture.calls.load(Ordering::Acquire), before);
 }

@@ -10,13 +10,16 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
 use tokio::sync::{Mutex, RwLock, Semaphore, oneshot};
 use tokio_util::sync::CancellationToken;
+mod preferences;
 mod recovery;
+mod state;
+use preferences::{PreferenceStore, ResumeIntent, SpeechSettings};
 use recovery::start_speech;
 
 #[derive(Debug, thiserror::Error)]
@@ -43,6 +46,8 @@ pub enum HostError {
     Archive(#[from] liazo_runtime::archive::ArchiveError),
     #[error("archive history is unavailable")]
     HistoryUnavailable,
+    #[error("session settings could not be saved")]
+    Settings,
     #[error(transparent)]
     Runtime(#[from] RuntimeError),
     #[error(transparent)]
@@ -57,12 +62,14 @@ pub struct SessionSummary {
     pub provider: String,
     pub address: SocketAddr,
     pub connection: ConnectionState,
+    pub pending: bool,
     pub recovery: Vec<RecoveryIssue>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryOperation {
+    Settings,
     Capture,
     Archive,
     RawAudio,
@@ -78,9 +85,8 @@ pub struct RecoveryIssue {
 
 #[derive(Clone)]
 struct SpeechIntent {
-    model: liazo_transcription::WhisperModel,
-    threads: u8,
-    sources: Vec<SourceKey>,
+    model: Option<liazo_transcription::WhisperModel>,
+    settings: SpeechSettings,
 }
 
 struct Active {
@@ -106,6 +112,12 @@ struct Inner {
     identity: Identity,
     peers: RwLock<Vec<StoredPeer>>,
     active: RwLock<Option<Active>>,
+    pending: RwLock<Option<ResumeIntent>>,
+    preferences: Option<PreferenceStore>,
+    preferences_revision: AtomicU64,
+    startup: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    resume_started: AtomicBool,
+    startup_issue: StdMutex<Option<String>>,
     operation: Arc<Mutex<()>>,
     speech_operation: Arc<Mutex<()>>,
     slots: Arc<Semaphore>,
@@ -124,6 +136,14 @@ struct Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
+        if let Some(task) = self
+            .startup
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            task.abort();
+        }
         if let Some(task) = self
             .monitor
             .get_mut()
@@ -197,10 +217,17 @@ impl SessionHost {
         trust: Option<Arc<dyn crate::TrustStore>>,
     ) -> Self {
         let catalog = liazo_runtime::archive::ArchiveCatalog::spawn(archive_root.clone()).ok();
+        let preferences = PreferenceStore::spawn(archive_root.clone(), identity.fingerprint()).ok();
         Self(Arc::new(Inner {
             identity,
             peers: RwLock::new(peers),
             active: RwLock::new(None),
+            pending: RwLock::new(None),
+            preferences,
+            preferences_revision: AtomicU64::new(1),
+            startup: StdMutex::new(None),
+            resume_started: AtomicBool::new(false),
+            startup_issue: StdMutex::new(None),
             operation: Arc::new(Mutex::new(())),
             speech_operation: Arc::new(Mutex::new(())),
             slots: Arc::new(Semaphore::new(8)),
@@ -247,14 +274,29 @@ impl SessionHost {
 
     pub async fn current(&self) -> Option<SessionSummary> {
         let active = self.0.active.read().await;
-        let active = active.as_ref()?;
-        Some(SessionSummary {
-            binding: active.receiver.archive_identity().binding,
-            provider: active.peer.to_string(),
-            address: active.address,
-            connection: active.receiver.connection(),
-            recovery: active.recovery.clone(),
-        })
+        if let Some(active) = active.as_ref() {
+            return Some(SessionSummary {
+                binding: active.receiver.archive_identity().binding,
+                provider: active.peer.to_string(),
+                address: active.address,
+                connection: active.receiver.connection(),
+                pending: false,
+                recovery: active.recovery.clone(),
+            });
+        }
+        self.0
+            .pending
+            .read()
+            .await
+            .as_ref()
+            .map(|pending| SessionSummary {
+                binding: pending.binding,
+                provider: pending.provider.clone(),
+                address: pending.address,
+                connection: ConnectionState::Disconnected,
+                pending: true,
+                recovery: vec![],
+            })
     }
 
     pub async fn connect(
@@ -266,59 +308,106 @@ impl SessionHost {
             return Err(HostError::Invalid);
         }
         let host = self.clone();
-        self.owned(async move { host.connect_inner(address, peer, None).await })
-            .await
+        self.owned(async move {
+            host.0.revision.fetch_add(1, Ordering::AcqRel);
+            host.connect_inner(address, peer, None).await
+        })
+        .await
     }
 
     pub async fn stop(&self, binding: SessionBinding) -> Result<(), HostError> {
-        let receiver = {
+        let (receiver, version) = {
             let mut active = self.0.active.write().await;
-            let active = active.as_mut().ok_or(HostError::NoSession)?;
-            if active.receiver.archive_identity().binding != binding {
-                return Err(HostError::NoSession);
-            }
-            active.reconnect = false;
-            active.speech = None;
-            active.speech_revision = active.speech_revision.saturating_add(1);
+            let receiver = if let Some(active) = active.as_mut() {
+                if active.receiver.archive_identity().binding != binding {
+                    return Err(HostError::NoSession);
+                }
+                active.reconnect = false;
+                active.speech = None;
+                active.speech_revision = active.speech_revision.saturating_add(1);
+                Some(active.receiver.clone())
+            } else {
+                let mut pending = self.0.pending.write().await;
+                if pending
+                    .as_ref()
+                    .is_none_or(|intent| intent.binding != binding)
+                {
+                    return Err(HostError::NoSession);
+                }
+                pending.take();
+                None
+            };
             self.0.revision.fetch_add(1, Ordering::AcqRel);
             self.0
                 .transition
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .cancel();
-            active.receiver.clone()
+            (receiver, self.next_preferences_revision())
         };
-        let speech = self.0.speech_operation.clone();
+        let host = self.clone();
         Self::spawn_owned(self.0.stops.clone(), async move {
-            let _speech = speech.lock().await;
-            receiver.stop().await.map_err(Into::into)
+            let stopping = async {
+                if let Some(receiver) = receiver {
+                    let _speech = host.0.speech_operation.lock().await;
+                    receiver.stop().await.map_err(HostError::from)
+                } else {
+                    Ok(())
+                }
+            };
+            let (stopped, persisted) = tokio::join!(stopping, host.persist(version, None));
+            stopped.and(persisted)
         })
         .await
     }
 
     pub async fn replace_peers(&self, peers: Vec<StoredPeer>) -> Result<(), HostError> {
-        let revoked = {
+        let (revoked, version) = {
             let mut trusted = self.0.peers.write().await;
+            let removed = trusted.iter().any(|old| {
+                !peers
+                    .iter()
+                    .any(|peer| peer.fingerprint() == old.fingerprint())
+            });
             *trusted = peers;
             let mut active = self.0.active.write().await;
-            if active.as_ref().is_some_and(|session| {
+            let mut pending = self.0.pending.write().await;
+            let revoked = if active.as_ref().is_some_and(|session| {
                 !trusted
                     .iter()
                     .any(|peer| peer.fingerprint() == session.peer)
             }) {
+                active.take().map(|session| session.receiver)
+            } else {
+                None
+            };
+            let pending_revoked = pending.as_ref().is_some_and(|intent| {
+                !trusted
+                    .iter()
+                    .any(|peer| peer.fingerprint().to_string() == intent.provider)
+            });
+            if pending_revoked {
+                pending.take();
+            }
+            let unknown_startup_revoked = removed && active.is_none() && pending.is_none();
+            let version = if revoked.is_some() || pending_revoked || unknown_startup_revoked {
                 self.0.revision.fetch_add(1, Ordering::AcqRel);
                 self.0
                     .transition
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .cancel();
-                active.take().map(|session| session.receiver)
+                Some(self.next_preferences_revision())
             } else {
                 None
-            }
+            };
+            (revoked, version)
         };
         if let Some(receiver) = revoked {
             self.retire_previous(receiver).await?;
+        }
+        if let Some(version) = version {
+            self.persist(version, None).await?;
         }
         Ok(())
     }
@@ -407,6 +496,13 @@ impl SessionHost {
             return Err(HostError::Invalid);
         }
         validate_sources(&sources)?;
+        if !path.is_absolute()
+            || path
+                .to_str()
+                .is_none_or(|path| path.len() > 4096 || path.chars().any(char::is_control))
+        {
+            return Err(HostError::Invalid);
+        }
         let host = self.clone();
         self.owned(async move {
             let receiver = host.receiver(binding).await?;
@@ -418,14 +514,19 @@ impl SessionHost {
                 .as_ref()
                 .ok_or(HostError::NoSession)?
                 .speech_revision;
-            let model =
-                tokio::task::spawn_blocking(move || liazo_transcription::WhisperModel::load(&path))
-                    .await
-                    .map_err(|_| HostError::Interrupted)??;
+            let model_path = path.clone();
+            let model = tokio::task::spawn_blocking(move || {
+                liazo_transcription::WhisperModel::load(&model_path)
+            })
+            .await
+            .map_err(|_| HostError::Interrupted)??;
             let speech = SpeechIntent {
-                model,
-                threads,
-                sources,
+                model: Some(model),
+                settings: SpeechSettings {
+                    path,
+                    threads,
+                    sources,
+                },
             };
             let _speech = host.0.speech_operation.lock().await;
             {
@@ -453,6 +554,7 @@ impl SessionHost {
                 receiver.stop_transcription().await;
                 return Err(HostError::Interrupted);
             }
+            let _ = host.persist_current().await;
             Ok(())
         })
         .await
@@ -479,10 +581,14 @@ impl SessionHost {
             active.receiver.clone()
         };
         let speech = self.0.speech_operation.clone();
+        let host = self.clone();
         Self::spawn_owned(self.0.stops.clone(), async move {
-            let _speech = speech.lock().await;
-            receiver.stop_transcription().await;
-            Ok(())
+            let stopping = async {
+                let _speech = speech.lock().await;
+                receiver.stop_transcription().await;
+            };
+            let (_, persisted) = tokio::join!(stopping, host.persist_current());
+            persisted
         })
         .await
     }

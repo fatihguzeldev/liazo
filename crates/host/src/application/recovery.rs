@@ -34,11 +34,19 @@ impl SessionHost {
         let (revision, transition) = {
             let active = self.0.active.read().await;
             if let Some(expected) = expected {
-                let active = active.as_ref().ok_or(HostError::Interrupted)?;
-                if !active.reconnect
-                    || active.receiver.archive_identity().binding != expected
-                    || active.receiver.connection() != ConnectionState::Disconnected
-                {
+                let matches = if let Some(active) = active.as_ref() {
+                    active.reconnect
+                        && active.receiver.archive_identity().binding == expected
+                        && active.receiver.connection() == ConnectionState::Disconnected
+                } else {
+                    self.0
+                        .pending
+                        .read()
+                        .await
+                        .as_ref()
+                        .is_some_and(|pending| pending.binding == expected)
+                };
+                if !matches {
                     return Err(HostError::Interrupted);
                 }
             }
@@ -75,6 +83,17 @@ impl SessionHost {
         };
         let mut session = Uuid::new_v4();
         let mut restore = None;
+        if previous.is_none()
+            && let Some(pending) = self.0.pending.read().await.clone()
+            && pending.provider == peer.to_string()
+        {
+            session = pending.binding.session;
+            restore = Some((
+                pending.capture,
+                pending.raw_audio,
+                pending.speech.map(Into::into),
+            ));
+        }
         if let Some((previous, previous_peer, reconnect, raw_audio, speech)) = previous {
             if reconnect
                 && previous_peer == peer
@@ -96,7 +115,15 @@ impl SessionHost {
         if transition.is_cancelled() {
             return Err(HostError::Interrupted);
         }
-        let mut recovery = vec![];
+        let mut recovery = self
+            .0
+            .startup_issue
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .map(|message| issue(RecoveryOperation::Settings, None, &message))
+            .into_iter()
+            .collect::<Vec<_>>();
         let archive = self.initialize_archive(&receiver).await;
         if archive.is_err() {
             recovery.push(issue(
@@ -135,7 +162,15 @@ impl SessionHost {
             }
             if let Some(speech) = speech {
                 let _speech = self.0.speech_operation.lock().await;
-                if !transition.is_cancelled()
+                if speech.model.is_none() {
+                    recovery.push(issue(
+                        RecoveryOperation::Transcription,
+                        None,
+                        "speech is starting",
+                    ));
+                }
+                if speech.model.is_some()
+                    && !transition.is_cancelled()
                     && let Err(error) = start_speech(&receiver, &speech).await
                 {
                     recovery.push(issue(
@@ -172,13 +207,15 @@ impl SessionHost {
             speech_revision: 0,
             recovery,
         });
+        self.0.pending.write().await.take();
         drop(active);
         drop(trusted);
+        let _ = self.persist_current().await;
         self.ensure_monitor();
         self.current().await.ok_or(HostError::NoSession)
     }
 
-    fn ensure_monitor(&self) {
+    pub(super) fn ensure_monitor(&self) {
         let mut monitor = self.0.monitor.lock().unwrap_or_else(|e| e.into_inner());
         if monitor.as_ref().is_some_and(|task| !task.is_finished()) {
             return;
@@ -194,20 +231,24 @@ impl SessionHost {
                 let host = SessionHost(inner);
                 let attempt = {
                     let active = host.0.active.read().await;
-                    let Some(active) = active.as_ref() else {
-                        continue;
-                    };
-                    if !active.reconnect {
-                        continue;
-                    }
-                    if active.receiver.connection() == ConnectionState::Disconnected {
-                        Some((
-                            active.address,
-                            active.peer,
-                            active.receiver.archive_identity().binding,
-                        ))
+                    if let Some(active) = active.as_ref() {
+                        (active.reconnect
+                            && active.receiver.connection() == ConnectionState::Disconnected)
+                            .then(|| {
+                                (
+                                    active.address,
+                                    active.peer,
+                                    active.receiver.archive_identity().binding,
+                                )
+                            })
                     } else {
-                        None
+                        host.0.pending.read().await.as_ref().and_then(|pending| {
+                            pending
+                                .provider
+                                .parse()
+                                .ok()
+                                .map(|peer| (pending.address, peer, pending.binding))
+                        })
                     }
                 };
                 if let Some((address, peer, binding)) = attempt {
@@ -356,7 +397,9 @@ impl SessionHost {
                 }
             }
         }
-        if let Some(speech) = speech {
+        let mut loaded_speech = None;
+        if let Some(mut speech) = speech {
+            let loaded = load_speech(&mut speech).await;
             let _speech = self.0.speech_operation.lock().await;
             let still_desired = {
                 let active = self.0.active.read().await;
@@ -371,11 +414,15 @@ impl SessionHost {
             }
             outcomes.push((
                 RecoveryOperation::Transcription,
-                start_speech(&receiver, &speech)
-                    .await
-                    .err()
-                    .map(|error| error.to_string()),
+                match loaded {
+                    Ok(()) => start_speech(&receiver, &speech)
+                        .await
+                        .err()
+                        .map(|error| error.to_string()),
+                    Err(error) => Some(error.to_string()),
+                },
             ));
+            loaded_speech = Some(speech);
         }
         let succeeded = outcomes.iter().all(|(_, error)| error.is_none());
         let mut active = self.0.active.write().await;
@@ -384,6 +431,9 @@ impl SessionHost {
             && active.speech_revision == speech_revision
             && active.reconnect
         {
+            if let Some(speech) = loaded_speech {
+                active.speech = Some(speech);
+            }
             for (operation, error) in outcomes {
                 active.recovery.retain(|issue| issue.operation != operation);
                 if let Some(error) = error {
@@ -416,12 +466,24 @@ pub(super) async fn start_speech(
 ) -> Result<(), RuntimeError> {
     receiver
         .start_transcription(
-            intent.model.clone(),
-            intent.threads,
-            intent.sources.clone(),
+            intent.model.clone().ok_or(RuntimeError::Closed)?,
+            intent.settings.threads,
+            intent.settings.sources.clone(),
             liazo_transcription::streaming::StreamingSettings::default(),
         )
         .await
+}
+
+async fn load_speech(intent: &mut SpeechIntent) -> Result<(), HostError> {
+    if intent.model.is_none() {
+        let path = intent.settings.path.clone();
+        intent.model = Some(
+            tokio::task::spawn_blocking(move || liazo_transcription::WhisperModel::load(&path))
+                .await
+                .map_err(|_| HostError::Interrupted)??,
+        );
+    }
+    Ok(())
 }
 
 fn restore_settings(
