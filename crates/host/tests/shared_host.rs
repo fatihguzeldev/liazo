@@ -621,6 +621,67 @@ async fn authenticated_consumers_share_one_session_and_binary_media_without_a_gu
     })
     .await
     .unwrap();
+    let ordinary = client
+        .post(format!("{base}/mcp"))
+        .bearer_auth(token)
+        .header(reqwest::header::ACCEPT, "application/json, text/event-stream")
+        .json(&json!({"jsonrpc":"2.0","id":"busy-status","method":"tools/call","params":{"name":"status"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ordinary.status(), StatusCode::TOO_MANY_REQUESTS);
+    drop(ordinary);
+    let wrong_method = client
+        .get(format!("{base}/mcp"))
+        .bearer_auth(token)
+        .json(&json!({"method":"tools/call","params":{"name":"model_cancel"}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_method.status(), StatusCode::TOO_MANY_REQUESTS);
+    drop(wrong_method);
+    let cancelled = mcp
+        .call_tool(CallToolRequestParams::new("model_cancel"))
+        .await
+        .expect("MCP model cancellation reaches a reserved control slot");
+    assert_eq!(cancelled.is_error, Some(false));
+    assert_eq!(
+        cancelled.structured_content,
+        Some(json!({"requested":true}))
+    );
+    let speech_stopped = mcp
+        .call_tool(
+            CallToolRequestParams::new("transcription_stop")
+                .with_arguments(json!({"binding":binding}).as_object().unwrap().clone()),
+        )
+        .await
+        .expect("MCP speech stop reaches a reserved control slot");
+    assert_eq!(speech_stopped.is_error, Some(false));
+    assert_eq!(
+        speech_stopped.structured_content,
+        Some(json!({"stopped":true}))
+    );
+    assert_eq!(
+        held.connection(),
+        liazo_runtime::ConnectionState::Connected,
+        "cancelling speech and setup leaves shared capture connected"
+    );
+    let ordinary = client
+        .get(format!("{base}/v1/status"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ordinary.status(), StatusCode::TOO_MANY_REQUESTS);
+    drop(ordinary);
+    let cancelled = client
+        .post(format!("{base}/v1/model-cancel"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cancelled.status(), StatusCode::OK);
+    drop(cancelled);
     let stopped = client
         .post(format!("{base}/v1/transcription-stop"))
         .bearer_auth(token)

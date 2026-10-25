@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{Path, Request, State},
-    http::{StatusCode, header},
+    http::{Method, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -199,10 +199,21 @@ async fn authorize(State(state): State<HttpState>, request: Request, next: Next)
         Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
     };
     if reserved {
-        let control = matches!(parts.uri.path(), "/v1/stop" | "/v1/transcription-stop")
-            || (parts.uri.path() == "/mcp"
-                && serde_json::from_slice::<serde_json::Value>(&bytes)
-                    .is_ok_and(|body| body["method"] == "notifications/cancelled"));
+        let control = parts.method == Method::POST
+            && (matches!(
+                parts.uri.path(),
+                "/v1/stop" | "/v1/transcription-stop" | "/v1/model-cancel"
+            ) || (parts.uri.path() == "/mcp"
+                && serde_json::from_slice::<serde_json::Value>(&bytes).is_ok_and(|body| {
+                    match body["method"].as_str() {
+                        Some("notifications/cancelled") => true,
+                        Some("tools/call") => matches!(
+                            body["params"]["name"].as_str(),
+                            Some("stop" | "transcription_stop" | "model_cancel")
+                        ),
+                        _ => false,
+                    }
+                })));
         if !control {
             return StatusCode::TOO_MANY_REQUESTS.into_response();
         }
