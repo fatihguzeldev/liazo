@@ -8,6 +8,11 @@ on:
         default: baseline
         type: choice
         options: [baseline, avx2]
+      backend:
+        description: Speech backend packages
+        default: cpu
+        type: choice
+        options: [cpu, vulkan, all]
   push:
     tags: ['v*']
 
@@ -17,7 +22,11 @@ permissions:
 jobs:
   windows:
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: ${{ fromJSON(inputs.backend == 'cpu' && '["cpu"]' || inputs.backend == 'vulkan' && '["vulkan"]' || '["cpu","vulkan"]') }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
@@ -31,6 +40,28 @@ jobs:
           $clang = 'C:\Program Files\LLVM\bin'
           if (!(Test-Path "$clang\libclang.dll")) { throw 'libclang is unavailable' }
           "LIBCLANG_PATH=$clang" >> $env:GITHUB_ENV
+      - name: pinned Vulkan SDK
+        if: matrix.backend == 'vulkan'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $version = '1.4.363.0'
+          $sha256 = '94a82d378f7a5e3e54c9db7d2fb7016af136e14ac0a18dbf0f2f67a36352d141'
+          $installer = Join-Path $env:RUNNER_TEMP "vulkansdk-windows-X64-$version.exe"
+          Invoke-WebRequest -Uri "https://sdk.lunarg.com/sdk/download/$version/windows/vulkansdk-windows-X64-$version.exe" -UserAgent 'Liazo-build/0.1' -OutFile $installer -TimeoutSec 300
+          if ((Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant() -ne $sha256) { throw 'Vulkan SDK checksum mismatch' }
+          $sdk = Join-Path $env:RUNNER_TEMP "VulkanSDK/$version"
+          $arguments = "--root `"$sdk`" --accept-licenses --default-answer --confirm-command install copy_only=1"
+          $process = Start-Process $installer -ArgumentList $arguments -PassThru
+          if (!$process.WaitForExit(300000)) { $process.Kill(); throw 'Vulkan SDK setup deadline' }
+          $process.Refresh()
+          if ($process.ExitCode -ne 0) { throw "Vulkan SDK setup failed: $($process.ExitCode)" }
+          foreach ($file in @('Include/vulkan/vulkan_core.h', 'Lib/vulkan-1.lib', 'Bin/glslc.exe')) {
+            if (!(Test-Path (Join-Path $sdk $file))) { throw "Vulkan SDK is missing $file" }
+          }
+          "VULKAN_SDK=$sdk" >> $env:GITHUB_ENV
+          "LIAZO_VULKAN_SDK_SHA256=$sha256" >> $env:GITHUB_ENV
+          (Join-Path $sdk 'Bin') >> $env:GITHUB_PATH
       - name: frontend dependencies
         working-directory: desktop
         run: npm ci --no-audit --no-fund
@@ -38,13 +69,17 @@ jobs:
         shell: pwsh
         env:
           LIAZO_PACKAGE_CPU: ${{ inputs.cpu || 'baseline' }}
-        run: desktop/scripts/package-windows.ps1 -Cpu $env:LIAZO_PACKAGE_CPU
+          LIAZO_PACKAGE_BACKEND: ${{ matrix.backend }}
+        run: desktop/scripts/package-windows.ps1 -Cpu $env:LIAZO_PACKAGE_CPU -Backend $env:LIAZO_PACKAGE_BACKEND
       - name: install and exercise the packaged MCP
         shell: pwsh
         env:
           LIAZO_PACKAGE_CPU: ${{ inputs.cpu || 'baseline' }}
+          LIAZO_PACKAGE_BACKEND: ${{ matrix.backend }}
         run: |
-          $output = Join-Path $PWD "target/distribution/x86_64-pc-windows-msvc-$env:LIAZO_PACKAGE_CPU"
+          $variant = if ($env:LIAZO_PACKAGE_BACKEND -eq 'cpu') { $env:LIAZO_PACKAGE_CPU } else { "$env:LIAZO_PACKAGE_CPU-$env:LIAZO_PACKAGE_BACKEND" }
+          $features = @(if ($env:LIAZO_PACKAGE_BACKEND -eq 'vulkan') { '--features'; 'vulkan' })
+          $output = Join-Path $PWD "target/distribution/x86_64-pc-windows-msvc-$variant"
           $installers = @(Get-ChildItem $output -Filter '*-setup.exe')
           if ($installers.Count -ne 1) { throw 'expected one installer' }
           $installer = $installers[0]
@@ -54,16 +89,34 @@ jobs:
           if (!(Test-Path "$installed/liazo-desktop.exe")) { throw 'desktop executable was not installed' }
           if (!(Test-Path "$installed/liazo.exe")) { throw 'MCP companion was not installed' }
           $env:LIAZO_TEST_CLI = Join-Path $installed 'liazo.exe'
-          $env:CARGO_TARGET_DIR = Join-Path $PWD "target/packages/windows-$env:LIAZO_PACKAGE_CPU"
-          & cargo test --locked --release --target x86_64-pc-windows-msvc -p liazo --test mcp_stdio
+          $env:CARGO_TARGET_DIR = Join-Path $PWD "target/packages/windows-$variant"
+          & cargo test --locked --release --target x86_64-pc-windows-msvc -p liazo --test mcp_stdio @features
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $uninstaller = Get-ChildItem $installed -Filter '*uninstall*.exe' | Select-Object -First 1
           if (!$uninstaller) { throw 'uninstaller was not installed' }
           $process = Start-Process $uninstaller.FullName -ArgumentList @('/S') -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "uninstall failed: $($process.ExitCode)" }
+      - name: native Vulkan build without a GPU device
+        if: matrix.backend == 'vulkan'
+        shell: pwsh
+        env:
+          LIAZO_PACKAGE_CPU: ${{ inputs.cpu || 'baseline' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:CARGO_TARGET_DIR = Join-Path $PWD "target/packages/windows-$env:LIAZO_PACKAGE_CPU-vulkan"
+          $env:VK_DRIVER_FILES = Join-Path $env:RUNNER_TEMP 'liazo-no-driver.json'
+          if (Test-Path -LiteralPath $env:VK_DRIVER_FILES) { throw 'expected a nonexistent test-only ICD path' }
+          $env:LIAZO_TEST_MODEL = Join-Path $env:RUNNER_TEMP 'liazo-no-device-base.bin'
+          Invoke-WebRequest -Uri 'https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-base.bin' -OutFile $env:LIAZO_TEST_MODEL -TimeoutSec 300
+          if ((Get-Item -LiteralPath $env:LIAZO_TEST_MODEL).Length -ne 147951465 -or (Get-FileHash $env:LIAZO_TEST_MODEL -Algorithm SHA256).Hash.ToLowerInvariant() -ne '60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe') { throw 'fallback model checksum mismatch' }
+          $test = 'tests::native_no_gpu_initializes_cpu_context_and_state'
+          $tests = & cargo test --locked --release --target x86_64-pc-windows-msvc -p liazo-transcription --features vulkan --lib -- --list
+          if ($LASTEXITCODE -ne 0 -or "${test}: test" -notin $tests) { throw 'native no-device test is unavailable' }
+          & cargo test --locked --release --target x86_64-pc-windows-msvc -p liazo-transcription --features vulkan --lib $test -- --ignored --exact --test-threads=1 --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: liazo-windows-${{ inputs.cpu || 'baseline' }}
+          name: liazo-windows-${{ inputs.cpu || 'baseline' }}${{ matrix.backend == 'vulkan' && '-vulkan' || '' }}
           path: |
             target/distribution/*/*.exe
             target/distribution/*/*.zip

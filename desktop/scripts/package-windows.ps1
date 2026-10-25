@@ -1,4 +1,7 @@
-param([ValidateSet('baseline', 'avx2')][string]$Cpu = 'baseline')
+param(
+    [ValidateSet('baseline', 'avx2')][string]$Cpu = 'baseline',
+    [ValidateSet('cpu', 'vulkan')][string]$Backend = 'cpu'
+)
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 if (!$IsWindows) { throw 'Windows packaging requires a native Windows build' }
@@ -13,12 +16,31 @@ function Get-SourceStatus([string]$Phase) {
     return $changes
 }
 
+function Get-VerifiedDownload([string]$Uri, [string]$Path, [string]$Sha256) {
+    if (!(Test-Path -LiteralPath $Path)) {
+        $partial = "$Path.part"
+        if (Test-Path -LiteralPath $partial) { throw "incomplete dependency download: $partial" }
+        Invoke-WebRequest -Uri $Uri -UserAgent 'Liazo-build/0.1' -OutFile $partial -TimeoutSec 300
+        if ((Get-FileHash $partial -Algorithm SHA256).Hash.ToLowerInvariant() -ne $Sha256) {
+            throw 'dependency download checksum mismatch'
+        }
+        Move-Item -LiteralPath $partial -Destination $Path
+    }
+    if ((Get-FileHash $Path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $Sha256) {
+        throw 'cached dependency checksum mismatch'
+    }
+}
+
 $root = (Resolve-Path (Join-Path $PSScriptRoot '../..')).Path
 $target = 'x86_64-pc-windows-msvc'
-$targetDir = Join-Path $root "target/packages/windows-$Cpu"
-$output = Join-Path $root "target/distribution/$target-$Cpu"
+$variant = if ($Backend -eq 'cpu') { $Cpu } else { "$Cpu-$Backend" }
+$targetDir = Join-Path $root "target/packages/windows-$variant"
+$output = Join-Path $root "target/distribution/$target-$variant"
 $stage = Join-Path $root 'desktop/src-tauri/binaries'
 $runtime = Join-Path $stage 'runtime'
+$featureArgs = @(if ($Backend -eq 'vulkan') { '--features'; 'vulkan' })
+$vulkanVersion = '1.4.363.0'
+$vulkanRuntime = $null
 $changedEnvironment = @{}
 $settings = @{
     CARGO_TARGET_DIR = $targetDir
@@ -51,7 +73,21 @@ try {
     $metadata = & cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
     if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
     $version = ($metadata.packages | Where-Object name -eq 'liazo').version
-    & cargo build --locked --release --target $target -p liazo
+    if ($Backend -eq 'vulkan') {
+        if (!$env:VULKAN_SDK -or
+            !(Test-Path (Join-Path $env:VULKAN_SDK 'Include/vulkan/vulkan_core.h')) -or
+            !(Test-Path (Join-Path $env:VULKAN_SDK 'Lib/vulkan-1.lib')) -or
+            !(Test-Path (Join-Path $env:VULKAN_SDK 'Bin/glslc.exe'))) {
+            throw 'Vulkan packaging requires the Vulkan SDK headers, import library, and glslc'
+        }
+        $header = Get-Content (Join-Path $env:VULKAN_SDK 'Include/vulkan/vulkan_core.h') -Raw
+        if ($header -notmatch '(?m)^#define VK_HEADER_VERSION\s+363\s*$') {
+            throw "Vulkan packaging requires SDK $vulkanVersion"
+        }
+        & (Join-Path $env:VULKAN_SDK 'Bin/glslc.exe') --version
+        if ($LASTEXITCODE -ne 0) { throw 'Vulkan shader compiler failed to start' }
+    }
+    & cargo build --locked --release --target $target -p liazo @featureArgs
     if ($LASTEXITCODE -ne 0) { throw 'companion build failed' }
     Get-SourceStatus 'after companion' | Out-Null
     $release = Join-Path $targetDir "$target/release"
@@ -65,11 +101,42 @@ try {
         Sort-Object FullName -Descending | Select-Object -First 1
     if (!$redist) { throw 'Visual C++ redistributable DLLs are unavailable' }
     Get-ChildItem $runtime -Filter '*.dll' | Remove-Item
+    foreach ($name in @('VulkanRT-License.txt', 'Vulkan-Loader-LICENSE.txt')) {
+        $previousNotice = Join-Path $runtime $name
+        if (Test-Path -LiteralPath $previousNotice) { Remove-Item -LiteralPath $previousNotice }
+    }
     Copy-Item (Join-Path $redist.FullName '*.dll') $runtime
+    if ($Backend -eq 'vulkan') {
+        $cache = Join-Path $root "target/dependencies/vulkan-$vulkanVersion"
+        New-Item -ItemType Directory -Path $cache -Force | Out-Null
+        $archive = Join-Path $cache "VulkanRT-X64-$vulkanVersion-Components.zip"
+        $archiveHash = 'a25a927aa8b9f0371048f1861cf88ac3b9bc9b1fb332c42d897c8ab32695769a'
+        Get-VerifiedDownload "https://sdk.lunarg.com/sdk/download/$vulkanVersion/windows/$(Split-Path $archive -Leaf)" $archive $archiveHash
+        $license = Join-Path $cache 'Vulkan-Loader-LICENSE.txt'
+        $licenseHash = '43c0a37e6a0fa7ff3c843b3ec5a4fac84b712558ddac103fbd4c1649662a9ece'
+        Get-VerifiedDownload "https://raw.githubusercontent.com/KhronosGroup/Vulkan-Loader/vulkan-sdk-$vulkanVersion/LICENSE.txt" $license $licenseHash
+        Expand-Archive -LiteralPath $archive -DestinationPath $cache -Force
+        $components = Join-Path $cache "VulkanRT-X64-$vulkanVersion-Components"
+        $loader = Join-Path $components 'x64/vulkan-1.dll'
+        $loaderHash = 'e1fcfc9489beefa6a6d9d11d6c7517f6a2b7f16e0d3fb8f4103bee0210f314a3'
+        if ((Get-FileHash $loader -Algorithm SHA256).Hash.ToLowerInvariant() -ne $loaderHash) {
+            throw 'Vulkan loader checksum mismatch'
+        }
+        $notice = Join-Path $components 'VulkanRT-License.txt'
+        $noticeHash = '404deb98dabf3e54bf9070d59676b31d69a3da2f9f6e56bdf09ad315c04c718c'
+        if ((Get-FileHash $notice -Algorithm SHA256).Hash.ToLowerInvariant() -ne $noticeHash) {
+            throw 'Vulkan runtime notice checksum mismatch'
+        }
+        Copy-Item $loader, $notice, $license $runtime
+        $vulkanRuntime = @{
+            version = $vulkanVersion; archiveSha256 = $archiveHash; loaderSha256 = $loaderHash
+            noticeSha256 = $noticeHash; licenseSha256 = $licenseHash
+        }
+    }
 
     Push-Location (Join-Path $root 'desktop')
     try {
-        & npm run tauri -- build --target $target --config src-tauri/bundle.windows.json --bundles nsis
+        & npm run tauri -- build --target $target --config src-tauri/bundle.windows.json --bundles nsis @featureArgs
         if ($LASTEXITCODE -ne 0) { throw 'desktop installer build failed' }
     } finally { Pop-Location }
     Get-SourceStatus 'after desktop bundle' | Out-Null
@@ -80,6 +147,7 @@ try {
     Copy-Item (Join-Path $release 'liazo.exe') $portable
     Copy-Item (Join-Path $release 'liazo-desktop.exe') $portable
     Copy-Item (Join-Path $runtime '*.dll') $portable
+    Get-ChildItem $runtime -Filter '*License*.txt' | Copy-Item -Destination $portable
     $dumpbin = Get-ChildItem (Join-Path $visualStudio 'VC/Tools/MSVC/*/bin/Hostx64/x64/dumpbin.exe') |
         Sort-Object FullName -Descending | Select-Object -First 1
     if (!$dumpbin) { throw 'dumpbin is unavailable' }
@@ -99,10 +167,13 @@ try {
     }
     & (Join-Path $portable 'liazo.exe') --help | Out-Null
     if ($LASTEXITCODE -ne 0) { throw 'packaged CLI failed to start' }
+    if ($Backend -eq 'vulkan') {
+        Copy-Item (Join-Path $runtime 'vulkan-1.dll') (Join-Path $release 'deps') -Force
+    }
     $previousCli = $env:LIAZO_TEST_CLI
     $env:LIAZO_TEST_CLI = Join-Path $portable 'liazo.exe'
     try {
-        & cargo test --locked --release --target $target -p liazo --test mcp_stdio
+        & cargo test --locked --release --target $target -p liazo --test mcp_stdio @featureArgs
         if ($LASTEXITCODE -ne 0) { throw 'packaged MCP smoke test failed' }
     } finally { $env:LIAZO_TEST_CLI = $previousCli }
 
@@ -118,12 +189,19 @@ try {
         sourceChanges = $sourceChanges
         target = $target
         cpu = $Cpu
+        backend = $Backend
+        cargoFeatures = @(if ($Backend -eq 'vulkan') { 'vulkan' })
+        vulkanRuntime = $vulkanRuntime
+        vulkanSdk = $(if ($Backend -eq 'vulkan') { @{ headerVersion = 363; archiveSha256 = $env:LIAZO_VULKAN_SDK_SHA256 } } else { $null })
+        runtimeDependencies = @(Get-ChildItem $runtime -File | Sort-Object Name | ForEach-Object {
+            @{ name = $_.Name; bytes = $_.Length; sha256 = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() }
+        })
         cpuRequirements = @(if ($Cpu -eq 'avx2') { 'SSE4.2'; 'AVX'; 'AVX2'; 'BMI2'; 'FMA'; 'F16C' } else { 'x86-64 baseline' })
         webview2 = 'installer embeds offline setup; portable desktop requires an installed WebView2 runtime'
         signing = 'unsigned'
-    } | ConvertTo-Json | Set-Content (Join-Path $output 'build.json') -Encoding utf8
+    } | ConvertTo-Json -Depth 6 | Set-Content (Join-Path $output 'build.json') -Encoding utf8
     Copy-Item (Join-Path $output 'build.json') $portable
-    Compress-Archive -Path (Join-Path $portable '*') -DestinationPath (Join-Path $output "liazo-$version-$target-$Cpu-portable.zip") -Force
+    Compress-Archive -Path (Join-Path $portable '*') -DestinationPath (Join-Path $output "liazo-$version-$target-$variant-portable.zip") -Force
     Copy-Item (Join-Path $release 'bundle/nsis/*-setup.exe') $output -Force
     Get-ChildItem $output -File | Where-Object Extension -in '.exe', '.zip' | ForEach-Object {
         $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()

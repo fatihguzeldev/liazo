@@ -1,6 +1,22 @@
 #!/bin/bash
 set -euo pipefail
 
+backend=metal
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --backend)
+      [[ $# -ge 2 ]] || { echo '--backend requires metal or cpu' >&2; exit 1; }
+      backend="$2"
+      shift 2
+      ;;
+    *) echo "unknown argument: $1" >&2; exit 1 ;;
+  esac
+done
+case "$backend" in
+  cpu|metal) ;;
+  *) echo "unsupported Mac backend: $backend" >&2; exit 1 ;;
+esac
+
 if [[ "$(uname -s)" != Darwin ]]; then
   echo 'macOS packaging requires a native Mac build' >&2
   exit 1
@@ -23,16 +39,19 @@ if [[ "$architecture" == x86_64 ]]; then
   export GGML_SSE42=OFF GGML_AVX=OFF GGML_AVX2=OFF GGML_BMI2=OFF GGML_FMA=OFF GGML_F16C=OFF
 fi
 export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,-rpath,@executable_path/../Frameworks"
-cargo build --locked --release --target "$target" -p liazo
+export CARGO_TARGET_DIR="$target_dir/packages/macos-$backend"
+build_args=(build --locked --release --target "$target" -p liazo)
+if [[ "$backend" == metal ]]; then build_args+=(--features metal); fi
+cargo "${build_args[@]}"
 
-output="$target_dir/distribution/$target"
+output="$target_dir/distribution/$target-$backend"
 mkdir -p "$output"
 staging="$(mktemp -d "$output/.package.XXXXXX")"
 trap 'rm -rf "$staging"' EXIT
 bundle="$staging/liazo.app"
 mkdir -p "$bundle/Contents/MacOS" "$bundle/Contents/Frameworks"
 mkdir -p "$bundle/Contents/Resources"
-cp "$target_dir/$target/release/liazo" "$bundle/Contents/MacOS/liazo"
+cp "$CARGO_TARGET_DIR/$target/release/liazo" "$bundle/Contents/MacOS/liazo"
 cp platform/macos/Info.plist "$bundle/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $version" "$bundle/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$bundle/Contents/Info.plist"
@@ -58,14 +77,16 @@ for executable in [bundle / "Contents/MacOS/liazo", *sorted((bundle / "Contents/
         raise SystemExit(f"unbundled runtime dependency: {dependency}")
 PY
 
-python3 - "$root" "$bundle/Contents/Resources/build.json" "$target" "$version" <<'PY'
+python3 - "$root" "$bundle/Contents/Resources/build.json" "$target" "$version" "$backend" <<'PY'
 import json, pathlib, subprocess, sys
-root, output, target, version = sys.argv[1:]
+root, output, target, version, backend = sys.argv[1:]
 source = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
 dirty = bool(subprocess.check_output(["git", "status", "--porcelain", "--untracked-files=normal"], cwd=root))
 pathlib.Path(output).write_text(json.dumps({
     "version": version, "source": source, "sourceDirty": dirty, "target": target,
     "cpu": "portable", "minimumSystemVersion": "14.2", "signing": "ad-hoc",
+    "backend": backend, "cargoFeatures": ["metal"] if backend == "metal" else [],
+    "metalShaderLibrary": "embedded" if backend == "metal" else None,
 }, indent=2) + "\n")
 PY
 
@@ -76,7 +97,7 @@ codesign --force --sign - --timestamp=none "$bundle"
 codesign --verify --deep --strict "$bundle"
 "$bundle/Contents/MacOS/liazo" --help >/dev/null
 
-archive="$output/liazo-$version-$target.zip"
+archive="$output/liazo-$version-$target-$backend.zip"
 ditto -c -k --sequesterRsrc --keepParent "$bundle" "$staging/package.zip"
 mv "$staging/package.zip" "$archive"
 rm -rf "$output/liazo.app"
