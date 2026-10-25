@@ -138,6 +138,8 @@ pub async fn serve(
         .route("/v1/capture", post(capture))
         .route("/v1/history", post(history))
         .route("/v1/transcripts", post(transcripts))
+        .route("/v1/raw-audio", post(raw_audio))
+        .route("/v1/audio-history", post(audio_history))
         .route("/v1/history-limits", post(history_limits))
         .route("/v1/transcribe", post(transcribe))
         .route("/v1/transcription-stop", post(transcription_stop))
@@ -401,6 +403,65 @@ async fn history_limits(
             .await?
             .configure_history(args.limits)?,
     ))
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct AudioMedia {
+    pub segment: Uuid,
+    pub reference: MediaRef,
+}
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct AudioHistoryResponse {
+    pub audio: liazo_runtime::archive::AudioPage,
+    pub media: Vec<AudioMedia>,
+    pub media_omitted: usize,
+}
+async fn raw_audio(
+    State(state): State<HttpState>,
+    Json(args): Json<RawAudio>,
+) -> Result<Json<serde_json::Value>, HostError> {
+    state
+        .host
+        .receiver(args.binding)
+        .await?
+        .configure_raw_audio(args.sources)
+        .await?;
+    Ok(Json(serde_json::json!({"applied":true})))
+}
+async fn audio_history(
+    State(state): State<HttpState>,
+    Json(args): Json<Transcripts>,
+) -> Result<Json<AudioHistoryResponse>, HostError> {
+    let mut audio = state
+        .host
+        .receiver(args.binding)
+        .await?
+        .history_audio(
+            Duration::from_millis(args.older_ms),
+            Duration::from_millis(args.newer_ms),
+            &args.sources,
+        )
+        .await?;
+    let mut media = vec![];
+    let mut omitted = 0;
+    for clip in &mut audio.clips {
+        if let Some(reference) = state
+            .media
+            .publish_audio(&clip.segment, std::mem::take(&mut clip.wav))
+        {
+            media.push(AudioMedia {
+                segment: clip.segment.id,
+                reference,
+            });
+        } else {
+            omitted += 1;
+        }
+    }
+    Ok(Json(AudioHistoryResponse {
+        audio,
+        media,
+        media_omitted: omitted,
+    }))
 }
 async fn transcribe(
     State(state): State<HttpState>,

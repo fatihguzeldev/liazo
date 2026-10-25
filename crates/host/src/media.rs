@@ -31,6 +31,32 @@ pub struct MediaRef {
 
 impl Media {
     pub fn publish(&self, metadata: &ImageMeta, bytes: Bytes) -> Option<MediaRef> {
+        self.publish_bytes(
+            metadata.source.clone(),
+            metadata.sequence,
+            metadata.format.mime_type(),
+            bytes,
+        )
+    }
+    pub fn publish_audio(
+        &self,
+        segment: &liazo_runtime::archive::AudioSegment,
+        bytes: Bytes,
+    ) -> Option<MediaRef> {
+        self.publish_bytes(
+            segment.source.clone(),
+            segment.packets[0].sequence,
+            "audio/wav",
+            bytes,
+        )
+    }
+    fn publish_bytes(
+        &self,
+        source: SourceKey,
+        sequence: u64,
+        mime: &'static str,
+        bytes: Bytes,
+    ) -> Option<MediaRef> {
         let mut items = self.0.lock().unwrap_or_else(|e| e.into_inner());
         items.retain(|_, item| item.expires > Instant::now());
         let used: usize = items.values().map(|item| item.bytes.len()).sum();
@@ -40,9 +66,9 @@ impl Media {
         let id = Uuid::new_v4();
         let reference = MediaRef {
             id,
-            source: metadata.source.clone(),
-            sequence: metadata.sequence,
-            content_type: metadata.format.mime_type(),
+            source,
+            sequence,
+            content_type: mime,
             length: bytes.len(),
         };
         items.insert(

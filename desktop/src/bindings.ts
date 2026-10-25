@@ -1,5 +1,17 @@
 /* generated from Rust; run npm run bindings */
 
+export type GapReason =
+  | "archive_backpressure"
+  | "archive_failure"
+  | "archive_stopped"
+  | "archive_interrupted"
+  | "disconnected"
+  | "stopped"
+  | "permission_required"
+  | "unavailable"
+  | "no_data"
+  | "skipped_frames"
+  | "capacity";
 export type ImageFormat = "png" | "jpeg";
 export type HistoryState =
   | {
@@ -21,18 +33,6 @@ export type HistoryState =
   | {
       state: "not_observed";
     };
-export type GapReason =
-  | "archive_backpressure"
-  | "archive_failure"
-  | "archive_stopped"
-  | "archive_interrupted"
-  | "disconnected"
-  | "stopped"
-  | "permission_required"
-  | "unavailable"
-  | "no_data"
-  | "skipped_frames"
-  | "capacity";
 export type ModelPhase =
   "verifying" | "missing" | "downloading" | "ready" | "failed";
 export type ArchivePhase = "recording" | "failed" | "stopping" | "stopped";
@@ -69,6 +69,7 @@ export type SourceKind =
   "display" | "window" | "system_audio" | "process_audio" | "microphone";
 
 export interface DesktopApi {
+  audio_history: AudioHistoryResponse;
   capture_request: Capture;
   configure_request: Configure;
   connect_request: Connect;
@@ -82,12 +83,78 @@ export interface DesktopApi {
   observation: ObservationResponse;
   observe_request: Observe;
   pair_request: Pair;
+  raw_audio_request: RawAudio;
   scope: Scope;
   session: SessionSummary | null;
   sources: SourceSnapshot;
   transcribe_request: Transcribe;
   transcripts: TranscriptPage;
   transcripts_request: Transcripts;
+}
+export interface AudioHistoryResponse {
+  audio: AudioPage;
+  media: AudioMedia[];
+  media_omitted: number;
+}
+export interface AudioPage {
+  capacity_before_ns: number | null;
+  clips: AudioClip[];
+  first_ns: number;
+  gaps: AudioGap[];
+  last_ns: number;
+  policy: AudioPolicyInterval[];
+  retention_floor_ns: number;
+  truncated: boolean;
+}
+export interface AudioClip {
+  segment: AudioSegment;
+}
+export interface AudioSegment {
+  channels: number;
+  id: string;
+  packets: AudioPacket[];
+  sample_rate: number;
+  source: SourceKey;
+  stream_id: string;
+}
+export interface AudioPacket {
+  captured_ns: number;
+  discontinuity: boolean;
+  frames: number;
+  received_ns: number;
+  receiver_range: ReceiverTimeRange | null;
+  sample_position: number;
+  sequence: number;
+}
+export interface ReceiverTimeRange {
+  earliest_ns: number;
+  latest_ns: number;
+}
+export interface SourceKey {
+  generation: string;
+  id: string;
+}
+export interface AudioGap {
+  end_ns: number | null;
+  first_ns: number;
+  reason: GapReason;
+  source: SourceKey | null;
+}
+export interface AudioPolicyInterval {
+  end_ns: number | null;
+  first_ns: number;
+  source: SourceKey;
+}
+export interface AudioMedia {
+  reference: MediaRef;
+  segment: string;
+}
+export interface MediaRef {
+  content_type: string;
+  id: string;
+  length: number;
+  sequence: number;
+  source: SourceKey;
 }
 export interface Capture {
   binding: SessionBinding;
@@ -96,10 +163,6 @@ export interface Capture {
 export interface SessionBinding {
   epoch: string;
   session: string;
-}
-export interface SourceKey {
-  generation: string;
-  id: string;
 }
 export interface Configure {
   binding: SessionBinding;
@@ -203,13 +266,6 @@ export interface ImageMeta {
   sequence: number;
   source: SourceKey;
   width: number;
-}
-export interface MediaRef {
-  content_type: string;
-  id: string;
-  length: number;
-  sequence: number;
-  source: SourceKey;
 }
 export interface History {
   age_ms: number;
@@ -330,6 +386,10 @@ export interface Pair {
   label: string;
   name: string;
 }
+export interface RawAudio {
+  binding: SessionBinding;
+  sources: SourceKey[];
+}
 export interface Scope {
   binding: SessionBinding;
 }
@@ -374,10 +434,6 @@ export interface ArchivedTranscript {
   received_ns: number;
   receiver_range: ReceiverTimeRange | null;
   transcript: Transcript;
-}
-export interface ReceiverTimeRange {
-  earliest_ns: number;
-  latest_ns: number;
 }
 export interface Transcripts {
   binding: SessionBinding;

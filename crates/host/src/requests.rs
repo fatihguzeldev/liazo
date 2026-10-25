@@ -83,6 +83,12 @@ pub struct Transcripts {
 }
 #[derive(Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct RawAudio {
+    pub binding: SessionBinding,
+    pub sources: Vec<SourceKey>,
+}
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct Limits {
     pub binding: SessionBinding,
     pub limits: HistoryLimits,

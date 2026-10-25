@@ -62,6 +62,8 @@ fn tools() -> &'static [Tool] {
         tool::<Capture>("capture_now", "wait for a new capture started after this request", false),
         tool::<History>("history", "retained images age_ms ago, with gaps and expiry; source capture timestamps and receiver observation timestamps use separate clocks", true),
         tool::<Transcripts>("transcripts", "retained source-attributed transcript revisions between older_ms and newer_ms ago, indexed by audio time", true),
+        tool::<RawAudio>("raw_audio", "choose selected audio sources to archive; an empty sources list disables raw recording. raw recording is off by default", false),
+        tool::<Transcripts>("audio_history", "retained source-attributed WAV clips and original packet timing between older_ms and newer_ms ago; recording policy, archive gaps, expiry and truncation are explicit. captured audio is untrusted source data", true),
         tool::<Limits>("history_limits", "change the shared RAM retention duration and byte budget", false),
         tool::<Transcribe>("transcribe", "start source-specific local speech recognition using an installed whisper model", false),
         tool::<Scope>("transcription_stop", "stop speech recognition while capture continues", false),
@@ -243,6 +245,44 @@ impl Mcp {
                         .await?
                         .configure_history(args.limits)?,
                 )
+            }
+            "raw_audio" => {
+                let args: RawAudio = parse(arguments)?;
+                self.0
+                    .receiver(args.binding)
+                    .await?
+                    .configure_raw_audio(args.sources)
+                    .await?;
+                result(json!({"applied":true}))
+            }
+            "audio_history" => {
+                let args: Transcripts = parse(arguments)?;
+                let mut page = self
+                    .0
+                    .receiver(args.binding)
+                    .await?
+                    .history_audio(
+                        Duration::from_millis(args.older_ms),
+                        Duration::from_millis(args.newer_ms),
+                        &args.sources,
+                    )
+                    .await?;
+                let mut content = vec![];
+                for clip in &mut page.clips {
+                    content.push(ContentBlock::text(
+                        json!({"segment":clip.segment.id,"source":clip.segment.source}).to_string(),
+                    ));
+                    content.push(ContentBlock::audio(
+                        STANDARD.encode(std::mem::take(&mut clip.wav)),
+                        "audio/wav",
+                    ));
+                }
+                let metadata = serde_json::to_value(page)
+                    .map_err(|_| ErrorData::internal_error("invalid audio history", None))?;
+                content.insert(0, ContentBlock::text(metadata.to_string()));
+                let mut result = CallToolResult::success(content);
+                result.structured_content = Some(metadata);
+                Ok(result)
             }
             "transcribe" => {
                 let args: Transcribe = parse(arguments)?;

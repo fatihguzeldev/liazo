@@ -20,6 +20,8 @@ struct DesktopApi {
     observation: ObservationResponse,
     history: HistoryResponse,
     transcripts: TranscriptPage,
+    audio_history: crate::http::AudioHistoryResponse,
+    raw_audio_request: requests::RawAudio,
     observe_request: requests::Observe,
     connect_request: requests::Connect,
     configure_request: requests::Configure,

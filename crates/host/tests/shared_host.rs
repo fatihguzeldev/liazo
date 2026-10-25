@@ -5,8 +5,8 @@ use liazo_core::{
     catalog::SourceSnapshot,
     control::{Failure, FailureCode},
     protocol::{
-        CaptureSettings, ImageFormat, ImageSubscription, Source, SourceAvailability, SourceKey,
-        SourceKind,
+        AudioMeta, CaptureSettings, ImageFormat, ImageSubscription, Source, SourceAvailability,
+        SourceKey, SourceKind,
     },
     wire::{Frame, Header, ImageMeta},
 };
@@ -45,6 +45,42 @@ fn source() -> SourceKey {
         generation: Uuid::from_u128(1),
     }
 }
+fn audio_source() -> SourceKey {
+    SourceKey {
+        id: "audio:fixture".into(),
+        generation: Uuid::from_u128(2),
+    }
+}
+struct Audio {
+    clock: Instant,
+    sequence: u64,
+    stream: Uuid,
+}
+#[async_trait]
+impl AudioTrack for Audio {
+    async fn next(&mut self) -> Result<Option<Frame>, Failure> {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        self.sequence += 1;
+        Ok(Some(
+            Frame::new(
+                Header::Audio(AudioMeta {
+                    source: audio_source(),
+                    stream_id: self.stream,
+                    sequence: self.sequence,
+                    sample_position: (self.sequence - 1) * 160,
+                    sample_rate: 16000,
+                    channels: 1,
+                    frames: 160,
+                    captured_ns: self.clock.elapsed().as_nanos() as u64,
+                    discontinuity: self.sequence == 1,
+                }),
+                Bytes::from(vec![0; 640]),
+            )
+            .unwrap(),
+        ))
+    }
+    async fn stop(self: Box<Self>) {}
+}
 struct Capture {
     clock: Instant,
     calls: AtomicUsize,
@@ -60,16 +96,28 @@ impl CaptureBackend for Capture {
     async fn discover(&self) -> Result<SourceSnapshot, Failure> {
         Ok(SourceSnapshot {
             revision: 1,
-            sources: vec![Source {
-                key: source(),
-                label: "fixture".into(),
-                kind: SourceKind::Display,
-                availability: SourceAvailability::Available,
-                pixel_width: Some(1),
-                pixel_height: Some(1),
-                scale: Some(1.),
-                process_id: None,
-            }],
+            sources: vec![
+                Source {
+                    key: source(),
+                    label: "fixture".into(),
+                    kind: SourceKind::Display,
+                    availability: SourceAvailability::Available,
+                    pixel_width: Some(1),
+                    pixel_height: Some(1),
+                    scale: Some(1.),
+                    process_id: None,
+                },
+                Source {
+                    key: audio_source(),
+                    label: "fixture audio".into(),
+                    kind: SourceKind::SystemAudio,
+                    availability: SourceAvailability::Available,
+                    pixel_width: None,
+                    pixel_height: None,
+                    scale: None,
+                    process_id: None,
+                },
+            ],
             issues: vec![],
         })
     }
@@ -98,11 +146,22 @@ impl CaptureBackend for Capture {
             Frame::new(Header::Image(meta), Bytes::from_static(b"fixture-image")).unwrap()
         })
     }
-    async fn audio(&self, _: &SourceKey, _: Uuid) -> Result<Box<dyn AudioTrack>, Failure> {
-        Err(Failure::new(
-            FailureCode::Unavailable,
-            "fixture has no audio",
-        ))
+    async fn audio(
+        &self,
+        source: &SourceKey,
+        stream: Uuid,
+    ) -> Result<Box<dyn AudioTrack>, Failure> {
+        if *source != audio_source() {
+            return Err(Failure::new(
+                FailureCode::Unavailable,
+                "unknown audio source",
+            ));
+        }
+        Ok(Box::new(Audio {
+            clock: self.clock,
+            sequence: 0,
+            stream,
+        }))
     }
 }
 
@@ -466,6 +525,70 @@ async fn authenticated_consumers_share_one_session_and_binary_media_without_a_gu
     );
     let scope: liazo_transport::SessionBinding = serde_json::from_value(binding.clone()).unwrap();
     let held = host.receiver(scope).await.unwrap();
+    let mut settings = held.settings();
+    settings.audio = vec![audio_source()];
+    held.configure(settings).await.unwrap();
+    let raw = mcp
+        .call_tool(
+            CallToolRequestParams::new("raw_audio").with_arguments(
+                json!({"binding":binding,"sources":[audio_source()]})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(raw.is_error, Some(false));
+    // Accumulate a real-time fixture interval before requesting its most recent 100 ms.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let audio = mcp
+        .call_tool(
+            CallToolRequestParams::new("audio_history").with_arguments(
+                json!({"binding":binding,"older_ms":100,"sources":[audio_source()]})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+        )
+        .await
+        .unwrap();
+    assert_eq!(audio.is_error, Some(false));
+    let data = audio
+        .content
+        .iter()
+        .find_map(|content| content.as_audio())
+        .expect("native MCP audio content");
+    assert_eq!(data.mime_type, "audio/wav");
+    assert_eq!(&STANDARD.decode(&data.data).unwrap()[..4], b"RIFF");
+    let audio: Value = client
+        .post(format!("{base}/v1/audio-history"))
+        .bearer_auth(token)
+        .json(&json!({"binding":binding,"older_ms":100,"sources":[audio_source()]}))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let reference = &audio["media"][0]["reference"];
+    assert_eq!(reference["content_type"], "audio/wav");
+    let wave = client
+        .get(format!(
+            "{base}/v1/media/{}",
+            reference["id"].as_str().unwrap()
+        ))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap();
+    assert_eq!(wave.headers()["content-type"], "audio/wav");
+    assert_eq!(&wave.bytes().await.unwrap()[..4], b"RIFF");
+    held.configure_raw_audio(vec![]).await.unwrap();
     let cursor = held.observe(0, false, &[], Duration::ZERO).await.cursor;
     let mut waiters = Vec::new();
     for _ in 0..8 {
