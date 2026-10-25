@@ -9,6 +9,9 @@ use std::{
 };
 use uuid::Uuid;
 
+mod index;
+pub use index::{ArchiveIdentity, ArchiveIndex};
+
 #[derive(Debug, thiserror::Error)]
 pub enum ArchiveError {
     #[error("archive storage is unavailable")]
@@ -21,6 +24,12 @@ pub enum ArchiveError {
     IdentityCollision,
     #[error("archive is already open")]
     Busy,
+    #[error("archive index is unavailable")]
+    Database(#[from] rusqlite::Error),
+    #[error("archive metadata is invalid")]
+    Metadata(#[from] serde_json::Error),
+    #[error("archive belongs to another session or version")]
+    SessionMismatch,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
