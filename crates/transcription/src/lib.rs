@@ -12,6 +12,7 @@ use whisper_rs::{
 };
 
 pub mod audio;
+pub mod streaming;
 
 pub const SAMPLE_RATE: usize = 16_000;
 pub const MAX_WINDOW_SAMPLES: usize = 30 * SAMPLE_RATE;
