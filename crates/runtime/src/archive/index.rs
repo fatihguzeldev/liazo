@@ -22,6 +22,18 @@ pub struct ArchiveIdentity {
     pub provider: Fingerprint,
     pub wall_anchor_unix_ms: u64,
 }
+impl ArchiveIdentity {
+    pub(crate) fn validate(self) -> Result<(), ArchiveError> {
+        if self.binding.session.is_nil()
+            || self.binding.epoch.is_nil()
+            || self.wall_anchor_unix_ms == 0
+            || self.wall_anchor_unix_ms > i64::MAX as u64 / 1_000_000
+        {
+            return Err(ArchiveError::SessionMismatch);
+        }
+        Ok(())
+    }
+}
 
 struct StoredImage {
     row: i64,
@@ -40,9 +52,7 @@ impl ArchiveIndex {
         limits: ArchiveLimits,
     ) -> Result<Self, ArchiveError> {
         limits.validate()?;
-        if identity.binding.session.is_nil() || identity.binding.epoch.is_nil() {
-            return Err(ArchiveError::SessionMismatch);
-        }
+        identity.validate()?;
         let payloads = PayloadStore::open(&root.join("payloads"))?;
         let database = Connection::open(root.join("index.sqlite3"))?;
         let version: i64 = database.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -107,7 +117,13 @@ impl ArchiveIndex {
         archive.initialize_lifecycle()?;
         archive.initialize_audio()?;
         archive.make_room(0, 0)?;
+        archive.database.execute("INSERT INTO meta (key,value) VALUES ('limits',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [serde_json::to_string(&limits)?])?;
         Ok(archive)
+    }
+
+    pub fn open_existing(root: &Path) -> Result<Self, ArchiveError> {
+        let info = super::ArchiveInfo::read(root)?;
+        Self::open(root, info.identity()?, info.limits)
     }
 
     pub fn record_image(

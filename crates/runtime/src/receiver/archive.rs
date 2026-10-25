@@ -184,6 +184,17 @@ impl ReceiverSession {
         Ok(())
     }
 
+    pub async fn retire_archive(&self) -> Result<(), RuntimeError> {
+        let mut owner = self.0.archive.lock().await;
+        if let Some(worker) = owner.as_mut()
+            && !worker.stop().await
+        {
+            return Err(ArchiveError::Busy.into());
+        }
+        owner.take();
+        Ok(())
+    }
+
     pub async fn history_transcripts(
         &self,
         older: Duration,

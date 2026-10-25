@@ -17,8 +17,10 @@ mod transcripts;
 pub use transcripts::{ArchivedTranscript, ReceiverTimeRange, TranscriptPage};
 mod audio;
 mod audio_groups;
+mod info;
 mod lifecycle;
 pub use audio::{AudioClip, AudioPacket, AudioPage, AudioPolicyInterval, AudioSegment};
+pub use info::ArchiveInfo;
 mod worker;
 pub(crate) use worker::ArchiveRecord;
 pub use worker::{ArchiveClient, ArchivePhase, ArchiveStatus, ArchiveWorker};
@@ -45,6 +47,8 @@ pub enum ArchiveError {
     Capacity,
     #[error("archive worker stopped")]
     Stopped,
+    #[error("archive not found")]
+    NotFound,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

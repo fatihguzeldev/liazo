@@ -3,7 +3,7 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ArchiveLimits {
     pub duration_ms: u64,
     pub max_bytes: u64,
