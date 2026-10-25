@@ -13,6 +13,14 @@ use tokio::sync::oneshot;
 
 impl ReceiverSession {
     #[cfg(any(test, feature = "test-support"))]
+    pub fn archive_start_threads(&self) -> u64 {
+        self.0.archive_start.started_threads()
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hold_archive_start(&self) -> Result<crate::archive::ArchiveTestHold, RuntimeError> {
+        Ok(self.0.archive_start.hold()?)
+    }
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn set_archive_database_full(&self, enabled: bool) -> Result<(), RuntimeError> {
         let archive = self
             .archive_client()
@@ -84,12 +92,13 @@ impl ReceiverSession {
             return Err(ArchiveError::Busy.into());
         }
         owner.take();
-        let worker = ArchiveWorker::start_with_budget(
+        let worker = ArchiveWorker::start_with_gate(
             root,
             self.archive_identity(),
             limits,
             self.0.shared.clock,
             budget,
+            self.0.archive_start.clone(),
         )
         .await?;
         let client = worker.client();

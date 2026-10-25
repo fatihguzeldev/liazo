@@ -481,6 +481,171 @@ mod storage_failures {
         (fixture, session, provider, archive)
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn stalled_startup_is_bounded_without_spawning_retry_threads_for_a_receiver_or_profile() {
+        for profile_budget in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let catalog =
+                liazo_runtime::archive::ArchiveCatalog::spawn(directory.path().to_owned()).unwrap();
+            let budget = profile_budget.then(|| catalog.budget(4 * 1024 * 1024).unwrap());
+            let first_fixture = fixture(vec![], true);
+            let (first, first_provider) = pair(first_fixture.clone()).await;
+            let settings = CaptureSettings {
+                images: vec![ImageSubscription {
+                    source: source(false),
+                    interval_ms: 50,
+                    max_width: None,
+                    crop: None,
+                    format: ImageFormat::Png,
+                    quality: 90,
+                    include_cursor: false,
+                }],
+                audio: vec![source(true)],
+            };
+            first.configure(settings.clone()).await.unwrap();
+            first_fixture.gate.add_permits(1);
+            let before = progress(&first, 0, 0).await;
+            let mut held = if let Some(budget) = &budget {
+                budget.hold_start().unwrap()
+            } else {
+                first.hold_archive_start().unwrap()
+            };
+            let root = |session: &ReceiverSession| {
+                let binding = session.archive_identity().binding;
+                if profile_budget {
+                    directory
+                        .path()
+                        .join(binding.session.to_string())
+                        .join(binding.epoch.to_string())
+                } else {
+                    directory.path().to_owned()
+                }
+            };
+            let first_root = root(&first);
+            let pending = first.clone();
+            let pending_root = first_root.clone();
+            let pending_budget = budget.clone();
+            let start = tokio::spawn(async move {
+                pending
+                    .start_archive_with_budget(
+                        pending_root,
+                        ArchiveLimits {
+                            duration_ms: 60_000,
+                            max_bytes: 4 * 1024 * 1024,
+                        },
+                        pending_budget,
+                    )
+                    .await
+            });
+            held.wait_started().await.unwrap();
+            progress(
+                &first,
+                before.images[0].metadata.sequence,
+                before.audio[0].sequence,
+            )
+            .await;
+            assert!(matches!(
+                timeout(Duration::from_secs(4), start)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                Err(liazo_runtime::RuntimeError::Archive(
+                    liazo_runtime::archive::ArchiveError::Busy
+                ))
+            ));
+            assert!(!first_root.join("index.sqlite3").exists());
+            let (session, provider, fixture) = if profile_budget {
+                finish(first, first_provider, first_fixture).await;
+                let fixture = super::fixture(vec![], true);
+                let (session, provider) = pair(fixture.clone()).await;
+                session.configure(settings).await.unwrap();
+                fixture.gate.add_permits(1);
+                progress(&session, 0, 0).await;
+                (session, provider, fixture)
+            } else {
+                (first, first_provider, first_fixture)
+            };
+            for _ in 0..5 {
+                let result = timeout(
+                    Duration::from_secs(1),
+                    session.start_archive_with_budget(
+                        root(&session),
+                        ArchiveLimits {
+                            duration_ms: 60_000,
+                            max_bytes: 4 * 1024 * 1024,
+                        },
+                        budget.clone(),
+                    ),
+                )
+                .await
+                .unwrap();
+                assert!(matches!(
+                    result,
+                    Err(liazo_runtime::RuntimeError::Archive(
+                        liazo_runtime::archive::ArchiveError::Busy
+                    ))
+                ));
+            }
+            assert_eq!(
+                budget.as_ref().map_or_else(
+                    || session.archive_start_threads(),
+                    |budget| budget.started_threads()
+                ),
+                1
+            );
+            let fresh = timeout(
+                Duration::from_secs(2),
+                session.capture_now(vec![source(false)]),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(fresh.images[0].payload.is_some());
+            drop(held);
+            timeout(Duration::from_secs(3), async {
+                loop {
+                    match session
+                        .start_archive_with_budget(
+                            root(&session),
+                            ArchiveLimits {
+                                duration_ms: 60_000,
+                                max_bytes: 4 * 1024 * 1024,
+                            },
+                            budget.clone(),
+                        )
+                        .await
+                    {
+                        Ok(()) => break,
+                        Err(liazo_runtime::RuntimeError::Archive(
+                            liazo_runtime::archive::ArchiveError::Busy,
+                        )) => tokio::time::sleep(Duration::from_millis(10)).await,
+                        Err(error) => panic!("startup recovery failed: {error}"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                budget.as_ref().map_or_else(
+                    || session.archive_start_threads(),
+                    |budget| budget.started_threads()
+                ),
+                2
+            );
+            session
+                .configure_raw_audio(vec![source(true)])
+                .await
+                .unwrap();
+            session.flush_archive().await.unwrap();
+            assert_eq!(
+                session.archive_status().unwrap().phase,
+                ArchivePhase::Recording
+            );
+            session.retire_archive().await.unwrap();
+            finish(session, provider, fixture).await;
+        }
+    }
+
     async fn progress(
         session: &ReceiverSession,
         image: u64,

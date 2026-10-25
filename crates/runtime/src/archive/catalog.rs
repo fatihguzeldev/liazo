@@ -81,6 +81,7 @@ enum Command {
 struct Owner {
     sender: SyncSender<Command>,
     closing: Arc<AtomicBool>,
+    start_gate: super::budget::ArchiveStartGate,
 }
 impl Drop for Owner {
     fn drop(&mut self) {
@@ -207,7 +208,14 @@ impl ArchiveCatalog {
                     }
                 }
             })?;
-        Ok(Self(Arc::new(Owner { sender, closing })))
+        Ok(Self(Arc::new(Owner {
+            sender,
+            closing,
+            start_gate: super::budget::ArchiveStartGate::default(),
+        })))
+    }
+    pub(crate) fn start_gate(&self) -> super::budget::ArchiveStartGate {
+        self.0.start_gate.clone()
     }
     pub(super) fn claim_budget(
         &self,

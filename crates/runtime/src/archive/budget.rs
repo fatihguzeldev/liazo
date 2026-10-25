@@ -8,12 +8,78 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 use uuid::Uuid;
 
 const ROOT_RESERVE: u64 = 64 * 1024;
+
+#[derive(Clone, Default)]
+pub(crate) struct ArchiveStartGate(Arc<StartGate>);
+#[derive(Default)]
+struct StartGate {
+    held: AtomicBool,
+    #[cfg(any(test, feature = "test-support"))]
+    started: AtomicU64,
+    #[cfg(any(test, feature = "test-support"))]
+    pause: std::sync::Mutex<Option<super::worker::StartPause>>,
+}
+pub(crate) struct ArchiveStartPermit {
+    gate: Arc<StartGate>,
+    #[cfg(any(test, feature = "test-support"))]
+    pause: Option<super::worker::StartPause>,
+}
+impl ArchiveStartGate {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn started_threads(&self) -> u64 {
+        self.0.started.load(Ordering::Acquire)
+    }
+    pub(crate) fn acquire(&self) -> Result<ArchiveStartPermit, ArchiveError> {
+        self.0
+            .held
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| ArchiveError::Busy)?;
+        Ok(ArchiveStartPermit {
+            gate: self.0.clone(),
+            #[cfg(any(test, feature = "test-support"))]
+            pause: self
+                .0
+                .pause
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(),
+        })
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn hold(&self) -> Result<super::ArchiveTestHold, ArchiveError> {
+        let mut pause = self.0.pause.lock().unwrap_or_else(|e| e.into_inner());
+        if self.0.held.load(Ordering::Acquire)
+            || pause.as_ref().is_some_and(|pause| !pause.released())
+        {
+            return Err(ArchiveError::Busy);
+        }
+        let (held, waiting) = super::ArchiveTestHold::startup();
+        *pause = Some(waiting);
+        Ok(held)
+    }
+}
+impl ArchiveStartPermit {
+    pub(crate) fn before_open(&mut self) {
+        #[cfg(any(test, feature = "test-support"))]
+        {
+            self.gate.started.fetch_add(1, Ordering::AcqRel);
+            if let Some(pause) = self.pause.take() {
+                pause.wait();
+            }
+        }
+    }
+}
+impl Drop for ArchiveStartPermit {
+    fn drop(&mut self) {
+        self.gate.held.store(false, Ordering::Release);
+    }
+}
 #[derive(Serialize, Deserialize)]
 struct ProfilePolicy {
     max_bytes: u64,
@@ -106,6 +172,17 @@ impl ArchiveCatalog {
 }
 
 impl ArchiveBudget {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn started_threads(&self) -> u64 {
+        self.start_gate().started_threads()
+    }
+    pub(crate) fn start_gate(&self) -> ArchiveStartGate {
+        self.catalog.start_gate()
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn hold_start(&self) -> Result<super::ArchiveTestHold, ArchiveError> {
+        self.start_gate().hold()
+    }
     pub(super) fn claim(
         &self,
         root: &Path,

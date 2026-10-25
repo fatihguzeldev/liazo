@@ -75,6 +75,7 @@ impl Drop for PendingGuard {
 struct Owner {
     finalizer: Mutex<Option<JoinHandle<()>>>,
     archive: tokio::sync::Mutex<Option<crate::archive::ArchiveWorker>>,
+    archive_start: crate::archive::ArchiveStartGate,
     cleanup: JoinHandle<()>,
     speech: tokio::sync::Mutex<Option<crate::speech::SpeechTask>>,
     shared: Arc<Shared>,
@@ -263,6 +264,7 @@ impl ReceiverSession {
         let receiver = Self(Arc::new(Owner {
             finalizer: Mutex::new(None),
             archive: tokio::sync::Mutex::new(None),
+            archive_start: crate::archive::ArchiveStartGate::default(),
             cleanup,
             speech: tokio::sync::Mutex::new(None),
             shared,

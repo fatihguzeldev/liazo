@@ -260,6 +260,52 @@ pub struct ArchiveWorker {
 #[cfg(any(test, feature = "test-support"))]
 pub struct ArchiveTestHold {
     release: Option<std::sync::mpsc::Sender<()>>,
+    started: Option<oneshot::Receiver<()>>,
+}
+#[cfg(any(test, feature = "test-support"))]
+pub(super) struct StartPause {
+    release: std::sync::mpsc::Receiver<()>,
+    started: oneshot::Sender<()>,
+}
+#[cfg(any(test, feature = "test-support"))]
+impl StartPause {
+    pub(super) fn released(&self) -> bool {
+        !matches!(
+            self.release.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        )
+    }
+    pub(super) fn wait(self) {
+        let _ = self.started.send(());
+        let _ = self.release.recv();
+    }
+}
+#[cfg(any(test, feature = "test-support"))]
+impl ArchiveTestHold {
+    pub(super) fn startup() -> (Self, StartPause) {
+        let (release, waiting) = std::sync::mpsc::channel();
+        let (started, ready) = oneshot::channel();
+        (
+            Self {
+                release: Some(release),
+                started: Some(ready),
+            },
+            StartPause {
+                release: waiting,
+                started,
+            },
+        )
+    }
+    pub async fn wait_started(&mut self) -> Result<(), ArchiveError> {
+        if let Some(started) = self.started.as_mut() {
+            tokio::time::timeout(Duration::from_secs(3), started)
+                .await
+                .map_err(|_| ArchiveError::Busy)?
+                .map_err(|_| ArchiveError::Stopped)?;
+            self.started.take();
+        }
+        Ok(())
+    }
 }
 #[cfg(any(test, feature = "test-support"))]
 impl Drop for ArchiveTestHold {
@@ -321,6 +367,7 @@ impl ArchiveClient {
         let (release, blocked) = std::sync::mpsc::channel();
         let guard = ArchiveTestHold {
             release: Some(release),
+            started: None,
         };
         let (started, ready) = oneshot::channel();
         self.sender
@@ -625,6 +672,29 @@ impl ArchiveWorker {
         clock: Instant,
         budget: Option<super::ArchiveBudget>,
     ) -> Result<Self, ArchiveError> {
+        Self::start_with_gate(
+            root,
+            identity,
+            limits,
+            clock,
+            budget,
+            super::ArchiveStartGate::default(),
+        )
+        .await
+    }
+    pub(crate) async fn start_with_gate(
+        root: PathBuf,
+        identity: ArchiveIdentity,
+        limits: ArchiveLimits,
+        clock: Instant,
+        budget: Option<super::ArchiveBudget>,
+        gate: super::ArchiveStartGate,
+    ) -> Result<Self, ArchiveError> {
+        let mut start = budget
+            .as_ref()
+            .map(super::ArchiveBudget::start_gate)
+            .unwrap_or(gate)
+            .acquire()?;
         let (sender, receiver) = mpsc::channel(QUEUE);
         let control = Arc::new(Control {
             raw_audio: RwLock::new(vec![]),
@@ -656,6 +726,14 @@ impl ArchiveWorker {
         let thread = std::thread::Builder::new()
             .name("liazo-archive".into())
             .spawn(move || {
+                // Keep the admission permit until the native thread (including
+                // index cleanup) exits, even when readiness times out.
+                start.before_open();
+                if worker_control.abort.load(Ordering::Acquire) {
+                    let _ = started.send(Err(ArchiveError::Stopped));
+                    let _ = completed.send(());
+                    return;
+                }
                 let mut index = match ArchiveIndex::open_with_budget(
                     &root, identity, limits, budget,
                 )
@@ -695,7 +773,10 @@ impl ArchiveWorker {
             thread: Some(thread),
             ticker,
         };
-        ready.await.map_err(|_| ArchiveError::Stopped)??;
+        tokio::time::timeout(Duration::from_secs(3), ready)
+            .await
+            .map_err(|_| ArchiveError::Busy)?
+            .map_err(|_| ArchiveError::Stopped)??;
         Ok(worker)
     }
     pub fn client(&self) -> ArchiveClient {

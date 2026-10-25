@@ -22,6 +22,7 @@ mod catalog;
 mod cleanup;
 mod info;
 pub use budget::ArchiveBudget;
+pub(crate) use budget::ArchiveStartGate;
 pub use catalog::{ArchiveCatalog, ArchiveSource, ArchiveSources, CatalogPage};
 mod lifecycle;
 pub use audio::{AudioClip, AudioPacket, AudioPage, AudioPolicyInterval, AudioSegment};
