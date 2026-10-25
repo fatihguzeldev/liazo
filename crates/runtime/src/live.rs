@@ -1,15 +1,18 @@
+use crate::history::{GapReason, HistoryLimits, RamHistory};
 use crate::transcripts::{TranscriptBuffer, TranscriptionStatus};
 use bytes::Bytes;
 use liazo_core::transcript::Transcript;
 use liazo_core::{
     catalog::SourceSnapshot,
     control::{Event, Failure},
-    protocol::{AudioMeta, CaptureSettings, SourceAvailability, SourceKey},
+    protocol::{AudioMeta, CaptureSettings, ImageSubscription, SourceAvailability, SourceKey},
     wire::{Frame, Header, ImageMeta},
 };
 use liazo_transport::SessionBinding;
 use serde::Serialize;
 use std::collections::HashMap;
+use std::time::Duration;
+use uuid::Uuid;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -100,6 +103,7 @@ struct Image {
     metadata: ImageMeta,
     payload: Bytes,
     changed_at: u64,
+    payload_id: Uuid,
 }
 struct Health {
     observed_ns: u64,
@@ -107,6 +111,7 @@ struct Health {
 }
 
 pub(crate) struct LiveState {
+    pub history: RamHistory,
     pub transcripts: TranscriptBuffer,
     pub binding: SessionBinding,
     pub connection: ConnectionState,
@@ -115,7 +120,7 @@ pub(crate) struct LiveState {
     pub settings: CaptureSettings,
     pub sources: SourceSnapshot,
     pub clock: Option<ClockMap>,
-    expected: Vec<SourceKey>,
+    expected: Vec<ImageSubscription>,
     expected_audio: Vec<SourceKey>,
     images: HashMap<SourceKey, Image>,
     audio: HashMap<SourceKey, AudioMeta>,
@@ -126,6 +131,7 @@ pub(crate) struct LiveState {
 impl LiveState {
     pub fn new(binding: SessionBinding) -> Self {
         Self {
+            history: RamHistory::new(HistoryLimits::default()).unwrap(),
             transcripts: TranscriptBuffer::default(),
             binding,
             connection: ConnectionState::Connecting,
@@ -150,14 +156,20 @@ impl LiveState {
         self.cursor = self.cursor.saturating_add(1);
     }
     pub fn preparing(&mut self, settings: &CaptureSettings) {
-        self.expected = settings
-            .images
-            .iter()
-            .map(|image| image.source.clone())
-            .collect();
+        self.expected = settings.images.clone();
         self.expected_audio = settings.audio.clone();
     }
-    pub fn applied(&mut self, revision: u64, settings: CaptureSettings) {
+    pub fn applied(&mut self, revision: u64, settings: CaptureSettings, now: u64) {
+        for old in &self.settings.images {
+            if !settings
+                .images
+                .iter()
+                .any(|image| image.source == old.source)
+            {
+                self.history
+                    .gap(old.source.clone(), now, GapReason::Stopped);
+            }
+        }
         self.revision = revision;
         self.settings = settings;
         self.expected.clear();
@@ -176,7 +188,7 @@ impl LiveState {
                 .images
                 .iter()
                 .any(|image| image.source == *source)
-                || self.expected.contains(source)
+                || self.expected.iter().any(|image| image.source == *source)
         });
         self.audio.retain(|source, _| {
             self.settings.audio.contains(source) || self.expected_audio.contains(source)
@@ -190,14 +202,17 @@ impl LiveState {
         });
     }
 
-    pub fn image(&mut self, frame: Frame) -> Result<(), ()> {
+    pub fn image(&mut self, frame: Frame, now: u64) -> Result<(), ()> {
         let (meta, unchanged) = match frame.header {
             Header::Image(meta) => (meta, false),
             Header::Unchanged(meta) => (meta, true),
             _ => return Err(()),
         };
         if meta.configuration_revision < self.revision
-            || !(self.expected.contains(&meta.source)
+            || !(self
+                .expected
+                .iter()
+                .any(|image| image.source == meta.source)
                 || self
                     .settings
                     .images
@@ -242,6 +257,24 @@ impl LiveState {
         } else {
             self.cursor.saturating_add(1)
         };
+        let payload_id = if unchanged {
+            old.unwrap().payload_id
+        } else {
+            Uuid::new_v4()
+        };
+        let interval_ms = self
+            .expected
+            .iter()
+            .chain(&self.settings.images)
+            .find(|image| image.source == meta.source)
+            .map_or(500, |image| image.interval_ms);
+        self.history.image(
+            meta.clone(),
+            payload_id,
+            payload.clone(),
+            now,
+            Duration::from_millis(u64::from(interval_ms) * 3 + 1000),
+        );
         if self
             .failures
             .get(&meta.source)
@@ -255,6 +288,7 @@ impl LiveState {
                 metadata: meta,
                 payload,
                 changed_at,
+                payload_id,
             },
         );
         self.changed();
@@ -290,7 +324,7 @@ impl LiveState {
         Ok(true)
     }
 
-    pub fn event(&mut self, event: Event) {
+    pub fn event(&mut self, event: Event, now: u64) {
         if let Event::SourceStatus {
             source,
             revision,
@@ -316,6 +350,13 @@ impl LiveState {
                 return;
             }
             if let Some(failure) = failure {
+                let reason = if failure.code == liazo_core::control::FailureCode::PermissionRequired
+                {
+                    GapReason::PermissionRequired
+                } else {
+                    GapReason::Unavailable
+                };
+                self.history.gap(source.clone(), now, reason);
                 self.failures.insert(
                     source,
                     Health {
@@ -327,6 +368,17 @@ impl LiveState {
                 self.failures.remove(&source);
             }
             self.changed();
+        }
+    }
+
+    pub fn connection_ended(&mut self, now: u64) {
+        let reason = if self.connection == ConnectionState::Stopped {
+            GapReason::Stopped
+        } else {
+            GapReason::Disconnected
+        };
+        for source in self.images.keys() {
+            self.history.gap(source.clone(), now, reason);
         }
     }
 

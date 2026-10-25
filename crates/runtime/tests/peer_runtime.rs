@@ -230,3 +230,72 @@ async fn fresh_capture_waits_for_a_capture_started_after_the_request_and_cursors
     session.stop().await.unwrap();
     provider.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn history_expires_in_the_background_while_the_current_live_image_stays_available() {
+    use liazo_runtime::history::{GapReason, HistoryLimits, HistoryState};
+    let capture = capture();
+    capture.gate.add_permits(1);
+    let (session, provider) = pair(capture).await;
+    session.configure(settings()).await.unwrap();
+    timeout(Duration::from_secs(1), async {
+        let mut cursor = 0;
+        loop {
+            let observed = session
+                .observe(cursor, false, &[], Duration::from_millis(100))
+                .await;
+            if !observed.images.is_empty() {
+                break;
+            }
+            cursor = observed.cursor;
+        }
+    })
+    .await
+    .unwrap();
+    let retained = session
+        .history_at(Duration::ZERO, &[source()])
+        .await
+        .unwrap();
+    assert!(matches!(
+        retained.images[0].state,
+        HistoryState::Available | HistoryState::Sampled
+    ));
+    assert_eq!(
+        retained.images[0].payload.as_ref().unwrap().as_ref(),
+        b"fixture-image"
+    );
+    assert!(
+        session
+            .history_at(Duration::ZERO, &[source(), source()])
+            .await
+            .is_err()
+    );
+    session
+        .configure_history(HistoryLimits {
+            duration_ms: 100,
+            max_bytes: 4096,
+        })
+        .unwrap();
+    timeout(Duration::from_secs(1), async {
+        while session.history_stats().payloads != 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let current = session.observe(0, true, &[], Duration::ZERO).await;
+    assert_eq!(
+        current.images[0].payload.as_ref().unwrap().as_ref(),
+        b"fixture-image"
+    );
+    session.stop().await.unwrap();
+    let stopped = session
+        .history_at(Duration::ZERO, &[source()])
+        .await
+        .unwrap();
+    assert_eq!(
+        stopped.images[0].state,
+        HistoryState::Gap(GapReason::Stopped)
+    );
+    provider.await.unwrap().unwrap();
+}

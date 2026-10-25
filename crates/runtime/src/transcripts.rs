@@ -75,6 +75,11 @@ impl TranscriptBuffer {
                 self.close_partial(gap, cursor, now);
             }
         }
+        self.trim(now);
+        true
+    }
+
+    pub fn trim(&mut self, now: u64) {
         while self
             .rows
             .front()
@@ -91,7 +96,6 @@ impl TranscriptBuffer {
                 self.expired = self.expired.max(row.changed);
             }
         }
-        true
     }
 
     fn close_partial(&mut self, gap: TranscriptionGap, cursor: u64, now: u64) {

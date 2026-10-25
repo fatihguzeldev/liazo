@@ -69,6 +69,7 @@ impl Drop for PendingGuard {
 }
 
 struct Owner {
+    cleanup: JoinHandle<()>,
     speech: tokio::sync::Mutex<Option<crate::speech::SpeechTask>>,
     shared: Arc<Shared>,
     supervisor: Mutex<Option<JoinHandle<()>>>,
@@ -79,6 +80,7 @@ struct Owner {
 impl Drop for Owner {
     fn drop(&mut self) {
         self.shared.cancelled.cancel();
+        self.cleanup.abort();
     }
 }
 
@@ -125,9 +127,11 @@ impl ReceiverSession {
                             {
                                 let mut state = reader.state.lock().unwrap_or_else(|e| e.into_inner());
                                 match &reply.result {
-                                    ReplyValue::Applied { revision, settings } => state.applied(*revision, settings.clone()),
+                                    ReplyValue::Applied { revision, settings } => state.applied(*revision, settings.clone(), reader.now_ns()),
                                     ReplyValue::Stopped => {
-                                        state.connection = ConnectionState::Stopped; state.changed();
+                                        state.connection = ConnectionState::Stopped;
+                                        state.connection_ended(reader.now_ns());
+                                        state.changed();
                                         let receipt = Frame::new(Header::Pong { nonce: reply.id }, Bytes::new())?;
                                         reader.sender.try_send(receipt).map_err(|_| RuntimeError::Closed)?;
                                     },
@@ -140,7 +144,7 @@ impl ReceiverSession {
                     }
                     Some(Header::Event(Event::CatalogChanged { .. })) => reader.sources_dirty.notify_one(),
                     Some(Header::Event(event)) => {
-                        reader.state.lock().unwrap_or_else(|e| e.into_inner()).event(event);
+                        reader.state.lock().unwrap_or_else(|e| e.into_inner()).event(event, reader.now_ns());
                         reader.signal();
                     }
                     _ => return Err(RuntimeError::Protocol),
@@ -159,7 +163,7 @@ impl ReceiverSession {
             let mut stream = peer.images;
             loop {
                 let frame = tokio::select! { _ = images.cancelled.cancelled() => return Ok(()), frame = Frame::read_from(&mut stream) => frame? };
-                images.state.lock().unwrap_or_else(|e| e.into_inner()).image(frame.ok_or(RuntimeError::Closed)?).map_err(|_| RuntimeError::Protocol)?;
+                images.state.lock().unwrap_or_else(|e| e.into_inner()).image(frame.ok_or(RuntimeError::Closed)?, images.now_ns()).map_err(|_| RuntimeError::Protocol)?;
                 images.signal();
             }
         });
@@ -203,6 +207,7 @@ impl ReceiverSession {
                     state.connection = ConnectionState::Disconnected;
                     state.gaps += 1;
                 }
+                state.connection_ended(supervisor_state.now_ns());
                 state.changed();
             }
             supervisor_state
@@ -214,7 +219,20 @@ impl ReceiverSession {
             supervisor_state.signal();
             while tasks.join_next().await.is_some() {}
         });
+        let retention = shared.clone();
+        let cleanup = tokio::spawn(async move {
+            let mut ticks = tokio::time::interval(Duration::from_millis(250));
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticks.tick().await;
+                let mut state = retention.state.lock().unwrap_or_else(|e| e.into_inner());
+                let now = retention.now_ns();
+                state.history.trim(now);
+                state.transcripts.trim(now);
+            }
+        });
         let receiver = Self(Arc::new(Owner {
+            cleanup,
             speech: tokio::sync::Mutex::new(None),
             shared,
             supervisor: Mutex::new(Some(supervisor)),
@@ -277,6 +295,87 @@ impl ReceiverSession {
     }
     pub fn subscribe_audio(&self) -> broadcast::Receiver<Frame> {
         self.0.shared.audio.subscribe()
+    }
+
+    pub fn configure_history(
+        &self,
+        limits: crate::history::HistoryLimits,
+    ) -> Result<crate::history::HistoryLimits, RuntimeError> {
+        let mut state = self
+            .0
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        state
+            .history
+            .configure(limits, self.0.shared.now_ns())
+            .map_err(|message| failure(FailureCode::InvalidRequest, message))?;
+        state.changed();
+        drop(state);
+        self.0.shared.signal();
+        Ok(limits)
+    }
+
+    pub fn history_stats(&self) -> crate::history::HistoryStats {
+        self.0
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .history
+            .stats()
+    }
+
+    pub async fn history_at(
+        &self,
+        age: Duration,
+        selected: &[SourceKey],
+    ) -> Result<crate::history::HistorySnapshot, RuntimeError> {
+        if selected.len() > 8 {
+            return Err(failure(
+                FailureCode::InvalidRequest,
+                "select at most eight image sources",
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for source in selected {
+            source
+                .validate()
+                .map_err(|error| failure(FailureCode::InvalidRequest, &error.to_string()))?;
+            if !seen.insert(source) {
+                return Err(failure(
+                    FailureCode::InvalidRequest,
+                    "duplicate history source",
+                ));
+            }
+        }
+        let mut state = self
+            .0
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let now = self.0.shared.now_ns();
+        let ago = u64::try_from(age.as_nanos())
+            .map_err(|_| failure(FailureCode::InvalidRequest, "invalid history time"))?;
+        let at = now.checked_sub(ago).ok_or_else(|| {
+            failure(
+                FailureCode::InvalidRequest,
+                "requested time predates this session",
+            )
+        })?;
+        let selected: Vec<_> = if selected.is_empty() {
+            state
+                .settings
+                .images
+                .iter()
+                .map(|image| image.source.clone())
+                .collect()
+        } else {
+            selected.to_vec()
+        };
+        Ok(state.history.at(at, now, &selected))
     }
 
     pub async fn start_transcription(
