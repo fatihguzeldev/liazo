@@ -54,6 +54,8 @@ test.beforeEach(async ({ page }) => {
       rawAudio: [] as (typeof audio)[],
       retainedAudio: false,
       audioExpired: false,
+      archiveExpired: false,
+      archiveDelay: false,
       modelPhase: new URL(location.href).searchParams.has("verifying")
         ? "verifying"
         : "missing",
@@ -194,7 +196,7 @@ test.beforeEach(async ({ page }) => {
           state.cursor++;
           return { applied: true };
         }
-        if (name === "audio-history")
+        if (name === "audio-history" || name === "archive-audio")
           return {
             audio: {
               first_ns: 0,
@@ -204,11 +206,13 @@ test.beforeEach(async ({ page }) => {
               truncated: false,
               gaps: [],
               policy:
-                state.retainedAudio && !state.audioExpired
+                (state.retainedAudio || name === "archive-audio") &&
+                !state.audioExpired
                   ? [{ source: audio, first_ns: 0, end_ns: null }]
                   : [],
               clips:
-                state.retainedAudio && !state.audioExpired
+                (state.retainedAudio || name === "archive-audio") &&
+                !state.audioExpired
                   ? [
                       {
                         segment: {
@@ -234,7 +238,8 @@ test.beforeEach(async ({ page }) => {
                   : [],
             },
             media:
-              state.retainedAudio && !state.audioExpired
+              (state.retainedAudio || name === "archive-audio") &&
+              !state.audioExpired
                 ? [
                     {
                       segment: id(9),
@@ -249,6 +254,77 @@ test.beforeEach(async ({ page }) => {
                   ]
                 : [],
             media_omitted: 0,
+          };
+        if (name === "archives")
+          return {
+            entries: [11, 12].map((epoch) => ({
+              binding: { session: binding.session, epoch: id(epoch) },
+              provider: "a".repeat(64),
+              wall_anchor_unix_ms: 1_790_000_000_000 - epoch * 60_000,
+              latest_ns: 1_200_000_000_000,
+              closed_at_ns: 1_200_000_000_000,
+              retention_floor_ns: 0,
+              writer_active: false,
+              limits: { duration_ms: 21_600_000, max_bytes: 17_179_869_184 },
+              accounted_bytes: 10_000,
+            })),
+            truncated: false,
+            unavailable: 0,
+          };
+        if (name === "archive-sources")
+          return {
+            entries: [
+              { key: source, image: true, audio: false },
+              { key: audio, image: false, audio: true },
+            ],
+            truncated: false,
+            next_after: null,
+          };
+        if (name === "archive-images") {
+          if (state.archiveDelay)
+            await new Promise((resolve) => setTimeout(resolve, 500));
+          return {
+            history: {
+              binding: input.binding,
+              at_ns: input.at_ms * 1_000_000,
+              images: [
+                {
+                  source,
+                  state: {
+                    state: state.archiveExpired ? "expired" : "sampled",
+                  },
+                  first_observed_ns: 1,
+                  last_confirmed_ns: 2,
+                  first_capture: metadata,
+                  last_capture: metadata,
+                },
+              ],
+              selection_truncated: false,
+              media_omitted: 0,
+            },
+            media: state.archiveExpired ? [] : [reference],
+          };
+        }
+        if (name === "archive-transcripts")
+          return {
+            entries: state.archiveExpired
+              ? []
+              : [
+                  {
+                    transcript: {
+                      ...state.row,
+                      text:
+                        input.binding.epoch === id(11)
+                          ? "previous connection"
+                          : "older connection",
+                      ending: "silence",
+                    },
+                    received_ns: 1,
+                    receiver_range: null,
+                  },
+                ],
+            truncated: false,
+            retention_floor_ns: state.archiveExpired ? 2_000_000_000_000 : 0,
           };
         if (name === "models")
           return [
@@ -617,4 +693,100 @@ test("returning live cancels late history presentation and the layout stays with
   }
   await page.setViewportSize({ width: 1180, height: 800 });
   await page.screenshot({ path: "../context/ui-current.png" });
+});
+
+test("retained recordings remain accessible without connecting and keep epoch offsets", async ({
+  page,
+}) => {
+  await page.goto("/?unpaired");
+  await page.getByRole("button", { name: "recordings", exact: true }).click();
+  await expect(
+    page.getByRole("combobox", { name: "recording", exact: true }),
+  ).toBeEnabled();
+  await page.getByRole("button", { name: "load history", exact: true }).click();
+  await expect(
+    page.getByRole("img", { name: "display:fixture", exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("previous connection", { exact: true }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "load audio", exact: true }).click();
+  await expect(page.getByRole("link", { name: /audio:fixture/ })).toBeVisible();
+  await page
+    .getByRole("combobox", { name: "recording", exact: true })
+    .selectOption("00000000-0000-4000-8000-000000000012");
+  await expect(
+    page.getByText("previous connection", { exact: true }),
+  ).not.toBeVisible();
+  await page.getByRole("button", { name: "load history", exact: true }).click();
+  await expect(
+    page.getByText("older connection", { exact: true }),
+  ).toBeVisible();
+  const calls = await page.evaluate(() => (window as any).fixture.calls);
+  const last = calls
+    .filter((call: any) => call.name === "archive-images")
+    .at(-1);
+  expect(last.args.at_ms).toBe(1_199_400);
+  expect(last.args.binding.epoch).toBe("00000000-0000-4000-8000-000000000012");
+  expect(
+    calls.some((call: any) =>
+      ["connect", "observe", "configure"].includes(call.name),
+    ),
+  ).toBe(false);
+  await page.evaluate(() => {
+    (window as any).fixture.archiveExpired = true;
+  });
+  await page.getByRole("button", { name: "load history", exact: true }).click();
+  await expect(
+    page.getByRole("img", { name: "display:fixture", exact: true }),
+  ).not.toBeVisible();
+  await expect(
+    page.getByText("transcripts expired", { exact: true }),
+  ).toBeVisible();
+  for (const width of [720, 1024, 1440]) {
+    await page.setViewportSize({ width, height: 900 });
+    expect(
+      await page.evaluate(() => document.documentElement.scrollWidth),
+    ).toBeLessThanOrEqual(width);
+    await expect(
+      page.getByRole("button", { name: "load history", exact: true }),
+    ).toBeVisible();
+  }
+});
+
+test("a pending recording read cannot replace a later epoch selection", async ({
+  page,
+}) => {
+  await page.goto("/?unpaired");
+  await page.getByRole("button", { name: "recordings", exact: true }).click();
+  await page.evaluate(() => {
+    (window as any).fixture.archiveDelay = true;
+  });
+  await page.getByRole("button", { name: "load history", exact: true }).click();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (window as any).fixture.calls.some(
+          (call: any) => call.name === "archive-images",
+        ),
+      ),
+    )
+    .toBe(true);
+  await page
+    .getByRole("combobox", { name: "recording", exact: true })
+    .selectOption("00000000-0000-4000-8000-000000000012");
+  await page.evaluate(() => {
+    (window as any).fixture.archiveDelay = false;
+  });
+  await page.getByRole("button", { name: "load history", exact: true }).click();
+  await expect(
+    page.getByText("older connection", { exact: true }),
+  ).toBeVisible();
+  await page.waitForTimeout(600);
+  await expect(
+    page.getByText("older connection", { exact: true }),
+  ).toBeVisible();
+  await expect(
+    page.getByText("previous connection", { exact: true }),
+  ).not.toBeVisible();
 });

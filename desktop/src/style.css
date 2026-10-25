@@ -239,6 +239,16 @@ legend {
   gap: 1rem;
   overflow-y: auto;
 }
+.recordings {
+  flex: 1;
+}
+.recordings .history-bar label {
+  max-width: 100%;
+  min-width: 0;
+}
+.recordings select {
+  max-width: 100%;
+}
 .preview-heading {
   display: flex;
   align-items: center;

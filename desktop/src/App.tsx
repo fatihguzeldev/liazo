@@ -8,16 +8,18 @@ import { History } from "./History";
 import type { Past } from "./History";
 import { useSession } from "./useSession";
 import { useHost } from "./useHost";
+import { Recordings } from "./Recordings";
 
 export function App() {
   const host = useHost();
   const { session, ready } = host;
   const [connecting, setConnecting] = useState(false);
+  const [recordings, setRecordings] = useState(false);
   const [preview, setPreview] = useState("");
   const [past, setPast] = useState<Past | null>(null);
   const [error, setError] = useState("");
   const [stopping, setStopping] = useState(false);
-  const live = useSession(session, preview, !!past);
+  const live = useSession(session, preview, !!past || recordings);
   useEffect(
     () => () => {
       if (past?.url) URL.revokeObjectURL(past.url);
@@ -64,9 +66,24 @@ export function App() {
           {!ready ? "opening…" : session ? status : "disconnected"}
         </span>
         <div className="header-actions">
+          <button
+            disabled={!ready}
+            aria-pressed={recordings}
+            onClick={() => {
+              setRecordings((value) => !value);
+              setConnecting(false);
+            }}
+          >
+            {recordings ? (session ? "live" : "connect") : "recordings"}
+          </button>
           {session && (
             <>
-              <button onClick={() => setConnecting((old) => !old)}>
+              <button
+                onClick={() => {
+                  setRecordings(false);
+                  setConnecting((old) => !old);
+                }}
+              >
                 {connecting ? "back" : "connect"}
               </button>
               <button
@@ -98,6 +115,8 @@ export function App() {
         <main className="empty" aria-busy="true">
           opening local session…
         </main>
+      ) : recordings ? (
+        <Recordings />
       ) : !session || connecting ? (
         <main className="connection-main">
           <Connection
