@@ -251,6 +251,7 @@ async fn real_speech_crosses_peer_transport_and_shared_observation_without_block
         .samples::<i16>()
         .flat_map(|sample| std::iter::repeat_n(f32::from(sample.unwrap()) / 32768.0, 3))
         .collect();
+    let audio_duration = Duration::from_secs_f64(pcm.len() as f64 / 48_000.0);
     let fixture = fixture(pcm, false);
     let (session, provider) = pair(fixture.clone()).await;
     let archive = tempfile::tempdir().unwrap();
@@ -293,33 +294,86 @@ async fn real_speech_crosses_peer_transport_and_shared_observation_without_block
     };
     #[cfg(feature = "test-support")]
     let mut storage_recovered = false;
+    #[cfg(not(feature = "test-support"))]
+    let storage_recovered = true;
     fixture.gate.add_permits(1);
     let mut cursor = 0;
     let mut partials = Vec::new();
     let mut final_ = None;
     let mut responsive = false;
-    timeout(Duration::from_secs(20), async {
-        while final_.is_none() {
+    let started = Instant::now();
+    let mut first_partial = None;
+    #[cfg(feature = "test-support")]
+    let mut archive_released = None;
+    let mut progress = String::from("waiting for the first observation");
+    // This is a correctness guard, not a latency budget. The Windows debug CI
+    // engine fixture already takes ~27 s including ~11 s of real-time audio.
+    // Allow the audio duration plus two 30 s inference opportunities, while
+    // separately bounding first-partial and archive-recovery progress below.
+    let completion_guard = audio_duration + Duration::from_secs(60);
+    timeout(completion_guard, async {
+        while final_.is_none() || !storage_recovered {
             let observed = session
                 .observe(cursor, false, &[], Duration::from_millis(500))
                 .await;
             cursor = observed.cursor;
+            progress = format!(
+                "elapsed={:?}, connection={:?}, cursor={}, image_sequence={:?}, audio_sequence={:?}, partials={}, responsive={}, speech={}, archive={}",
+                started.elapsed(),
+                observed.connection,
+                observed.cursor,
+                observed.images.first().map(|image| image.metadata.sequence),
+                observed.audio.first().map(|audio| audio.sequence),
+                partials.len(),
+                responsive,
+                serde_json::to_string(&observed.transcription).unwrap(),
+                serde_json::to_string(&observed.archive).unwrap(),
+            );
+            assert!(
+                first_partial.is_some() || started.elapsed() < Duration::from_secs(30),
+                "first partial exceeded the correctness guard: {progress}"
+            );
             assert_eq!(observed.transcription.gaps, 0);
             #[cfg(feature = "test-support")]
-            if responsive
-                && !storage_recovered
-                && observed.archive.as_ref().is_some_and(|status| {
-                    status.phase == liazo_runtime::archive::ArchivePhase::Failed
-                })
-            {
-                session.set_archive_database_full(false).await.unwrap();
-                fixture.changing.store(false, Ordering::SeqCst);
-                storage_recovered = true;
+            if responsive && !storage_recovered {
+                // The FIFO barrier proves the specific SQLite-full failure;
+                // cached status alone does not identify the failed write.
+                match session.flush_archive().await {
+                    Err(liazo_runtime::RuntimeError::Archive(
+                        liazo_runtime::archive::ArchiveError::Database(error),
+                    )) if error.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull) => {
+                        eprintln!(
+                            "speech fixture SQLite full acknowledged at {:?}",
+                            started.elapsed()
+                        );
+                        session.set_archive_database_full(false).await.unwrap();
+                        fixture.changing.store(false, Ordering::SeqCst);
+                        storage_recovered = true;
+                        eprintln!("speech fixture archive recovered at {:?}", started.elapsed());
+                    }
+                    Ok(()) => {}
+                    Err(error) => panic!("unexpected archive barrier result: {error}; {progress}"),
+                }
             }
+            #[cfg(feature = "test-support")]
+            assert!(
+                storage_recovered
+                    || archive_released.is_none_or(|released: Instant| {
+                        released.elapsed() < Duration::from_secs(30)
+                    }),
+                "archive did not fail and recover after release: {progress}"
+            );
             for transcript in observed.transcripts {
                 assert_eq!(transcript.source, source(true));
                 if transcript.ending.is_none() && !transcript.text.is_empty() {
                     partials.push(transcript.id);
+                    if first_partial.is_none() {
+                        first_partial = Some(started.elapsed());
+                        eprintln!(
+                            "speech fixture first partial at {:?}",
+                            first_partial.unwrap()
+                        );
+                    }
                     if !responsive {
                         let image = timeout(
                             Duration::from_secs(1),
@@ -334,18 +388,26 @@ async fn real_speech_crosses_peer_transport_and_shared_observation_without_block
                         {
                             assert!(session.archive_status().unwrap().dropped_records > 0);
                             drop(disk_hold.take());
+                            archive_released = Some(Instant::now());
+                            eprintln!(
+                                "speech fixture archive released at {:?}",
+                                started.elapsed()
+                            );
                         }
                     }
                 } else if transcript.ending.is_some()
                     && transcript.text.split_whitespace().count() >= 3
                 {
                     final_ = Some(transcript);
+                    eprintln!("speech fixture final at {:?}", started.elapsed());
                 }
             }
         }
     })
     .await
-    .unwrap();
+    .unwrap_or_else(|_| {
+        panic!("speech fixture exceeded {completion_guard:?} correctness guard: {progress}")
+    });
     #[cfg(feature = "test-support")]
     assert!(
         storage_recovered,
