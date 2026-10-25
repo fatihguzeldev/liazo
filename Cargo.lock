@@ -2220,6 +2220,7 @@ dependencies = [
  "liazo-runtime",
  "liazo-transcription",
  "liazo-transport",
+ "png 0.18.1",
  "reqwest",
  "rmcp",
  "rustls",
