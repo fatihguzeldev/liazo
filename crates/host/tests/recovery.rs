@@ -303,6 +303,38 @@ impl Fixture {
         .await
         .unwrap()
     }
+    async fn archive_ready(&self, binding: SessionBinding) -> liazo_host::SessionSummary {
+        let receiver = self.host.receiver(binding).await.unwrap();
+        let mut last = String::from("waiting for archive recovery");
+        timeout(Duration::from_secs(15), async {
+            loop {
+                let current = self.host.current().await.unwrap();
+                let archive = receiver.archive_status();
+                last = serde_json::json!({
+                    "session": &current,
+                    "archive": &archive,
+                    "transcription": receiver.transcription_status(),
+                })
+                .to_string();
+                assert_eq!(current.binding, binding, "epoch changed: {last}");
+                assert_eq!(
+                    current.connection,
+                    ConnectionState::Connected,
+                    "live connection was lost: {last}"
+                );
+                if current.recovery.is_empty()
+                    && archive.is_some_and(|status| {
+                        status.phase == liazo_runtime::archive::ArchivePhase::Recording
+                    })
+                {
+                    return current;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("archive recovery did not become ready: {last}"))
+    }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -615,15 +647,31 @@ async fn real_speech_reconnects_and_recovers_without_undoing_explicit_transcript
     cancel.cancel();
     let current = fixture.epoch_after(first).await;
     assert_eq!(current.binding.session, first.session);
-    assert!(current.recovery.is_empty());
     let receiver = fixture.host.receiver(current.binding).await.unwrap();
     assert!(
         receiver
             .observe(0, false, &[], Duration::ZERO)
             .await
             .transcription
-            .active
+            .active,
+        "speech is inactive after reconnect: {}",
+        serde_json::json!({
+            "session": &current,
+            "transcription": receiver.transcription_status(),
+        })
     );
+    let fresh = timeout(
+        Duration::from_secs(1),
+        receiver.capture_now(vec![image_key(Uuid::from_u128(1))]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(fresh.binding, current.binding);
+    assert!(fresh.images[0].payload.is_some());
+    // Live/STT reconnect can precede completion of the previous archive's
+    // retirement. Its explicit recovery issue must subsequently clear.
+    let current = fixture.archive_ready(current.binding).await;
     fixture.capture.gate.add_permits(1);
     timeout(Duration::from_secs(35), async {
         loop {
@@ -768,6 +816,12 @@ async fn stalled_archive_uses_one_retirement_slot_while_multiple_live_epochs_con
     for _ in 0..2 {
         let receiver = fixture.host.receiver(current.binding).await.unwrap();
         assert!(receiver.archive_status().is_none());
+        assert!(
+            current
+                .recovery
+                .iter()
+                .any(|issue| issue.operation == liazo_host::RecoveryOperation::Archive)
+        );
         assert_eq!(receiver.settings(), settings());
         let fresh = receiver
             .capture_now(vec![image_key(Uuid::from_u128(1))])
@@ -779,6 +833,12 @@ async fn stalled_archive_uses_one_retirement_slot_while_multiple_live_epochs_con
         current = fixture.epoch_after(current.binding).await;
     }
     assert_eq!(current.binding.session, first.session);
+    assert!(
+        current
+            .recovery
+            .iter()
+            .any(|issue| issue.operation == liazo_host::RecoveryOperation::Archive)
+    );
     assert!(old.archive_status().unwrap().queued_bytes <= 64 * 1024 * 1024);
     let epochs = std::fs::read_dir(root.path().join(first.session.to_string()))
         .unwrap()
@@ -789,18 +849,7 @@ async fn stalled_archive_uses_one_retirement_slot_while_multiple_live_epochs_con
     );
     drop(hold);
     let receiver = fixture.host.receiver(current.binding).await.unwrap();
-    timeout(Duration::from_secs(8), async {
-        loop {
-            if receiver.archive_status().is_some()
-                && fixture.host.current().await.unwrap().recovery.is_empty()
-            {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
+    fixture.archive_ready(current.binding).await;
     assert!(old.archive_status().is_none());
     assert_eq!(
         receiver.archive_status().unwrap().raw_audio_sources,
