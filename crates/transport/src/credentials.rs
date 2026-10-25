@@ -66,12 +66,31 @@ pub struct DeviceCredentials {
 
 impl DeviceCredentials {
     pub fn open() -> Result<Self, CredentialError> {
+        Self::open_profile("default")
+    }
+
+    pub fn open_profile(profile: &str) -> Result<Self, CredentialError> {
+        if profile.is_empty()
+            || profile.len() > 64
+            || !profile
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err(CredentialError::InvalidRecord);
+        }
         #[cfg(target_os = "macos")]
         let backend = apple_native_keyring_store::keychain::Store::new()?;
         #[cfg(target_os = "windows")]
         let backend = windows_native_keyring_store::Store::new()?;
         #[cfg(any(target_os = "macos", target_os = "windows"))]
-        return Ok(Self::with_backend(backend, "app.liazo.credentials"));
+        return Ok(Self::with_backend(
+            backend,
+            &if profile == "default" {
+                "app.liazo.credentials".into()
+            } else {
+                format!("app.liazo.credentials.{profile}")
+            },
+        ));
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         Err(CredentialError::Unsupported)
     }

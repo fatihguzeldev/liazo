@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     io,
     net::SocketAddr,
@@ -53,8 +53,13 @@ impl Interrupt {
 
 #[derive(Clone)]
 pub struct PeerServer {
-    acceptor: TlsAcceptor,
-    paired: Arc<RwLock<HashMap<Fingerprint, CancellationToken>>>,
+    state: Arc<RwLock<ServerState>>,
+}
+
+struct ServerState {
+    identity: Fingerprint,
+    acceptor: Option<TlsAcceptor>,
+    paired: HashMap<Fingerprint, CancellationToken>,
 }
 
 impl PeerServer {
@@ -62,8 +67,28 @@ impl PeerServer {
         identity: &Identity,
         trusted: &[CertificateDer<'static>],
     ) -> Result<Self, TransportError> {
-        if trusted.is_empty() || trusted.len() > 32 {
+        let acceptor = Self::build_acceptor(identity, trusted)?;
+        Ok(Self {
+            state: Arc::new(RwLock::new(ServerState {
+                identity: identity.fingerprint(),
+                acceptor,
+                paired: trusted
+                    .iter()
+                    .map(|cert| (fingerprint(cert), CancellationToken::new()))
+                    .collect(),
+            })),
+        })
+    }
+
+    fn build_acceptor(
+        identity: &Identity,
+        trusted: &[CertificateDer<'static>],
+    ) -> Result<Option<TlsAcceptor>, TransportError> {
+        if trusted.len() > 32 {
             return Err(TransportError::InvalidIdentity);
+        }
+        if trusted.is_empty() {
+            return Ok(None);
         }
         let mut roots = RootCertStore::empty();
         for certificate in trusted {
@@ -79,22 +104,41 @@ impl PeerServer {
                 identity.key.clone_key(),
             )?;
         config.alpn_protocols = vec![ALPN.to_vec()];
-        Ok(Self {
-            acceptor: TlsAcceptor::from(Arc::new(config)),
-            paired: Arc::new(RwLock::new(
-                trusted
-                    .iter()
-                    .map(|cert| (fingerprint(cert), CancellationToken::new()))
-                    .collect(),
-            )),
-        })
+        Ok(Some(TlsAcceptor::from(Arc::new(config))))
+    }
+
+    pub fn replace_trusted(
+        &self,
+        identity: &Identity,
+        trusted: &[CertificateDer<'static>],
+    ) -> Result<(), TransportError> {
+        let acceptor = Self::build_acceptor(identity, trusted)?;
+        let pins: HashSet<_> = trusted.iter().map(fingerprint).collect();
+        let mut state = self.state.write().unwrap_or_else(|e| e.into_inner());
+        if state.identity != identity.fingerprint() {
+            return Err(TransportError::InvalidIdentity);
+        }
+        state.paired.retain(|pin, token| {
+            if pins.contains(pin) {
+                true
+            } else {
+                token.cancel();
+                false
+            }
+        });
+        for pin in pins {
+            state.paired.entry(pin).or_default();
+        }
+        state.acceptor = acceptor;
+        Ok(())
     }
 
     pub fn revoke(&self, peer: Fingerprint) -> bool {
         let token = self
-            .paired
+            .state
             .write()
             .unwrap_or_else(|e| e.into_inner())
+            .paired
             .remove(&peer);
         if let Some(token) = token {
             token.cancel();
@@ -106,7 +150,14 @@ impl PeerServer {
 
     pub async fn accept(&self, socket: TcpStream) -> Result<PeerConnection, TransportError> {
         socket.set_nodelay(true)?;
-        let io = timeout(HANDSHAKE_TIMEOUT, self.acceptor.accept(socket))
+        let acceptor = self
+            .state
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .acceptor
+            .clone()
+            .ok_or(TransportError::UntrustedPeer)?;
+        let io = timeout(HANDSHAKE_TIMEOUT, acceptor.accept(socket))
             .await
             .map_err(|_| TransportError::Timeout)??;
         let connection = io.get_ref().1;
@@ -116,9 +167,10 @@ impl PeerServer {
             .ok_or(TransportError::UntrustedPeer)?;
         let peer = fingerprint(certificate);
         let token = self
-            .paired
+            .state
             .read()
             .unwrap_or_else(|e| e.into_inner())
+            .paired
             .get(&peer)
             .cloned()
             .ok_or(TransportError::UntrustedPeer)?;
