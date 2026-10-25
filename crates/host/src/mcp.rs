@@ -300,6 +300,19 @@ impl Mcp {
 }
 
 const IMAGE_BUDGET: usize = 32 * 1024 * 1024;
+fn media_result(metadata: Value, mut content: Vec<ContentBlock>) -> CallToolResult {
+    let has_media = content
+        .iter()
+        .any(|block| block.as_image().is_some() || block.as_audio().is_some());
+    content.insert(0, ContentBlock::text(metadata.to_string()));
+    let mut result = CallToolResult::success(content);
+    // Consumers may prefer structuredContent over content, hiding native media.
+    if !has_media {
+        result.structured_content = Some(metadata);
+    }
+    result
+}
+
 fn audio(mut page: liazo_runtime::archive::AudioPage) -> Result<CallToolResult, CallError> {
     let mut content = vec![];
     for clip in &mut page.clips {
@@ -313,10 +326,7 @@ fn audio(mut page: liazo_runtime::archive::AudioPage) -> Result<CallToolResult, 
     }
     let metadata = serde_json::to_value(page)
         .map_err(|_| ErrorData::internal_error("invalid audio history", None))?;
-    content.insert(0, ContentBlock::text(metadata.to_string()));
-    let mut result = CallToolResult::success(content);
-    result.structured_content = Some(metadata);
-    Ok(result)
+    Ok(media_result(metadata, content))
 }
 fn archived_images(mut history: crate::ArchivedImages) -> CallToolResult {
     let mut content = vec![];
@@ -332,10 +342,7 @@ fn archived_images(mut history: crate::ArchivedImages) -> CallToolResult {
         }
     }
     let metadata = json!({"history":history});
-    content.insert(0, ContentBlock::text(metadata.to_string()));
-    let mut result = CallToolResult::success(content);
-    result.structured_content = Some(metadata);
-    result
+    media_result(metadata, content)
 }
 fn observation(mut observed: Observation) -> CallToolResult {
     let mut content = Vec::new();
@@ -359,10 +366,7 @@ fn observation(mut observed: Observation) -> CallToolResult {
         }
     }
     let metadata = json!({"observation":observed,"media_omitted":omitted});
-    content.insert(0, ContentBlock::text(metadata.to_string()));
-    let mut result = CallToolResult::success(content);
-    result.structured_content = Some(metadata);
-    result
+    media_result(metadata, content)
 }
 fn history(mut history: HistorySnapshot) -> CallToolResult {
     let mut content = Vec::new();
@@ -385,8 +389,5 @@ fn history(mut history: HistorySnapshot) -> CallToolResult {
         }
     }
     let metadata = json!({"history":history,"media_omitted":omitted});
-    content.insert(0, ContentBlock::text(metadata.to_string()));
-    let mut result = CallToolResult::success(content);
-    result.structured_content = Some(metadata);
-    result
+    media_result(metadata, content)
 }

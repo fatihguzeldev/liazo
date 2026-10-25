@@ -388,15 +388,16 @@ async fn authenticated_consumers_share_one_session_and_binary_media_without_a_gu
         .find_map(|content| content.as_image())
         .expect("native MCP image content");
     assert_eq!(STANDARD.decode(&image.data).unwrap(), b"fixture-image");
-    assert_eq!(
-        observed.structured_content.as_ref().unwrap()["observation"]["binding"],
-        binding
+    assert!(
+        observed.structured_content.is_none(),
+        "structured metadata must not shadow native MCP image content"
     );
+    let observed_metadata: Value =
+        serde_json::from_str(&observed.content[0].as_text().unwrap().text).unwrap();
+    assert_eq!(observed_metadata["observation"]["binding"], binding);
     assert_eq!(capture.calls.load(Ordering::Relaxed), 1);
     let id = first["media"][0]["id"].as_str().unwrap();
-    let after = observed.structured_content.as_ref().unwrap()["observation"]["cursor"]
-        .as_u64()
-        .unwrap();
+    let after = observed_metadata["observation"]["cursor"].as_u64().unwrap();
     let quiet = mcp
         .call_tool(
             CallToolRequestParams::new("observe").with_arguments(
@@ -414,6 +415,9 @@ async fn authenticated_consumers_share_one_session_and_binary_media_without_a_gu
             .iter()
             .all(|content| content.as_image().is_none())
     );
+    let quiet_metadata: Value =
+        serde_json::from_str(&quiet.content[0].as_text().unwrap().text).unwrap();
+    assert_eq!(quiet.structured_content, Some(quiet_metadata));
     let fresh = mcp
         .call_tool(
             CallToolRequestParams::new("capture_now").with_arguments(
@@ -432,6 +436,10 @@ async fn authenticated_consumers_share_one_session_and_binary_media_without_a_gu
             .iter()
             .any(|content| content.as_image().is_some())
     );
+    assert!(fresh.structured_content.is_none());
+    let fresh_metadata: Value =
+        serde_json::from_str(&fresh.content[0].as_text().unwrap().text).unwrap();
+    assert_eq!(fresh_metadata["observation"]["binding"], binding);
     let retained = mcp
         .call_tool(
             CallToolRequestParams::new("history").with_arguments(
@@ -448,6 +456,13 @@ async fn authenticated_consumers_share_one_session_and_binary_media_without_a_gu
             .content
             .iter()
             .any(|content| content.as_image().is_some())
+    );
+    assert!(retained.structured_content.is_none());
+    let retained_metadata: Value =
+        serde_json::from_str(&retained.content[0].as_text().unwrap().text).unwrap();
+    assert_eq!(
+        retained_metadata["history"]["images"][0]["source"],
+        json!(source())
     );
     assert_eq!(
         client
@@ -670,6 +685,13 @@ async fn authenticated_consumers_share_one_session_and_binary_media_without_a_gu
         .expect("native MCP audio content");
     assert_eq!(data.mime_type, "audio/wav");
     assert_eq!(&STANDARD.decode(&data.data).unwrap()[..4], b"RIFF");
+    assert!(
+        audio.structured_content.is_none(),
+        "structured metadata must not shadow native MCP audio content"
+    );
+    let audio_metadata: Value =
+        serde_json::from_str(&audio.content[0].as_text().unwrap().text).unwrap();
+    assert!(!audio_metadata["clips"].as_array().unwrap().is_empty());
     let audio: Value = client
         .post(format!("{base}/v1/audio-history"))
         .bearer_auth(token)

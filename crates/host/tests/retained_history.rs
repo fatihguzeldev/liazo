@@ -286,6 +286,9 @@ async fn http_and_mcp_read_closed_epochs_without_an_active_connection() {
         .find_map(|content| content.as_image())
         .unwrap();
     assert_eq!(STANDARD.decode(&data.data).unwrap(), b"old epoch image");
+    assert!(image.structured_content.is_none());
+    let metadata: Value = serde_json::from_str(&image.content[0].as_text().unwrap().text).unwrap();
+    assert_eq!(metadata["history"]["binding"], json!(first.binding));
     let wave = mcp
         .call_tool(
             CallToolRequestParams::new("archive_audio")
@@ -300,6 +303,9 @@ async fn http_and_mcp_read_closed_epochs_without_an_active_connection() {
         .find_map(|content| content.as_audio())
         .unwrap();
     assert_eq!(&STANDARD.decode(&data.data).unwrap()[..4], b"RIFF");
+    assert!(wave.structured_content.is_none());
+    let metadata: Value = serde_json::from_str(&wave.content[0].as_text().unwrap().text).unwrap();
+    assert!(!metadata["clips"].as_array().unwrap().is_empty());
     assert!(host.current().await.is_none());
     mcp.cancel().await.unwrap();
     cancel.cancel();
