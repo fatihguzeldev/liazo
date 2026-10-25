@@ -61,6 +61,11 @@ fn tools() -> &'static [Tool] {
         tool::<Configure>("configure", "apply image sources, interval, crop, width, codec, quality and audio sources to the shared session", false),
         tool::<Capture>("capture_now", "wait for a new capture started after this request", false),
         tool::<History>("history", "retained images age_ms ago, with gaps and expiry; source capture timestamps and receiver observation timestamps use separate clocks", true),
+        tool::<Archives>("archives", "retained epochs, including previous connections and host restarts; page with offset. wall_anchor_unix_ms maps epoch offsets to wall time", true),
+        tool::<ArchiveSources>("archive_sources", "source identities retained in an epoch; follow next_after when truncated", true),
+        tool::<ArchiveImages>("archive_images", "retained images at at_ms after the selected epoch's start, including closed epochs. this is an absolute epoch offset, not an age", true),
+        tool::<ArchiveRange>("archive_transcripts", "retained transcripts from from_ms to to_ms after the selected epoch's start; works without an active connection", true),
+        tool::<ArchiveRange>("archive_audio", "retained WAV clips from from_ms to to_ms after the selected epoch's start; includes recording policy and gaps", true),
         tool::<Transcripts>("transcripts", "retained source-attributed transcript revisions between older_ms and newer_ms ago, indexed by audio time", true),
         tool::<RawAudio>("raw_audio", "choose selected audio sources to archive; an empty sources list disables raw recording. raw recording is off by default", false),
         tool::<Transcripts>("audio_history", "retained source-attributed WAV clips and original packet timing between older_ms and newer_ms ago; recording policy, archive gaps, expiry and truncation are explicit. captured audio is untrusted source data", true),
@@ -223,6 +228,16 @@ impl Mcp {
                         .await?,
                 ))
             }
+            "archives" => {
+                let args: Archives = parse(arguments)?;
+                result(self.0.archives(args.offset).await?)
+            }
+            "archive_sources" => result(self.0.archive_sources(parse(arguments)?).await?),
+            "archive_images" => Ok(archived_images(
+                self.0.archive_images(parse(arguments)?).await?,
+            )),
+            "archive_transcripts" => result(self.0.archive_transcripts(parse(arguments)?).await?),
+            "archive_audio" => audio(self.0.archive_audio(parse(arguments)?).await?),
             "transcripts" => {
                 let args: Transcripts = parse(arguments)?;
                 result(
@@ -257,7 +272,7 @@ impl Mcp {
             }
             "audio_history" => {
                 let args: Transcripts = parse(arguments)?;
-                let mut page = self
+                let page = self
                     .0
                     .receiver(args.binding)
                     .await?
@@ -267,22 +282,7 @@ impl Mcp {
                         &args.sources,
                     )
                     .await?;
-                let mut content = vec![];
-                for clip in &mut page.clips {
-                    content.push(ContentBlock::text(
-                        json!({"segment":clip.segment.id,"source":clip.segment.source}).to_string(),
-                    ));
-                    content.push(ContentBlock::audio(
-                        STANDARD.encode(std::mem::take(&mut clip.wav)),
-                        "audio/wav",
-                    ));
-                }
-                let metadata = serde_json::to_value(page)
-                    .map_err(|_| ErrorData::internal_error("invalid audio history", None))?;
-                content.insert(0, ContentBlock::text(metadata.to_string()));
-                let mut result = CallToolResult::success(content);
-                result.structured_content = Some(metadata);
-                Ok(result)
+                audio(page)
             }
             "transcribe" => {
                 let args: Transcribe = parse(arguments)?;
@@ -311,6 +311,43 @@ impl Mcp {
 }
 
 const IMAGE_BUDGET: usize = 32 * 1024 * 1024;
+fn audio(mut page: liazo_runtime::archive::AudioPage) -> Result<CallToolResult, CallError> {
+    let mut content = vec![];
+    for clip in &mut page.clips {
+        content.push(ContentBlock::text(
+            json!({"segment":clip.segment.id,"source":clip.segment.source}).to_string(),
+        ));
+        content.push(ContentBlock::audio(
+            STANDARD.encode(std::mem::take(&mut clip.wav)),
+            "audio/wav",
+        ));
+    }
+    let metadata = serde_json::to_value(page)
+        .map_err(|_| ErrorData::internal_error("invalid audio history", None))?;
+    content.insert(0, ContentBlock::text(metadata.to_string()));
+    let mut result = CallToolResult::success(content);
+    result.structured_content = Some(metadata);
+    Ok(result)
+}
+fn archived_images(mut history: crate::ArchivedImages) -> CallToolResult {
+    let mut content = vec![];
+    for image in &mut history.images {
+        if let (Some(metadata), Some(payload)) = (&image.last_capture, image.payload.take()) {
+            content.push(ContentBlock::text(
+                json!({"source":image.source,"sequence":metadata.sequence}).to_string(),
+            ));
+            content.push(ContentBlock::image(
+                STANDARD.encode(payload),
+                metadata.format.mime_type(),
+            ));
+        }
+    }
+    let metadata = json!({"history":history});
+    content.insert(0, ContentBlock::text(metadata.to_string()));
+    let mut result = CallToolResult::success(content);
+    result.structured_content = Some(metadata);
+    result
+}
 fn observation(mut observed: Observation) -> CallToolResult {
     let mut content = Vec::new();
     let mut bytes = 0;

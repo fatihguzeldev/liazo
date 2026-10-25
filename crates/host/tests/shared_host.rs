@@ -644,6 +644,14 @@ async fn authenticated_consumers_share_one_session_and_binary_media_without_a_gu
         liazo_runtime::ConnectionState::Disconnected
     );
     assert!(held.configure(CaptureSettings::default()).await.is_err());
+    let retained = host
+        .archive_sources(liazo_host::requests::ArchiveSources {
+            binding: held.archive_identity().binding,
+            after: None,
+        })
+        .await
+        .unwrap();
+    assert!(retained.entries.iter().any(|entry| entry.key == source()));
     mcp.cancel().await.unwrap();
     cancel.cancel();
     running.await.unwrap().unwrap();

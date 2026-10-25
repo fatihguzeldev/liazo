@@ -131,9 +131,28 @@ pub async fn operation(
 ) -> Result<Value, String> {
     let method = match name.as_str() {
         "status" | "peers" | "discover" | "models" => Method::GET,
-        "connect" | "pair" | "forget" | "sources" | "observe" | "configure" | "capture"
-        | "history" | "transcripts" | "history-limits" | "transcribe" | "transcription-stop"
-        | "stop" | "model-install" | "model-cancel" | "raw-audio" | "audio-history" => Method::POST,
+        "connect"
+        | "pair"
+        | "forget"
+        | "sources"
+        | "observe"
+        | "configure"
+        | "capture"
+        | "history"
+        | "transcripts"
+        | "history-limits"
+        | "transcribe"
+        | "transcription-stop"
+        | "stop"
+        | "model-install"
+        | "model-cancel"
+        | "raw-audio"
+        | "audio-history"
+        | "archives"
+        | "archive-sources"
+        | "archive-images"
+        | "archive-transcripts"
+        | "archive-audio" => Method::POST,
         _ => return Err("unknown operation".into()),
     };
     let body = (method == Method::POST).then_some(args);

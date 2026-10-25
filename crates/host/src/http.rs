@@ -137,6 +137,11 @@ pub async fn serve(
         .route("/v1/configure", post(configure))
         .route("/v1/capture", post(capture))
         .route("/v1/history", post(history))
+        .route("/v1/archives", post(archives))
+        .route("/v1/archive-sources", post(archive_sources))
+        .route("/v1/archive-images", post(archive_images))
+        .route("/v1/archive-transcripts", post(archive_transcripts))
+        .route("/v1/archive-audio", post(archive_audio))
         .route("/v1/transcripts", post(transcripts))
         .route("/v1/raw-audio", post(raw_audio))
         .route("/v1/audio-history", post(audio_history))
@@ -224,6 +229,11 @@ impl IntoResponse for HostError {
         let code = match self {
             Self::NoSession => StatusCode::NOT_FOUND,
             Self::Invalid => StatusCode::BAD_REQUEST,
+            Self::Archive(liazo_runtime::archive::ArchiveError::NotFound) => StatusCode::NOT_FOUND,
+            Self::Archive(liazo_runtime::archive::ArchiveError::Busy) => StatusCode::CONFLICT,
+            Self::Archive(liazo_runtime::archive::ArchiveError::InvalidPayload) => {
+                StatusCode::BAD_REQUEST
+            }
             Self::Unpaired => StatusCode::FORBIDDEN,
             Self::ActiveSession | Self::Interrupted | Self::Busy => StatusCode::CONFLICT,
             _ => StatusCode::UNPROCESSABLE_ENTITY,
@@ -243,6 +253,56 @@ pub struct HistoryResponse {
     history: HistorySnapshot,
     media: Vec<MediaRef>,
     media_omitted: usize,
+}
+
+#[derive(Serialize, schemars::JsonSchema)]
+pub struct ArchiveImagesResponse {
+    pub history: crate::ArchivedImages,
+    pub media: Vec<MediaRef>,
+}
+
+async fn archives(
+    State(state): State<HttpState>,
+    Json(args): Json<Archives>,
+) -> Result<Json<liazo_runtime::archive::CatalogPage>, HostError> {
+    Ok(Json(state.host.archives(args.offset).await?))
+}
+async fn archive_sources(
+    State(state): State<HttpState>,
+    Json(args): Json<ArchiveSources>,
+) -> Result<Json<liazo_runtime::archive::ArchiveSources>, HostError> {
+    Ok(Json(state.host.archive_sources(args).await?))
+}
+async fn archive_images(
+    State(state): State<HttpState>,
+    Json(args): Json<ArchiveImages>,
+) -> Result<Json<ArchiveImagesResponse>, HostError> {
+    let mut history = state.host.archive_images(args).await?;
+    let mut media = vec![];
+    for image in &mut history.images {
+        if let (Some(metadata), Some(bytes)) = (&image.last_capture, image.payload.take()) {
+            match state.media.publish(metadata, bytes) {
+                Some(reference) => media.push(reference),
+                None => history.media_omitted += 1,
+            }
+        }
+    }
+    Ok(Json(ArchiveImagesResponse { history, media }))
+}
+async fn archive_transcripts(
+    State(state): State<HttpState>,
+    Json(args): Json<ArchiveRange>,
+) -> Result<Json<liazo_runtime::archive::TranscriptPage>, HostError> {
+    Ok(Json(state.host.archive_transcripts(args).await?))
+}
+async fn archive_audio(
+    State(state): State<HttpState>,
+    Json(args): Json<ArchiveRange>,
+) -> Result<Json<AudioHistoryResponse>, HostError> {
+    Ok(Json(audio_response(
+        &state.media,
+        state.host.archive_audio(args).await?,
+    )))
 }
 
 fn image_response(state: &HttpState, mut observation: Observation) -> ObservationResponse {
@@ -432,7 +492,7 @@ async fn audio_history(
     State(state): State<HttpState>,
     Json(args): Json<Transcripts>,
 ) -> Result<Json<AudioHistoryResponse>, HostError> {
-    let mut audio = state
+    let audio = state
         .host
         .receiver(args.binding)
         .await?
@@ -442,13 +502,16 @@ async fn audio_history(
             &args.sources,
         )
         .await?;
+    Ok(Json(audio_response(&state.media, audio)))
+}
+fn audio_response(
+    store: &Media,
+    mut audio: liazo_runtime::archive::AudioPage,
+) -> AudioHistoryResponse {
     let mut media = vec![];
     let mut omitted = 0;
     for clip in &mut audio.clips {
-        if let Some(reference) = state
-            .media
-            .publish_audio(&clip.segment, std::mem::take(&mut clip.wav))
-        {
+        if let Some(reference) = store.publish_audio(&clip.segment, std::mem::take(&mut clip.wav)) {
             media.push(AudioMedia {
                 segment: clip.segment.id,
                 reference,
@@ -457,11 +520,11 @@ async fn audio_history(
             omitted += 1;
         }
     }
-    Ok(Json(AudioHistoryResponse {
+    AudioHistoryResponse {
         audio,
         media,
         media_omitted: omitted,
-    }))
+    }
 }
 async fn transcribe(
     State(state): State<HttpState>,

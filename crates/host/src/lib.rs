@@ -1,4 +1,6 @@
 mod application;
+mod history;
+pub use history::ArchivedImages;
 pub mod bindings;
 pub mod http;
 pub mod launcher;

@@ -340,6 +340,9 @@ impl ReceiverSession {
             .settings
             .clone()
     }
+    pub fn elapsed(&self) -> Duration {
+        Duration::from_nanos(self.0.shared.now_ns())
+    }
     pub fn subscribe_audio(&self) -> broadcast::Receiver<Frame> {
         self.0.shared.audio.subscribe()
     }

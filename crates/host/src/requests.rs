@@ -13,6 +13,36 @@ pub struct Empty {}
 pub struct Scope {
     pub binding: SessionBinding,
 }
+#[derive(Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct Archives {
+    #[serde(default)]
+    pub offset: usize,
+}
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveSources {
+    pub binding: SessionBinding,
+    #[serde(default)]
+    pub after: Option<SourceKey>,
+}
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveImages {
+    pub binding: SessionBinding,
+    pub at_ms: u64,
+    #[serde(default)]
+    pub sources: Vec<SourceKey>,
+}
+#[derive(Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveRange {
+    pub binding: SessionBinding,
+    pub from_ms: u64,
+    pub to_ms: u64,
+    #[serde(default)]
+    pub sources: Vec<SourceKey>,
+}
 #[derive(Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Connect {

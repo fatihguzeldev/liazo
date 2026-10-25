@@ -32,6 +32,10 @@ pub enum HostError {
     #[error(transparent)]
     Model(#[from] crate::models::ModelError),
     #[error(transparent)]
+    Archive(#[from] liazo_runtime::archive::ArchiveError),
+    #[error("archive history is unavailable")]
+    HistoryUnavailable,
+    #[error(transparent)]
     Runtime(#[from] RuntimeError),
     #[error(transparent)]
     Transport(#[from] liazo_transport::TransportError),
@@ -63,6 +67,7 @@ struct Inner {
     trust_ops: Mutex<()>,
     trust: Option<Arc<dyn crate::TrustStore>>,
     archive_root: PathBuf,
+    catalog: Option<liazo_runtime::archive::ArchiveCatalog>,
     models: crate::models::ModelStore,
 }
 
@@ -70,6 +75,9 @@ struct Inner {
 pub struct SessionHost(Arc<Inner>);
 
 impl SessionHost {
+    pub(crate) fn catalog(&self) -> Result<&liazo_runtime::archive::ArchiveCatalog, HostError> {
+        self.0.catalog.as_ref().ok_or(HostError::HistoryUnavailable)
+    }
     pub async fn observe(
         &self,
         args: crate::requests::Observe,
@@ -120,6 +128,7 @@ impl SessionHost {
         model_root: PathBuf,
         trust: Option<Arc<dyn crate::TrustStore>>,
     ) -> Self {
+        let catalog = liazo_runtime::archive::ArchiveCatalog::spawn(archive_root.clone()).ok();
         Self(Arc::new(Inner {
             identity,
             peers: RwLock::new(peers),
@@ -131,6 +140,7 @@ impl SessionHost {
             trust_ops: Mutex::new(()),
             trust,
             archive_root,
+            catalog,
             models: crate::models::ModelStore::new(model_root),
         }))
     }
@@ -210,6 +220,8 @@ impl SessionHost {
             .map(|active| active.receiver.clone());
         if let Some(previous) = previous {
             previous.disconnect().await?;
+            previous.retire_archive().await?;
+            self.0.active.write().await.take();
         }
         let certificate = self
             .0
@@ -283,6 +295,7 @@ impl SessionHost {
         };
         if let Some(receiver) = revoked {
             let _ = receiver.disconnect().await;
+            let _ = receiver.retire_archive().await;
         }
         Ok(())
     }
@@ -428,7 +441,7 @@ impl SessionHost {
     }
 }
 
-fn validate_sources(sources: &[SourceKey]) -> Result<(), HostError> {
+pub(crate) fn validate_sources(sources: &[SourceKey]) -> Result<(), HostError> {
     let mut seen = std::collections::HashSet::new();
     if sources.len() > 8 {
         return Err(HostError::Invalid);
