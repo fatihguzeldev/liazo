@@ -25,12 +25,16 @@ impl ArchiveIndex {
             let last: u64 = self.database.query_row(
                 "SELECT COALESCE(MAX(time),0) FROM (
                 SELECT MAX(last_ns) AS time FROM images UNION ALL SELECT MAX(first_ns) FROM gaps
-                UNION ALL SELECT MAX(received_ns) FROM transcripts)",
+                UNION ALL SELECT MAX(received_ns) FROM transcripts UNION ALL SELECT MAX(received_ns) FROM audio UNION ALL SELECT MAX(first_ns) FROM audio_policy)",
                 [],
                 |row| row.get(0),
             )?;
             self.record_global_gap(last.saturating_add(1), GapReason::ArchiveInterrupted)?;
             self.close_partials(last)?;
+            self.database.execute(
+                "UPDATE audio_policy SET end_ns=?1 WHERE end_ns IS NULL",
+                [last],
+            )?;
         }
         let tx = self.database.transaction()?;
         tx.execute("INSERT INTO meta (key,value) VALUES ('writer_active','1') ON CONFLICT(key) DO UPDATE SET value='1'", [])?;
@@ -45,6 +49,10 @@ impl ArchiveIndex {
         }
         self.close_partials(now)?;
         let tx = self.database.transaction()?;
+        tx.execute(
+            "UPDATE audio_policy SET end_ns=?1 WHERE end_ns IS NULL",
+            [now],
+        )?;
         tx.execute("INSERT INTO meta (key,value) VALUES ('writer_active','0') ON CONFLICT(key) DO UPDATE SET value='0'", [])?;
         tx.execute("INSERT INTO meta (key,value) VALUES ('closed_at',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [now.to_string()])?;
         tx.commit()?;

@@ -42,6 +42,7 @@ pub struct ArchiveStats {
     pub metadata_budget_bytes: u64,
     pub payloads: u64,
     pub intervals: u64,
+    pub audio_segments: u64,
     pub retention_floor_ns: u64,
 }
 
@@ -76,6 +77,9 @@ impl ArchiveIndex {
             metadata_budget_bytes: self.limits.metadata_budget(),
             payloads,
             intervals,
+            audio_segments: self
+                .database
+                .query_row("SELECT COUNT(*) FROM audio", [], |row| row.get(0))?,
             retention_floor_ns,
         })
     }
@@ -96,6 +100,8 @@ impl ArchiveIndex {
         let tx = self.database.transaction()?;
         tx.execute("INSERT INTO meta (key,value) VALUES ('retention_floor',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [floor.to_string()])?;
         tx.execute("DELETE FROM images WHERE last_ns<?1", [floor])?;
+        tx.execute("DELETE FROM audio WHERE last_ns<?1", [floor])?;
+        tx.execute("DELETE FROM audio_policy WHERE end_ns<?1", [floor])?;
         tx.execute("DELETE FROM gaps WHERE end_ns<?1", [floor])?;
         tx.execute("DELETE FROM global_gaps WHERE end_ns<?1", [floor])?;
         tx.execute(
@@ -108,19 +114,26 @@ impl ArchiveIndex {
             if self.stats()?.accounted_bytes + reserve <= self.limits.max_bytes {
                 return Ok(());
             }
-            let oldest: Option<(i64, u64)> = self
+            let oldest: Option<(String, String, u64)> = self
                 .database
                 .query_row(
-                    "SELECT id,last_ns FROM images ORDER BY last_ns LIMIT 1",
+                    "SELECT kind,id,last_ns FROM (SELECT 'image' AS kind,CAST(id AS TEXT) AS id,last_ns FROM images UNION ALL SELECT 'audio',id,last_ns FROM audio) ORDER BY last_ns LIMIT 1",
                     [],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?;
-            let Some((row, end)) = oldest else {
+            let Some((kind, row, end)) = oldest else {
                 return Err(ArchiveError::Capacity);
             };
             let tx = self.database.transaction()?;
-            tx.execute("DELETE FROM images WHERE id=?1", [row])?;
+            tx.execute(
+                if kind == "audio" {
+                    "DELETE FROM audio WHERE id=?1"
+                } else {
+                    "DELETE FROM images WHERE id=?1"
+                },
+                [row],
+            )?;
             tx.execute("INSERT INTO meta (key,value) VALUES ('capacity_before',?1) ON CONFLICT(key) DO UPDATE SET value=CAST(MAX(CAST(value AS INTEGER),?1) AS TEXT)", [end])?;
             tx.commit()?;
             self.remove_unused()?;
@@ -129,7 +142,7 @@ impl ArchiveIndex {
     }
 
     fn remove_unused(&mut self) -> Result<(), ArchiveError> {
-        let unused = self.database.prepare("SELECT id FROM payloads WHERE NOT EXISTS (SELECT 1 FROM images WHERE images.payload=payloads.id)")?
+        let unused = self.database.prepare("SELECT id FROM payloads WHERE NOT EXISTS (SELECT 1 FROM images WHERE images.payload=payloads.id) AND NOT EXISTS (SELECT 1 FROM audio WHERE audio.payload=payloads.id)")?
             .query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
         for id in unused {
             let uuid: Uuid = id.parse().map_err(|_| ArchiveError::InvalidPayload)?;

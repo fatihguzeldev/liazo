@@ -266,6 +266,7 @@ export interface ArchiveStatus {
 }
 export interface ArchiveStats {
   accounted_bytes: number;
+  audio_segments: number;
   intervals: number;
   metadata_budget_bytes: number;
   payloads: number;

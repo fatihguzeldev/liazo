@@ -46,7 +46,7 @@ impl ArchiveIndex {
         let payloads = PayloadStore::open(&root.join("payloads"))?;
         let database = Connection::open(root.join("index.sqlite3"))?;
         let version: i64 = database.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version > 1 {
+        if version > 2 {
             return Err(ArchiveError::SessionMismatch);
         }
         database.busy_timeout(Duration::from_secs(2))?;
@@ -79,7 +79,7 @@ impl ArchiveIndex {
         if existing != identity {
             return Err(ArchiveError::SessionMismatch);
         }
-        database.pragma_update(None, "user_version", 1)?;
+        database.pragma_update(None, "user_version", 2)?;
         let check: String = database.pragma_query_value(None, "quick_check", |row| row.get(0))?;
         if check != "ok" {
             return Err(ArchiveError::InvalidPayload);
@@ -105,6 +105,7 @@ impl ArchiveIndex {
         };
         archive.initialize_transcripts()?;
         archive.initialize_lifecycle()?;
+        archive.initialize_audio()?;
         archive.make_room(0, 0)?;
         Ok(archive)
     }
