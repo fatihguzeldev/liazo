@@ -1,7 +1,7 @@
 use crate::{Result, profile::Profile};
 use liazo_transport::{
-    AcceptedLane, DeviceCredentials, LaneKind, PairingServer, PeerConnection, PeerServer,
-    PeerSession, SessionBinding, SessionServer,
+    AcceptedLane, DeviceCredentials, Fingerprint, LaneKind, PairingServer, PeerConnection,
+    PeerServer, PeerSession, PendingPairing, SessionBinding, SessionServer,
 };
 use std::{
     collections::HashMap,
@@ -9,7 +9,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{net::TcpListener, sync::oneshot, task::JoinSet};
+use tokio::{net::TcpListener, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -110,7 +110,6 @@ pub async fn run(
     let mut pending: HashMap<Uuid, Partial> = HashMap::new();
     let mut active = JoinSet::new();
     let mut active_cancel: Option<CancellationToken> = None;
-    let mut pairings = JoinSet::new();
     let mut pairing_handshakes = JoinSet::new();
     let mut trust = tokio::time::interval(Duration::from_secs(1));
     let mut previous: Vec<_> = peers.iter().map(|peer| peer.fingerprint()).collect();
@@ -149,34 +148,14 @@ pub async fn run(
             }
             request = pairing_handshakes.join_next(), if !pairing_handshakes.is_empty() => {
                 if let Some(Ok(Ok(request))) = request {
-                    eprintln!("pair request: {} {}", request.label(), request.fingerprint());
-                    let (answer, answered) = oneshot::channel();
-                    // One invitation is single-use, so at most one terminal approval reader exists.
-                    std::thread::spawn(move || {
-                        eprintln!("allow this computer? [y/n]");
-                        let mut line = String::new();
-                        let allowed = std::io::stdin().read_line(&mut line).is_ok() && line.trim() == "y";
-                        let _ = answer.send(allowed);
-                    });
-                    pairings.spawn(async move {
-                        let allowed = tokio::time::timeout(Duration::from_secs(120), answered).await.ok().and_then(|answer| answer.ok()).unwrap_or(false);
-                        (request, allowed)
-                    });
-                }
-            }
-            answer = pairings.join_next(), if !pairings.is_empty() => {
-                if let Some(Ok((request, allowed))) = answer {
-                    if allowed {
-                        {
-                            let _lock = profile.lock("credentials")?;
-                            credentials.save_peer(request.certificate(), request.label())?;
-                            let peers = credentials.peers()?;
-                            server.replace_trusted(&identity, &peers.into_iter().map(|peer| peer.certificate).collect::<Vec<_>>())?;
-                        }
-                        let peer = request.fingerprint();
-                        request.approve().await?;
-                        println!("{}", serde_json::json!({"event":"paired","fingerprint":peer.to_string()}));
-                    } else { request.deny().await?; }
+                    let peer = complete_pairing(request, |request| {
+                        let _lock = profile.lock("credentials")?;
+                        credentials.save_peer(request.certificate(), request.label())?;
+                        let peers = credentials.peers()?;
+                        server.replace_trusted(&identity, &peers.into_iter().map(|peer| peer.certificate).collect::<Vec<_>>())?;
+                        Ok(())
+                    }).await?;
+                    println!("{}", serde_json::json!({"event":"paired","fingerprint":peer.to_string()}));
                 }
             }
             _ = trust.tick() => {
@@ -194,7 +173,6 @@ pub async fn run(
     }
     cancel.cancel();
     handshakes.abort_all();
-    pairings.abort_all();
     pairing_handshakes.abort_all();
     drop(pending);
     while active.join_next().await.is_some() {}
@@ -210,6 +188,18 @@ pub async fn run(
     _: bool,
 ) -> Result<()> {
     Err("capture provider requires macos".into())
+}
+
+async fn complete_pairing(
+    request: PendingPairing,
+    persist_trust: impl FnOnce(&PendingPairing) -> Result<()>,
+) -> Result<Fingerprint> {
+    // PairingServer has already verified the expiring, single-use secret.
+    // Giving that secret to the client is the user's authorization.
+    persist_trust(&request)?;
+    let peer = request.fingerprint();
+    request.approve().await?;
+    Ok(peer)
 }
 
 fn advertised_ip(bound: IpAddr, explicit: Option<IpAddr>) -> Result<IpAddr> {
@@ -229,4 +219,74 @@ fn advertised_ip(bound: IpAddr, explicit: Option<IpAddr>) -> Result<IpAddr> {
         .map(|interface| interface.ip())
         .find(|ip| !ip.is_loopback() && !ip.is_unspecified() && ip.is_ipv4())
         .ok_or_else(|| "no local address is available; specify --advertise".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use liazo_transport::{Identity, PeerClient, request_pairing};
+
+    #[tokio::test]
+    async fn a_valid_token_registers_the_exact_client_without_interactive_approval() {
+        let provider = Identity::generate().unwrap();
+        let receiver = Identity::generate().unwrap();
+        let expected = receiver.fingerprint();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let pairing = PairingServer::open(&provider, address).unwrap();
+        let invitation = pairing.invitation();
+        let server = PeerServer::new(&provider, &[]).unwrap();
+        let client = tokio::spawn(async move {
+            request_pairing(&invitation, &receiver, "windows")
+                .await
+                .unwrap();
+            (receiver, invitation)
+        });
+        let (socket, _) = listener.accept().await.unwrap();
+        let request = pairing.accept(socket).await.unwrap();
+        let mut saved = None;
+        let registered = tokio::time::timeout(
+            Duration::from_secs(2),
+            complete_pairing(request, |request| {
+                saved = Some((request.fingerprint(), request.label().to_owned()));
+                server.replace_trusted(&provider, &[request.certificate().clone()])?;
+                Ok(())
+            }),
+        )
+        .await
+        .expect("pairing must finish without waiting for stdin")
+        .unwrap();
+        assert_eq!(registered, expected);
+        assert_eq!(saved, Some((expected, "windows".into())));
+        let (receiver, invitation) = client.await.unwrap();
+        let accept = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            server.accept(socket).await.unwrap().fingerprint()
+        });
+        PeerClient::new(&receiver, invitation.provider_certificate())
+            .unwrap()
+            .connect(address)
+            .await
+            .unwrap();
+        assert_eq!(accept.await.unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn failing_to_persist_trust_does_not_approve_the_client() {
+        let provider = Identity::generate().unwrap();
+        let receiver = Identity::generate().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pairing = PairingServer::open(&provider, listener.local_addr().unwrap()).unwrap();
+        let invitation = pairing.invitation();
+        let client =
+            tokio::spawn(async move { request_pairing(&invitation, &receiver, "windows").await });
+        let (socket, _) = listener.accept().await.unwrap();
+        let request = pairing.accept(socket).await.unwrap();
+        assert!(
+            complete_pairing(request, |_| Err("credential store denied access".into()))
+                .await
+                .is_err()
+        );
+        assert!(client.await.unwrap().is_err());
+    }
 }
