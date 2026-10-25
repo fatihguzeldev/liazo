@@ -49,6 +49,7 @@ jobs:
           if (Test-Path -LiteralPath $buildRoot) { throw 'expected an unused ephemeral Vulkan build directory' }
           New-Item -ItemType Directory -Path $buildRoot | Out-Null
           "LIAZO_VULKAN_BUILD_ROOT=$buildRoot" >> $env:GITHUB_ENV
+          'CMAKE_GENERATOR=Ninja' >> $env:GITHUB_ENV
           $version = '1.4.363.0'
           $sha256 = '94a82d378f7a5e3e54c9db7d2fb7016af136e14ac0a18dbf0f2f67a36352d141'
           $installer = Join-Path $env:RUNNER_TEMP "vulkansdk-windows-X64-$version.exe"
@@ -140,13 +141,29 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
+      - name: collect native CMake diagnostics
+        if: failure()
+        shell: pwsh
+        env:
+          LIAZO_PACKAGE_CPU: ${{ inputs.cpu || 'baseline' }}
+          LIAZO_PACKAGE_BACKEND: ${{ matrix.backend }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $buildRoot = if ($env:LIAZO_PACKAGE_BACKEND -eq 'vulkan') { $env:LIAZO_VULKAN_BUILD_ROOT } else { Join-Path $PWD "target/packages/windows-$env:LIAZO_PACKAGE_CPU" }
+          if ($buildRoot -and (Test-Path -LiteralPath $buildRoot)) {
+            $logs = @(Get-ChildItem -LiteralPath $buildRoot -Recurse -File -Filter CMakeConfigureLog.yaml | Sort-Object FullName)
+            $destination = Join-Path $PWD 'target/native-diagnostics'
+            New-Item -ItemType Directory -Path $destination -Force | Out-Null
+            for ($index = 0; $index -lt $logs.Count; $index++) {
+              Copy-Item -LiteralPath $logs[$index].FullName -Destination (Join-Path $destination ('cmake-{0:D3}.yaml' -f $index))
+            }
+            Write-Host "Collected $($logs.Count) native CMake logs"
+          }
       - name: native CMake diagnostics
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: liazo-native-diagnostics-${{ inputs.cpu || 'baseline' }}-${{ matrix.backend }}
-          path: |
-            target/**/CMakeFiles/CMakeConfigureLog.yaml
-            ${{ env.LIAZO_VULKAN_BUILD_ROOT || 'target/no-vulkan-build' }}/**/CMakeFiles/CMakeConfigureLog.yaml
+          path: target/native-diagnostics/*.yaml
           if-no-files-found: ignore
           retention-days: 2

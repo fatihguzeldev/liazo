@@ -59,6 +59,7 @@ $settings = @{
     GGML_FMA = 'OFF'
     GGML_F16C = 'OFF'
 }
+if ($Backend -eq 'vulkan') { $settings.CMAKE_GENERATOR = 'Ninja' }
 if ($Cpu -eq 'avx2') {
     $settings.GGML_SSE42 = 'ON'
     $settings.GGML_AVX = 'ON'
@@ -137,6 +138,10 @@ try {
             }
         }
         Write-Host "Vulkan host compiler: $($compiler.Source)"
+        $ninja = Get-Command ninja.exe -CommandType Application -ErrorAction Stop | Select-Object -First 1
+        & $ninja.Source --version
+        if ($LASTEXITCODE -ne 0) { throw 'Ninja failed to start' }
+        Write-Host "Vulkan CMake generator: Ninja ($($ninja.Source))"
         if (!$env:VULKAN_SDK -or
             !(Test-Path (Join-Path $env:VULKAN_SDK 'Include/vulkan/vulkan_core.h')) -or
             !(Test-Path (Join-Path $env:VULKAN_SDK 'Lib/vulkan-1.lib')) -or
