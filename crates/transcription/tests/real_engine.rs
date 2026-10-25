@@ -117,3 +117,78 @@ async fn real_streaming_inference_publishes_revisable_partials_and_attributed_fi
             && final_.revision > partial.revision
             && final_.text.split_whitespace().count() >= 3)));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires LIAZO_TEST_MODEL"]
+async fn nonspeech_windows_preserve_an_empty_terminal_transcript() {
+    use liazo_core::{protocol::SourceKey, transcript::EndReason};
+    use liazo_transcription::{
+        SAMPLE_RATE,
+        streaming::InferenceWindow,
+        worker::{InferenceWorker, RecognitionUpdate},
+    };
+    use uuid::Uuid;
+
+    let model = WhisperModel::load(&PathBuf::from(
+        std::env::var_os("LIAZO_TEST_MODEL").expect("model path"),
+    ))
+    .unwrap();
+    let mut samples = vec![0.0; SAMPLE_RATE];
+    for start in (320..SAMPLE_RATE - 160).step_by(1600) {
+        for offset in 0..80 {
+            let decay = 1.0 - offset as f32 / 80.0;
+            samples[start + offset] = 0.5 * decay * (offset as f32 * 1.3).sin();
+        }
+    }
+    let rms =
+        (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32).sqrt();
+    assert!(rms > 0.003, "fixture must pass the existing energy gate");
+    let mut window = InferenceWindow {
+        id: Uuid::new_v4(),
+        source: SourceKey {
+            id: "audio:keyboard-fixture".into(),
+            generation: Uuid::new_v4(),
+        },
+        stream_id: Uuid::new_v4(),
+        revision: 1,
+        start_ns: 2_000_000_000,
+        end_ns: 3_000_000_000,
+        ending: None,
+        samples: samples.into(),
+    };
+    let mut worker = InferenceWorker::start(model, 4).await.unwrap();
+    assert!(worker.submit(window.clone()).unwrap().is_empty());
+    // A suppressed partial emits no update. Submit its final without waiting
+    // for a partial, allowing the worker's normal coalescing/cancellation path.
+    window.revision = 2;
+    window.ending = Some(EndReason::Stopped);
+    assert!(worker.submit(window.clone()).unwrap().is_empty());
+    worker.finish();
+
+    let mut finals = 0;
+    while let Some(update) = tokio::time::timeout(Duration::from_secs(10), worker.next())
+        .await
+        .expect("speech worker did not finish its bounded noise window")
+    {
+        let RecognitionUpdate::Transcript(transcript) = update else {
+            panic!("suppressing noise must not produce a transcription gap");
+        };
+        transcript.validate().unwrap();
+        assert!(transcript.text.is_empty());
+        assert_eq!(transcript.ending, window.ending);
+        assert_eq!(transcript.id, window.id);
+        assert_eq!(transcript.source, window.source);
+        assert_eq!(transcript.stream_id, window.stream_id);
+        assert_eq!(transcript.revision, window.revision);
+        assert_eq!(
+            (transcript.start_ns, transcript.end_ns),
+            (window.start_ns, window.end_ns)
+        );
+        finals += 1;
+    }
+    worker.join().await.unwrap();
+    assert_eq!(
+        finals, 1,
+        "noise must close exactly one attributed utterance"
+    );
+}

@@ -14,6 +14,7 @@ use whisper_rs::{
 mod acceleration;
 pub mod audio;
 pub mod streaming;
+mod vad;
 pub mod worker;
 
 use acceleration::with_cpu_fallback;
@@ -43,6 +44,7 @@ pub struct RecognizedSegment {
     pub end_ms: u64,
     pub text: String,
     pub no_speech_probability: f32,
+    pub average_log_probability: Option<f32>,
 }
 
 #[derive(Clone)]
@@ -119,13 +121,21 @@ impl WhisperModel {
             }
             loaded.context.create_state()
         })?;
-        Ok(WhisperDecoder { state, threads })
+        Ok(WhisperDecoder {
+            state,
+            threads,
+            end_of_text_token: loaded.context.token_eot(),
+            // Keep the existing recognizer available if optional VAD cannot initialize.
+            speech_gate: vad::SpeechGate::new().ok(),
+        })
     }
 }
 
 pub struct WhisperDecoder {
     state: WhisperState,
     threads: u8,
+    end_of_text_token: whisper_rs::WhisperTokenId,
+    speech_gate: Option<vad::SpeechGate>,
 }
 
 impl WhisperDecoder {
@@ -138,6 +148,18 @@ impl WhisperDecoder {
         validate_input(samples)?;
         if cancelled.load(Ordering::Acquire) {
             return Err(TranscriptionError::Cancelled);
+        }
+        // Keep filtering on this worker, with the original samples and timestamps.
+        // A failed gate falls back to Whisper rather than silently losing speech.
+        let speech = self
+            .speech_gate
+            .as_mut()
+            .is_none_or(|gate| gate.has_speech(samples).unwrap_or(true));
+        if cancelled.load(Ordering::Acquire) {
+            return Err(TranscriptionError::Cancelled);
+        }
+        if !speech {
+            return Ok(Vec::new());
         }
         let mut parameters = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         parameters.set_n_threads(i32::from(self.threads));
@@ -183,10 +205,39 @@ impl WhisperDecoder {
                     end_ms,
                     text: segment.to_str()?.trim().to_owned(),
                     no_speech_probability: segment.no_speech_probability(),
+                    average_log_probability: average_text_log_probability(
+                        (0..segment.n_tokens()).filter_map(|index| {
+                            segment.get_token(index).map(|token| {
+                                let data = token.token_data();
+                                (data.id, data.plog)
+                            })
+                        }),
+                        self.end_of_text_token,
+                    ),
                 })
             })
             .collect()
     }
+}
+
+fn average_text_log_probability(
+    tokens: impl Iterator<Item = (whisper_rs::WhisperTokenId, f32)>,
+    end_of_text_token: whisper_rs::WhisperTokenId,
+) -> Option<f32> {
+    let mut total = 0.0_f64;
+    let mut count = 0;
+    for (id, probability) in tokens {
+        // Timestamp/control tokens do not describe confidence in the actual words.
+        if id < 0 || id >= end_of_text_token {
+            continue;
+        }
+        if !probability.is_finite() || probability > 0.0 {
+            return None;
+        }
+        total += f64::from(probability);
+        count += 1;
+    }
+    (count > 0).then(|| (total / f64::from(count)) as f32)
 }
 
 unsafe extern "C" fn should_abort(user: *mut std::ffi::c_void) -> bool {
@@ -209,6 +260,27 @@ fn validate_input(samples: &[f32]) -> Result<(), TranscriptionError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn word_confidence_excludes_special_tokens_and_handles_missing_scores() {
+        let tokens = [(1, -0.2), (2, -0.6), (10, -8.0), (12, 0.0)];
+        assert_eq!(
+            average_text_log_probability(tokens.into_iter(), 10),
+            Some(-0.4)
+        );
+        assert_eq!(
+            average_text_log_probability([(10, 0.0)].into_iter(), 10),
+            None
+        );
+        assert_eq!(
+            average_text_log_probability([(1, f32::NAN)].into_iter(), 10),
+            None
+        );
+        assert_eq!(
+            average_text_log_probability([(1, f32::NEG_INFINITY)].into_iter(), 10),
+            None
+        );
+    }
 
     #[cfg(feature = "vulkan")]
     #[test]

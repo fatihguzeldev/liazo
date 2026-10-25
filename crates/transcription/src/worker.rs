@@ -17,6 +17,14 @@ use uuid::Uuid;
 const MAX_PENDING_BYTES: usize = 32 * 1024 * 1024;
 const MAX_FINALS: usize = 16;
 
+fn accepts_segment(no_speech_probability: f32, average_log_probability: Option<f32>) -> bool {
+    // Native Whisper already uses joint no-speech/logprob suppression. Preserve this
+    // wrapper's existing 0.8 boundary, but allow confident words through it as well.
+    !((0.0..=1.0).contains(&no_speech_probability)
+        && no_speech_probability > 0.8
+        && average_log_probability.is_some_and(|score| score.is_finite() && score < -1.0))
+}
+
 pub enum RecognitionUpdate {
     Transcript(Transcript),
     Gap(TranscriptionGap),
@@ -83,10 +91,12 @@ impl InferenceWorker {
                     let update = match result {
                         Ok(segments) => {
                             let mut text = String::new();
-                            for segment in segments
-                                .into_iter()
-                                .filter(|segment| segment.no_speech_probability <= 0.8)
-                            {
+                            for segment in segments.into_iter().filter(|segment| {
+                                accepts_segment(
+                                    segment.no_speech_probability,
+                                    segment.average_log_probability,
+                                )
+                            }) {
                                 for ch in segment.text.trim().chars().filter(|ch| !ch.is_control())
                                 {
                                     if text.len() + ch.len_utf8() > 16_383 {
@@ -306,6 +316,21 @@ impl Queue {
 mod tests {
     use super::*;
     use liazo_core::transcript::EndReason;
+
+    #[test]
+    fn confident_short_speech_is_not_discarded_by_no_speech_score_alone() {
+        assert!(accepts_segment(0.95, Some(-0.15)));
+        assert!(!accepts_segment(0.95, Some(-1.8)));
+        assert!(accepts_segment(0.15, Some(-1.8)));
+    }
+
+    #[test]
+    fn unavailable_confidence_is_not_evidence_of_silence() {
+        assert!(accepts_segment(0.95, None));
+        assert!(accepts_segment(0.95, Some(f32::NAN)));
+        assert!(accepts_segment(f32::NAN, Some(-0.15)));
+    }
+
     fn window(id: Uuid, revision: u32, ending: Option<EndReason>) -> InferenceWindow {
         InferenceWindow {
             id,
