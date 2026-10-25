@@ -13,7 +13,7 @@ export function Speech({
   sources: Source[];
   disabled: boolean;
 }) {
-  const [choice, setChoice] = useState("base");
+  const [choice, setChoice] = useState("large-v3-turbo");
   const [custom, setCustom] = useState("");
   const [models, setModels] = useState<Api["models"]>([]);
   const [refresh, setRefresh] = useState(0);
@@ -28,6 +28,13 @@ export function Speech({
           const rows = await call<Api["models"]>("models");
           if (!alive) break;
           setModels(rows);
+          setChoice((current) =>
+            current === "custom" ||
+            !rows.length ||
+            rows.some((model) => model.id === current)
+              ? current
+              : (rows.find((model) => model.phase === "ready")?.id ?? rows[0].id),
+          );
           if (
             !rows.some(
               (row) => row.phase === "downloading" || row.phase === "verifying",
@@ -112,7 +119,9 @@ export function Speech({
                       : ""}
                 </option>
               ))}
-              {!models.length && <option value="base">loading…</option>}
+              {!models.length && (
+                <option value="large-v3-turbo">loading…</option>
+              )}
               <option value="custom">use a file</option>
             </select>
           </label>

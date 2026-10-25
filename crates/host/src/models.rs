@@ -16,7 +16,7 @@ struct Definition {
     bytes: u64,
     sha256: &'static str,
 }
-const MODELS: [Definition; 2] = [
+const MODELS: [Definition; 3] = [
     Definition {
         id: "base",
         file: "ggml-base.bin",
@@ -28,6 +28,12 @@ const MODELS: [Definition; 2] = [
         file: "ggml-small-q8_0.bin",
         bytes: 264464607,
         sha256: "49c8fb02b65e6049d5fa6c04f81f53b867b5ec9540406812c643f177317f779f",
+    },
+    Definition {
+        id: "large-v3-turbo",
+        file: "ggml-large-v3-turbo.bin",
+        bytes: 1_624_555_275,
+        sha256: "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69",
     },
 ];
 
@@ -372,6 +378,33 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+    #[tokio::test]
+    async fn turbo_manifest_is_exposed_without_changing_existing_model_ids() {
+        let root = tempfile::tempdir().unwrap();
+        let store = ModelStore::new(root.path().to_owned());
+        let rows = initialized(&store).await;
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            ["base", "small-q8", "large-v3-turbo"]
+        );
+        let turbo = rows.iter().find(|row| row.id == "large-v3-turbo").unwrap();
+        assert_eq!(turbo.bytes, 1_624_555_275);
+        assert_eq!(
+            turbo.sha256,
+            "1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69"
+        );
+        assert!(turbo.phase == ModelPhase::Missing && turbo.path.is_none());
+        assert_eq!(turbo.received_bytes, 0);
+        let definition = MODELS.iter().find(|model| model.id == turbo.id).unwrap();
+        assert_eq!(definition.file, "ggml-large-v3-turbo.bin");
+        assert_eq!(REVISION, "5359861c739e955e79d9a303bcbc70fb988958b1");
+        assert!(
+            MODELS
+                .iter()
+                .all(|model| model.bytes > 0 && model.bytes <= 2 * 1024 * 1024 * 1024)
+        );
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
     #[tokio::test]
     async fn status_returns_while_initial_verification_is_pending() {
