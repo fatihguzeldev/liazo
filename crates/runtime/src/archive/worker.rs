@@ -716,7 +716,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn idle_archives_expire_on_the_worker_and_sealing_keeps_reads_available() {
+    async fn idle_maintenance_expires_archives_and_sealing_keeps_reads_available() {
         let root = tempfile::tempdir().unwrap();
         let identity = ArchiveIdentity {
             provider: Identity::generate().unwrap().fingerprint(),
@@ -731,7 +731,7 @@ mod tests {
             root.path().to_owned(),
             identity,
             ArchiveLimits {
-                duration_ms: 100,
+                duration_ms: 60_000,
                 max_bytes: 4 * 1024 * 1024,
             },
             clock,
@@ -769,13 +769,10 @@ mod tests {
             client.image(source.clone(), at).await.unwrap().state,
             HistoryState::Available
         );
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while client.status().stats.unwrap().payloads != 0 {
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .unwrap();
+        // Drive the idle maintenance path with epoch time, independently of fsync latency.
+        client.tick(at + 60_001_000_000);
+        client.flush().await.unwrap();
+        assert_eq!(client.status().stats.unwrap().payloads, 0);
         assert!(matches!(
             client.image(source.clone(), at).await.unwrap().state,
             HistoryState::Expired | HistoryState::NotRetained
