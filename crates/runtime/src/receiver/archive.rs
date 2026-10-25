@@ -63,17 +63,25 @@ impl ReceiverSession {
                 .await?;
         let client = worker.client();
         *owner = Some(worker);
-        {
+        let attached = {
             let mut state = self
                 .0
                 .shared
                 .state
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if state.connection != ConnectionState::Connected {
-                return Err(RuntimeError::Closed);
+            if state.connection == ConnectionState::Connected {
+                state.attach_archive(client, self.0.shared.now_ns());
+                true
+            } else {
+                false
             }
-            state.attach_archive(client, self.0.shared.now_ns());
+        };
+        if !attached {
+            if let Some(worker) = owner.as_mut() {
+                worker.stop().await;
+            }
+            return Err(RuntimeError::Closed);
         }
         self.0.shared.signal();
         Ok(())
