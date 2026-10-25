@@ -171,6 +171,7 @@ try {
         if (Test-Path -LiteralPath $previousNotice) { Remove-Item -LiteralPath $previousNotice }
     }
     Copy-Item (Join-Path $redist.FullName '*.dll') $runtime
+    Copy-Item (Join-Path $root 'crates/transcription/models/LICENSE.silero') (Join-Path $runtime 'Silero-License.txt') -Force
     if ($Backend -eq 'vulkan') {
         $cache = Join-Path $root "target/dependencies/vulkan-$vulkanVersion"
         New-Item -ItemType Directory -Path $cache -Force | Out-Null

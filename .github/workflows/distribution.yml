@@ -119,6 +119,30 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or "${test}: test" -notin $tests) { throw 'native no-device test is unavailable' }
           & cargo test --locked --release --target x86_64-pc-windows-msvc -p liazo-transcription --features vulkan --lib $test -- --ignored --exact --test-threads=1 --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: speech gate checks
+        if: matrix.backend == 'vulkan'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:CARGO_TARGET_DIR = $env:LIAZO_VULKAN_BUILD_ROOT
+          & cargo test --locked --release --target x86_64-pc-windows-msvc -p liazo-transcription --features vulkan --lib vad::tests -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $checks = Join-Path $PWD 'target/speech-checks'
+          New-Item -ItemType Directory -Path $checks -Force | Out-Null
+          $release = Join-Path $env:CARGO_TARGET_DIR 'x86_64-pc-windows-msvc/release'
+          $executables = @(Get-ChildItem (Join-Path $release 'deps') -Filter 'liazo_transcription-*.exe')
+          if ($executables.Count -ne 1) { throw 'expected one native speech test executable' }
+          Copy-Item $executables[0].FullName (Join-Path $checks 'liazo-speech-checks.exe')
+          Copy-Item (Join-Path $PWD 'desktop/src-tauri/binaries/runtime/*.dll') $checks
+          Copy-Item (Join-Path $PWD 'crates/transcription/models/LICENSE.silero') (Join-Path $checks 'Silero-License.txt')
+      - name: native speech checks
+        if: matrix.backend == 'vulkan'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: liazo-speech-checks
+          path: target/speech-checks/*
+          if-no-files-found: error
+          retention-days: 2
       - name: portable package
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
