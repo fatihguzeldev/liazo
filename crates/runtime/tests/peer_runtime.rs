@@ -178,6 +178,8 @@ async fn pair(
     let session = ReceiverSession::connect(&client, address, Uuid::new_v4())
         .await
         .unwrap();
+    assert_eq!(session.archive_identity().provider, identity.fingerprint());
+    assert!(session.archive_identity().wall_anchor_unix_ms > 0);
     (session, provider)
 }
 

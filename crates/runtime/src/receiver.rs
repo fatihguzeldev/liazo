@@ -9,12 +9,12 @@ use liazo_core::{
     protocol::{CaptureSettings, PROTOCOL_VERSION, SourceKey},
     wire::{Frame, Header},
 };
-use liazo_transport::{PeerClient, PeerSession};
+use liazo_transport::{Fingerprint, PeerClient, PeerSession};
 use std::{
     collections::HashMap,
     net::SocketAddr,
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     sync::{Notify, Semaphore, broadcast, mpsc, oneshot},
@@ -33,6 +33,8 @@ struct Router {
     pending: HashMap<u64, Pending>,
 }
 pub(crate) struct Shared {
+    provider: Fingerprint,
+    wall_anchor_unix_ms: u64,
     pub(crate) state: Mutex<LiveState>,
     router: Mutex<Router>,
     sender: mpsc::Sender<Frame>,
@@ -97,9 +99,23 @@ impl ReceiverSession {
     }
 
     pub async fn attach(peer: PeerSession) -> Result<Self, RuntimeError> {
+        let provider = peer.control.fingerprint();
+        if peer.images.fingerprint() != provider || peer.audio.fingerprint() != provider {
+            return Err(RuntimeError::Protocol);
+        }
+        let clock = Instant::now();
+        let wall_anchor_unix_ms = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| failure(FailureCode::Internal, "system clock is unavailable"))?
+                .as_millis(),
+        )
+        .map_err(|_| failure(FailureCode::Internal, "system clock is out of range"))?;
         let (sender, mut outgoing) = mpsc::channel::<Frame>(32);
         let (audio, _) = broadcast::channel(32);
         let shared = Arc::new(Shared {
+            provider,
+            wall_anchor_unix_ms,
             state: Mutex::new(LiveState::new(peer.binding)),
             router: Mutex::new(Router {
                 next_id: 1,
@@ -110,7 +126,7 @@ impl ReceiverSession {
             changed: Notify::new(),
             sources_dirty: Notify::new(),
             cancelled: CancellationToken::new(),
-            clock: Instant::now(),
+            clock,
             audio,
         });
         let (mut control_reader, mut control_writer) = tokio::io::split(peer.control);
@@ -296,6 +312,20 @@ impl ReceiverSession {
     }
     pub fn subscribe_audio(&self) -> broadcast::Receiver<Frame> {
         self.0.shared.audio.subscribe()
+    }
+
+    pub fn archive_identity(&self) -> crate::archive::ArchiveIdentity {
+        crate::archive::ArchiveIdentity {
+            binding: self
+                .0
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .binding,
+            provider: self.0.shared.provider,
+            wall_anchor_unix_ms: self.0.shared.wall_anchor_unix_ms,
+        }
     }
 
     pub fn configure_history(

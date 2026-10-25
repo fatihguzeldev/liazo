@@ -20,6 +20,7 @@ pub struct ArchiveIndex {
 pub struct ArchiveIdentity {
     pub binding: SessionBinding,
     pub provider: Fingerprint,
+    pub wall_anchor_unix_ms: u64,
 }
 
 struct StoredImage {
@@ -65,7 +66,7 @@ impl ArchiveIndex {
                 first_ns INTEGER NOT NULL, end_ns INTEGER, reason TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS gaps_time ON gaps(source, generation, first_ns DESC);")?;
         let identity = serde_json::to_string(
-            &serde_json::json!({ "session": identity.binding.session, "epoch": identity.binding.epoch, "provider": identity.provider.to_string() }),
+            &serde_json::json!({ "session": identity.binding.session, "epoch": identity.binding.epoch, "provider": identity.provider.to_string(), "wall_anchor_unix_ms":identity.wall_anchor_unix_ms }),
         )?;
         database.execute(
             "INSERT OR IGNORE INTO meta (key,value) VALUES ('binding',?1)",
@@ -349,6 +350,7 @@ mod tests {
     use liazo_transport::Identity;
     fn binding() -> ArchiveIdentity {
         ArchiveIdentity {
+            wall_anchor_unix_ms: 1_700_000_000_000,
             provider: Identity::generate().unwrap().fingerprint(),
             binding: SessionBinding {
                 session: Uuid::new_v4(),
@@ -537,5 +539,12 @@ mod tests {
             archive.at(&meta(1).source, 500_000_000).unwrap().state,
             HistoryState::Expired
         );
+        drop(archive);
+        let mut changed_anchor = binding;
+        changed_anchor.wall_anchor_unix_ms += 1;
+        assert!(matches!(
+            ArchiveIndex::open(root.path(), changed_anchor, ArchiveLimits::default()),
+            Err(ArchiveError::SessionMismatch)
+        ));
     }
 }
