@@ -1,0 +1,28 @@
+[package]
+name = "liazo-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+liazo-core = { path = "../core" }
+liazo-runtime = { path = "../runtime" }
+liazo-transport = { path = "../transport" }
+liazo-transcription = { path = "../transcription" }
+tokio.workspace = true
+tokio-util = { version = "0.7", features = ["rt"] }
+uuid.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+base64 = "0.22"
+getrandom = "0.4"
+subtle = "2"
+futures-util = "0.3"
+
+[dev-dependencies]
+async-trait = "0.1"
+tempfile = "3"
+reqwest = { version = "0.13", default-features = false, features = ["json"] }

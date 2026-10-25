@@ -1,0 +1,456 @@
+use crate::{
+    HostError, SessionHost,
+    media::{Media, MediaRef},
+};
+use axum::{
+    Json, Router,
+    body::Body,
+    extract::{Path, Request, State},
+    http::{StatusCode, header},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+    routing::{get, post},
+};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use futures_util::StreamExt;
+use liazo_core::protocol::{CaptureSettings, SourceKey};
+use liazo_runtime::{
+    Observation,
+    history::{HistoryLimits, HistorySnapshot},
+};
+use liazo_transport::SessionBinding;
+use serde::{Deserialize, Serialize};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
+use subtle::ConstantTimeEq;
+use tokio::{net::TcpListener, sync::Semaphore};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+const MAX_REQUEST: usize = 64 * 1024;
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Endpoint {
+    pub version: u16,
+    pub address: SocketAddr,
+    pub token: String,
+}
+impl Endpoint {
+    pub fn new(address: SocketAddr) -> std::io::Result<Self> {
+        if !address.ip().is_loopback() || address.port() == 0 {
+            return Err(std::io::Error::other(
+                "local host requires a bound loopback address",
+            ));
+        }
+        let mut token = [0; 32];
+        getrandom::fill(&mut token).map_err(std::io::Error::other)?;
+        Ok(Self {
+            version: 1,
+            address,
+            token: URL_SAFE_NO_PAD.encode(token),
+        })
+    }
+}
+
+#[derive(Clone)]
+struct HttpState {
+    host: SessionHost,
+    authorization: Arc<Vec<u8>>,
+    authority: String,
+    media: Media,
+    requests: Arc<Semaphore>,
+}
+
+pub async fn serve(
+    listener: TcpListener,
+    host: SessionHost,
+    endpoint: Endpoint,
+    cancel: CancellationToken,
+) -> std::io::Result<()> {
+    if listener.local_addr()? != endpoint.address || !endpoint.address.ip().is_loopback() {
+        return Err(std::io::Error::other(
+            "local endpoint does not match listener",
+        ));
+    }
+    let state = HttpState {
+        host,
+        authorization: Arc::new(format!("Bearer {}", endpoint.token).into_bytes()),
+        authority: endpoint.address.to_string(),
+        media: Media::default(),
+        requests: Arc::new(Semaphore::new(8)),
+    };
+    let cleanup_media = state.media.clone();
+    let cleanup_cancel = cancel.child_token();
+    let stopping = cleanup_cancel.clone();
+    let cleanup = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            tokio::select! { _ = stopping.cancelled() => break, _ = tick.tick() => cleanup_media.trim() }
+        }
+    });
+    struct Cleanup(tokio::task::JoinHandle<()>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let _cleanup = Cleanup(cleanup);
+    let router = Router::new()
+        .route("/v1/status", get(status))
+        .route("/v1/peers", get(peers))
+        .route("/v1/connect", post(connect))
+        .route("/v1/sources", post(sources))
+        .route("/v1/observe", post(observe))
+        .route("/v1/configure", post(configure))
+        .route("/v1/capture", post(capture))
+        .route("/v1/history", post(history))
+        .route("/v1/transcripts", post(transcripts))
+        .route("/v1/history-limits", post(history_limits))
+        .route("/v1/transcribe", post(transcribe))
+        .route("/v1/transcription-stop", post(transcription_stop))
+        .route("/v1/stop", post(stop))
+        .route("/v1/media/{id}", get(media))
+        .layer(middleware::from_fn_with_state(state.clone(), authorize))
+        .with_state(state);
+    axum::serve(listener, router)
+        .with_graceful_shutdown(cancel.cancelled_owned())
+        .await
+}
+
+async fn authorize(State(state): State<HttpState>, request: Request, next: Next) -> Response {
+    if request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        != Some(state.authority.as_str())
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if request
+        .headers()
+        .get(header::ORIGIN)
+        .is_some_and(|origin| origin.as_bytes() != format!("http://{}", state.authority).as_bytes())
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let supplied = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .map_or(&[][..], |value| value.as_bytes());
+    if !bool::from(supplied.ct_eq(state.authorization.as_slice())) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Ok(permit) = state.requests.clone().try_acquire_owned() else {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    };
+    let (parts, body) = request.into_parts();
+    let bytes = match tokio::time::timeout(
+        Duration::from_secs(5),
+        axum::body::to_bytes(body, MAX_REQUEST),
+    )
+    .await
+    {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(_)) => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+        Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
+    };
+    let response = next
+        .run(Request::from_parts(parts, Body::from(bytes)))
+        .await;
+    let (mut parts, body) = response.into_parts();
+    parts
+        .headers
+        .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    parts
+        .headers
+        .insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
+    let stream = body.into_data_stream().map(move |chunk| {
+        let _held = &permit;
+        chunk
+    });
+    Response::from_parts(parts, Body::from_stream(stream))
+}
+
+impl IntoResponse for HostError {
+    fn into_response(self) -> Response {
+        let code = match self {
+            Self::NoSession => StatusCode::NOT_FOUND,
+            Self::Invalid => StatusCode::BAD_REQUEST,
+            Self::Unpaired => StatusCode::FORBIDDEN,
+            Self::ActiveSession | Self::Interrupted => StatusCode::CONFLICT,
+            _ => StatusCode::UNPROCESSABLE_ENTITY,
+        };
+        (code, Json(serde_json::json!({"error":self.to_string()}))).into_response()
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Scope {
+    binding: SessionBinding,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Connect {
+    address: SocketAddr,
+    peer: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Observe {
+    binding: SessionBinding,
+    #[serde(default)]
+    after: u64,
+    #[serde(default)]
+    current: bool,
+    #[serde(default)]
+    sources: Vec<SourceKey>,
+    #[serde(default)]
+    wait_ms: u64,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Configure {
+    binding: SessionBinding,
+    settings: CaptureSettings,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Capture {
+    binding: SessionBinding,
+    sources: Vec<SourceKey>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct History {
+    binding: SessionBinding,
+    age_ms: u64,
+    #[serde(default)]
+    sources: Vec<SourceKey>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Transcripts {
+    binding: SessionBinding,
+    older_ms: u64,
+    #[serde(default)]
+    newer_ms: u64,
+    #[serde(default)]
+    sources: Vec<SourceKey>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Limits {
+    binding: SessionBinding,
+    limits: HistoryLimits,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Transcribe {
+    binding: SessionBinding,
+    model: PathBuf,
+    threads: u8,
+    sources: Vec<SourceKey>,
+}
+
+#[derive(Serialize)]
+struct ObservationResponse {
+    observation: Observation,
+    media: Vec<MediaRef>,
+    media_omitted: usize,
+}
+#[derive(Serialize)]
+struct HistoryResponse {
+    history: HistorySnapshot,
+    media: Vec<MediaRef>,
+    media_omitted: usize,
+}
+
+fn image_response(state: &HttpState, mut observation: Observation) -> ObservationResponse {
+    let mut media = Vec::new();
+    let mut omitted = 0;
+    for image in &mut observation.images {
+        if let Some(bytes) = image.payload.take() {
+            match state.media.publish(&image.metadata, bytes) {
+                Some(reference) => media.push(reference),
+                None => omitted += 1,
+            }
+        }
+    }
+    ObservationResponse {
+        observation,
+        media,
+        media_omitted: omitted,
+    }
+}
+fn validate_sources(sources: &[SourceKey]) -> Result<(), HostError> {
+    let mut seen = std::collections::HashSet::new();
+    if sources.len() > 8 {
+        return Err(HostError::Invalid);
+    }
+    for source in sources {
+        source.validate().map_err(|_| HostError::Invalid)?;
+        if !seen.insert(source) {
+            return Err(HostError::Invalid);
+        }
+    }
+    Ok(())
+}
+async fn status(State(state): State<HttpState>) -> Json<Option<crate::SessionSummary>> {
+    Json(state.host.current().await)
+}
+async fn peers(State(state): State<HttpState>) -> Json<Vec<(String, String)>> {
+    Json(state.host.peers().await)
+}
+async fn connect(
+    State(state): State<HttpState>,
+    Json(args): Json<Connect>,
+) -> Result<Json<crate::SessionSummary>, HostError> {
+    Ok(Json(
+        state.host.connect(args.address, args.peer.parse()?).await?,
+    ))
+}
+async fn sources(
+    State(state): State<HttpState>,
+    Json(args): Json<Scope>,
+) -> Result<Json<liazo_core::catalog::SourceSnapshot>, HostError> {
+    Ok(Json(state.host.receiver(args.binding).await?.sources()))
+}
+async fn observe(
+    State(state): State<HttpState>,
+    Json(args): Json<Observe>,
+) -> Result<Json<ObservationResponse>, HostError> {
+    validate_sources(&args.sources)?;
+    if args.wait_ms > 25_000 {
+        return Err(HostError::Invalid);
+    }
+    let receiver = state.host.receiver(args.binding).await?;
+    Ok(Json(image_response(
+        &state,
+        receiver
+            .observe(
+                args.after,
+                args.current,
+                &args.sources,
+                Duration::from_millis(args.wait_ms),
+            )
+            .await,
+    )))
+}
+async fn configure(
+    State(state): State<HttpState>,
+    Json(args): Json<Configure>,
+) -> Result<Json<serde_json::Value>, HostError> {
+    let revision = state
+        .host
+        .receiver(args.binding)
+        .await?
+        .configure(args.settings)
+        .await?;
+    Ok(Json(serde_json::json!({"revision":revision})))
+}
+async fn capture(
+    State(state): State<HttpState>,
+    Json(args): Json<Capture>,
+) -> Result<Json<ObservationResponse>, HostError> {
+    validate_sources(&args.sources)?;
+    Ok(Json(image_response(
+        &state,
+        state
+            .host
+            .receiver(args.binding)
+            .await?
+            .capture_now(args.sources)
+            .await?,
+    )))
+}
+async fn history(
+    State(state): State<HttpState>,
+    Json(args): Json<History>,
+) -> Result<Json<HistoryResponse>, HostError> {
+    let mut history = state
+        .host
+        .receiver(args.binding)
+        .await?
+        .history_at(Duration::from_millis(args.age_ms), &args.sources)
+        .await?;
+    let mut media = Vec::new();
+    let mut omitted = 0;
+    for image in &mut history.images {
+        if let (Some(metadata), Some(bytes)) = (&image.last_capture, image.payload.take()) {
+            match state.media.publish(metadata, bytes) {
+                Some(reference) => media.push(reference),
+                None => omitted += 1,
+            }
+        }
+    }
+    Ok(Json(HistoryResponse {
+        history,
+        media,
+        media_omitted: omitted,
+    }))
+}
+async fn transcripts(
+    State(state): State<HttpState>,
+    Json(args): Json<Transcripts>,
+) -> Result<Json<liazo_runtime::archive::TranscriptPage>, HostError> {
+    Ok(Json(
+        state
+            .host
+            .receiver(args.binding)
+            .await?
+            .history_transcripts(
+                Duration::from_millis(args.older_ms),
+                Duration::from_millis(args.newer_ms),
+                &args.sources,
+            )
+            .await?,
+    ))
+}
+async fn history_limits(
+    State(state): State<HttpState>,
+    Json(args): Json<Limits>,
+) -> Result<Json<HistoryLimits>, HostError> {
+    Ok(Json(
+        state
+            .host
+            .receiver(args.binding)
+            .await?
+            .configure_history(args.limits)?,
+    ))
+}
+async fn transcribe(
+    State(state): State<HttpState>,
+    Json(args): Json<Transcribe>,
+) -> Result<Json<serde_json::Value>, HostError> {
+    state
+        .host
+        .transcribe(args.binding, args.model, args.threads, args.sources)
+        .await?;
+    Ok(Json(serde_json::json!({"started":true})))
+}
+async fn transcription_stop(
+    State(state): State<HttpState>,
+    Json(args): Json<Scope>,
+) -> Result<Json<serde_json::Value>, HostError> {
+    state
+        .host
+        .receiver(args.binding)
+        .await?
+        .stop_transcription()
+        .await;
+    Ok(Json(serde_json::json!({"stopped":true})))
+}
+async fn stop(
+    State(state): State<HttpState>,
+    Json(args): Json<Scope>,
+) -> Result<Json<serde_json::Value>, HostError> {
+    state.host.stop(args.binding).await?;
+    Ok(Json(serde_json::json!({"stopped":true})))
+}
+async fn media(State(state): State<HttpState>, Path(id): Path<Uuid>) -> Response {
+    match state.media.get(id) {
+        Some((bytes, mime)) => ([(header::CONTENT_TYPE, mime)], bytes).into_response(),
+        None => StatusCode::GONE.into_response(),
+    }
+}

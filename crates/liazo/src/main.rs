@@ -9,6 +9,7 @@ use std::{
 };
 use uuid::Uuid;
 
+mod host;
 #[cfg(target_os = "macos")]
 mod macos;
 mod profile;
@@ -27,6 +28,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    Host {
+        #[arg(long, default_value = "127.0.0.1:45811")]
+        listen: SocketAddr,
+    },
     Provide {
         #[arg(long, default_value = "0.0.0.0:45810")]
         listen: SocketAddr,
@@ -127,6 +132,7 @@ async fn run(cli: Cli) -> Result<()> {
     let profile = profile::Profile::open(cli.profile)?;
     let credentials = profile.credentials()?;
     match cli.command {
+        Command::Host { listen } => host::run(profile, credentials, listen).await,
         Command::Unlock => {
             let _ = profile.identity(&credentials)?;
             let _ = credentials.peers()?;

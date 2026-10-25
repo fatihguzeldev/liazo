@@ -7,6 +7,7 @@ rust-version.workspace = true
 [dependencies]
 liazo-core = { path = "../core" }
 liazo-runtime = { path = "../runtime" }
+liazo-host = { path = "../host" }
 liazo-transport = { path = "../transport" }
 liazo-transcription = { path = "../transcription" }
 tokio = { workspace = true, features = ["signal"] }

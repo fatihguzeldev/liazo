@@ -653,6 +653,27 @@ impl ReceiverSession {
         self.seal_archive().await?;
         Ok(())
     }
+
+    pub async fn disconnect(&self) -> Result<(), RuntimeError> {
+        let _stopping = self.0.stop.lock().await;
+        self.0.shared.cancelled.cancel();
+        {
+            let mut state = self
+                .0
+                .shared
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if state.connection != ConnectionState::Stopped {
+                state.connection = ConnectionState::Disconnected;
+                state.connection_ended(self.0.shared.now_ns());
+                state.changed();
+            }
+        }
+        self.0.shared.signal();
+        self.stop_transcription().await;
+        self.seal_archive().await
+    }
 }
 
 fn failure(code: FailureCode, message: &str) -> RuntimeError {
