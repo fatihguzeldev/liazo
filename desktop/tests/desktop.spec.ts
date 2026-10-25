@@ -68,7 +68,8 @@ test.beforeEach(async ({ page }) => {
       denied: false,
       lastDenied: false,
       stopped: false,
-      disconnected: false,
+      disconnected: new URL(location.href).searchParams.has("pending"),
+      pending: new URL(location.href).searchParams.has("pending"),
       cursor: 2,
       revision: 1,
       calls: [] as { name: string; args: any }[],
@@ -192,11 +193,13 @@ test.beforeEach(async ({ page }) => {
           if (name === "connect") {
             state.connected = true;
             state.disconnected = false;
+            state.pending = false;
             state.stopped = false;
           }
           return state.connected
             ? {
                 binding,
+                pending: state.pending,
                 recovery: state.recovery,
                 provider: "a".repeat(64),
                 address: "127.0.0.1:45810",
@@ -481,6 +484,10 @@ test.beforeEach(async ({ page }) => {
           };
         }
         if (name === "stop") {
+          if (state.pending) {
+            state.connected = false;
+            state.pending = false;
+          }
           state.stopped = true;
           state.cursor++;
           return { stopped: true };
@@ -868,4 +875,44 @@ test("recovery failures remain visible in a live session and can be dismissed", 
   ).toBeVisible();
   await page.getByRole("button", { name: "dismiss", exact: true }).click();
   await expect(page.getByRole("status")).not.toBeVisible();
+});
+
+test("startup recovery waits without reading a missing receiver and can be stopped", async ({
+  page,
+}) => {
+  await page.goto("/?pending");
+  await expect(page.locator(".connection-state")).toHaveText("reconnecting…");
+  await expect(page.locator("main[aria-busy=true]")).toHaveText(
+    "reconnecting…",
+  );
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (window as any).fixture.calls.filter(
+            (call: any) => call.name === "status",
+          ).length,
+      ),
+    )
+    .toBeGreaterThanOrEqual(2);
+  expect(
+    await page.evaluate(() =>
+      (window as any).fixture.calls.some((call: any) =>
+        ["observe", "sources"].includes(call.name),
+      ),
+    ),
+  ).toBe(false);
+  await page.getByRole("button", { name: "stop", exact: true }).click();
+  await expect(page.locator(".connection-state")).toHaveText("disconnected");
+  await expect(page.locator("main[aria-busy=true]")).not.toBeVisible();
+  const calls = await page.evaluate(() => (window as any).fixture.calls);
+  expect(calls.find((call: any) => call.name === "stop")?.args).toEqual({
+    binding: {
+      session: "00000000-0000-4000-8000-000000000003",
+      epoch: "00000000-0000-4000-8000-000000000004",
+    },
+  });
+  expect(
+    calls.some((call: any) => ["observe", "sources"].includes(call.name)),
+  ).toBe(false);
 });

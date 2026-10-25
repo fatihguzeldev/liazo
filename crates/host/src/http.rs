@@ -403,12 +403,7 @@ async fn configure(
     State(state): State<HttpState>,
     Json(args): Json<Configure>,
 ) -> Result<Json<serde_json::Value>, HostError> {
-    let revision = state
-        .host
-        .receiver(args.binding)
-        .await?
-        .configure(args.settings)
-        .await?;
+    let revision = state.host.configure(args.binding, args.settings).await?;
     Ok(Json(serde_json::json!({"revision":revision})))
 }
 async fn capture(
@@ -493,9 +488,7 @@ async fn raw_audio(
 ) -> Result<Json<serde_json::Value>, HostError> {
     state
         .host
-        .receiver(args.binding)
-        .await?
-        .configure_raw_audio(args.sources)
+        .configure_raw_audio(args.binding, args.sources)
         .await?;
     Ok(Json(serde_json::json!({"applied":true})))
 }

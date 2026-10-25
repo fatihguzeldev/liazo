@@ -28,6 +28,7 @@ export function useHost() {
             setSession((old) =>
               old?.binding.epoch === next?.binding.epoch &&
               old?.connection === next?.connection &&
+              old?.pending === next?.pending &&
               JSON.stringify(old?.recovery) === JSON.stringify(next?.recovery)
                 ? old
                 : next,

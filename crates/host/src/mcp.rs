@@ -210,12 +210,7 @@ impl Mcp {
             }
             "configure" => {
                 let args: Configure = parse(arguments)?;
-                let revision = self
-                    .0
-                    .receiver(args.binding)
-                    .await?
-                    .configure(args.settings)
-                    .await?;
+                let revision = self.0.configure(args.binding, args.settings).await?;
                 result(json!({"revision":revision}))
             }
             "history" => {
@@ -264,9 +259,7 @@ impl Mcp {
             "raw_audio" => {
                 let args: RawAudio = parse(arguments)?;
                 self.0
-                    .receiver(args.binding)
-                    .await?
-                    .configure_raw_audio(args.sources)
+                    .configure_raw_audio(args.binding, args.sources)
                     .await?;
                 result(json!({"applied":true}))
             }

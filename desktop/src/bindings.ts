@@ -64,7 +64,7 @@ export type TranscriptionGapReason =
   | "interrupted";
 export type EndReason = "silence" | "limit" | "stopped" | "gap";
 export type RecoveryOperation =
-  "capture" | "archive" | "raw_audio" | "transcription";
+  "settings" | "capture" | "archive" | "raw_audio" | "transcription";
 export type SourceAvailability =
   "available" | "permission_required" | "unavailable";
 export type SourceKind =
@@ -465,6 +465,7 @@ export interface SessionSummary {
   address: string;
   binding: SessionBinding;
   connection: ConnectionState;
+  pending: boolean;
   provider: string;
   recovery: RecoveryIssue[];
 }

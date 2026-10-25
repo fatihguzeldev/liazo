@@ -21,7 +21,11 @@ export function App() {
   const [past, setPast] = useState<Past | null>(null);
   const [error, setError] = useState("");
   const [stopping, setStopping] = useState(false);
-  const live = useSession(session, preview, !!past || recordings);
+  const live = useSession(
+    session?.pending ? null : session,
+    preview,
+    !!past || recordings,
+  );
   useEffect(
     () => () => {
       if (past?.url) URL.revokeObjectURL(past.url);
@@ -65,7 +69,13 @@ export function App() {
       <header className="app-header">
         <h1>liazo</h1>
         <span className="connection-state">
-          {!ready ? "opening…" : session ? status : "disconnected"}
+          {!ready
+            ? "opening…"
+            : session?.pending
+              ? "reconnecting…"
+              : session
+                ? status
+                : "disconnected"}
         </span>
         <div className="header-actions">
           <button
@@ -170,6 +180,10 @@ export function App() {
               setConnecting(false);
             }}
           />
+        </main>
+      ) : session.pending ? (
+        <main className="empty" aria-busy="true">
+          reconnecting…
         </main>
       ) : (
         <>
